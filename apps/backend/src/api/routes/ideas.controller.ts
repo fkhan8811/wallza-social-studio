@@ -9,7 +9,7 @@ import {
   Post,
   Put,
 } from '@nestjs/common';
-import { Organization } from '@prisma/client';
+import { Organization, Prisma } from '@prisma/client';
 import { ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
@@ -218,7 +218,7 @@ export class IdeasController {
     });
     if (!existing) throw new NotFoundException('Idea not found.');
 
-    const data: Record<string, unknown> = {};
+    const data: Prisma.ContentIdeaUpdateInput = {};
     if (body.title !== undefined) {
       const title = typeof body.title === 'string' ? body.title.trim() : '';
       if (!title || title.length > 160) {
