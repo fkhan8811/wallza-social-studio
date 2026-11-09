@@ -53,11 +53,7 @@ export class ChatwootService {
   async createLaunchUrl(organization: Organization, user: User) {
     this.assertConfigured();
 
-    const [accountId, chatwootUserId] = await Promise.all([
-      this.getOrCreateAccount(organization),
-      this.getOrCreateUser(user),
-    ]);
-
+    // Validate the Postiz tenant boundary before creating any external resource.
     const membership = await this.prisma.userOrganization.findUnique({
       where: {
         userId_organizationId: {
@@ -73,6 +69,11 @@ export class ChatwootService {
         'Your Postiz organization membership is not active.'
       );
     }
+
+    const [accountId, chatwootUserId] = await Promise.all([
+      this.getOrCreateAccount(organization),
+      this.getOrCreateUser(user),
+    ]);
 
     const role =
       membership.role === 'ADMIN' || membership.role === 'SUPERADMIN'
@@ -100,7 +101,14 @@ export class ChatwootService {
 
     // Never allow the Platform API response to turn this endpoint into an
     // arbitrary external redirect.
-    const target = new URL(login.url);
+    let target: URL;
+    try {
+      target = new URL(login.url);
+    } catch {
+      throw new BadGatewayException(
+        'Chatwoot returned an invalid single sign-on URL.'
+      );
+    }
     const configured = new URL(this.baseUrl());
     if (target.origin !== configured.origin) {
       throw new BadGatewayException(
