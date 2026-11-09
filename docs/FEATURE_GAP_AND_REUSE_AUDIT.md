@@ -22,12 +22,13 @@ These are not new build targets. New modules should call or extend the native Po
 
 | Area | Current Postiz fork | Upgrade direction | Reuse candidate |
 |---|---|---|---|
-| Social engagement inbox | No dedicated conversation inbox or DM management route; existing comments are post-review comments | Shared inbox, assignment, teams, labels, priorities, private notes, saved replies, macros and automation | **Chatwoot Community Edition** |
+| Social engagement inbox | No dedicated conversation inbox or DM management route; existing comments are post-review comments | Shared inbox for customer DMs/support; separately, a social-native feed for comments, mentions, reviews, assignments and replies | **Chatwoot** for DM/support; **OpenPost / BrightBean Studio** as social-native references |
 | Social listening | No dedicated brand/keyword monitoring, sentiment feed or topic clustering | Brand/product keywords, mentions, sentiment, themes, source filters and alerts | **Harken** (after tenant isolation) |
 | Content idea pipeline | Calendar and drafts exist, but no dedicated pre-production Kanban pipeline | Idea → brief → production → approval → scheduled → published, with conversion into native drafts | Reuse native Postiz composer, media and scheduling |
 | External client approvals | Internal post comments/preview exist, but not a proper expiring client review workspace with reviewer-only access and approval audit | Secure review links, approve/request changes, comments and audit trail | Extend native preview/comment primitives |
-| Campaign operations | Posts and tags/content sets exist; no first-class campaign workspace found in the inspected route tree | Group content, assets, channels, owners, dates and results as campaigns | Native posts, tags, sets and analytics |
+| Campaign operations | Posts and tags/content sets exist; no first-class campaign workspace found in the inspected route tree | Group content, assets, channels, owners, dates, workflow steps and results as campaigns | Reuse native posts/tags/analytics; use BrightBean Studio's approval-stage ideas and campaign-oriented UX as a reference |
 | Competitive/performance intelligence | Analytics are based on connected accounts and published posts | Later add competitive/keyword context without fabricating inaccessible competitor metrics | Harken or an API-backed listening provider |
+| Visual social automation | AI agents exist, but there is no confirmed general-purpose visual trigger/condition/delay graph with comment-to-DM, keyword triggers and drip sequences | Trigger flows from comments, keywords, incoming DMs, schedules and webhooks; add conditions, delays, human hand-off and delivery analytics | **BrightBean Chat** for chat-marketing flows; **OpenPost Workflows** as a reference |
 
 ## Repositories evaluated
 
@@ -80,7 +81,7 @@ These are not new build targets. New modules should call or extend the native Po
 - PostZen documents an inbox-oriented workflow covering supported Meta comments and DMs plus comment-to-DM automation.
 - It is a product reference, not an open-source codebase we should copy. Actual available actions depend on platform permissions, API scopes and Meta's messaging windows.
 
-## First integration delivered in this branch
+## First integration slice committed in this branch (validation pending)
 
 The first slice adds an **Engage** entry to the Postiz navigation and a secure Chatwoot SSO bridge:
 1. Backend-only Chatwoot Platform API configuration.
@@ -90,7 +91,7 @@ The first slice adds an **Engage** entry to the Postiz navigation and a secure C
 5. Chatwoot issues the SSO URL; Postiz verifies the redirect stays on the configured Chatwoot origin.
 6. The inbox, realtime conversations, teams, automations and social channel connections remain upstream Chatwoot features.
 
-This is a companion integration, not a forked or rewritten inbox implementation. It is the first-stage support/DM inbox, **not** a complete social-native comments/mentions/reviews inbox. The connected social channels must also be authorized/configured in Chatwoot; Postiz account connections are not automatically imported.
+This is a companion integration, not a forked or rewritten inbox implementation. It is the first-stage support/DM inbox, **not** a complete social-native comments/mentions/reviews inbox. The connected social channels must also be authorized/configured in Chatwoot; Postiz account connections are not automatically imported. The code is committed but has not yet been built, deployed or end-to-end tested.
 
 ## Runtime configuration
 
@@ -119,11 +120,11 @@ Then rebuild/restart Postiz. Configure the Chatwoot Platform App token and verif
 
 ## Next upgrades — in order
 
-1. **Complete Engage:** verify live Chatwoot provisioning against the deployed Community Edition; add admin connection diagnostics and a clear first-run setup guide. Keep its scope to support channels and DMs unless a supported provider adapter can safely reuse Postiz authorizations.
+1. **Complete Engage:** verify live Chatwoot provisioning against the deployed Community Edition; add admin connection diagnostics and a clear first-run setup guide. Keep its scope to support channels and DMs unless a supported provider adapter can safely reuse Postiz authorizations. Chatwoot's current self-hosted deployment guide recommends 4 CPU cores and 8 GB RAM, so it should not be installed on the existing 2-core Oracle VM without a new capacity plan.
 2. **Social-native inbox:** use OpenPost/BrightBean as implementation references for comments, mentions, reviews, per-provider permission gates, durable reply receipts and idempotent retry. First prove we can reuse Postiz's existing encrypted OAuth grants; do not make every customer connect the same account twice.
 3. **Social Listening:** evaluate Harken's ingestion/sentiment pipeline; first add strict organizationId to tracked projects, queries, mentions, API lookups, alerts and authorization before customer exposure.
 4. **Ideas & Production Pipeline:** reuse existing native drafts, posts, media, tags and composer to avoid duplicate publishing objects.
-5. **Client Approval Portal:** build on the existing preview and comments rather than a new media/post engine.
+5. **Client Approval Portal:** compare BrightBean Studio's client portal, two-stage approvals and magic-link workflow; extend Postiz's existing preview/comments and native post states instead of adding a duplicate publishing system.
 6. **Campaigns:** group native content objects and reuse Postiz analytics.
 
 ## Guardrails
