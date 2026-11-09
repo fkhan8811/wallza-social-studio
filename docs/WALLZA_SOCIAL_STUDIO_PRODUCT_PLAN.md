@@ -57,6 +57,31 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 5. **Campaign operations and polish:** campaign grouping, cross-module navigation, responsive states, accessibility and regression testing.
 6. **Release gate:** run migrations and full checks, document environment variables/deployment, verify existing Postiz flows, then plan WallzaOS integration.
 
+## Feature implementation status — branch `wallza/social-studio-feature-upgrades`
+
+### Implemented in this branch (not yet merged into main)
+
+- Organization-scoped `ContentIdeaStage` and `ContentIdea` Prisma models.
+- Authenticated, organization-scoped Ideas API for listing stages, creating/updating/deleting ideas, adding/updating/deleting empty stages, and moving ideas between stages.
+- Default content pipeline stages: Inbox, Idea, Brief, In production, Ready, Scheduled, Published and Archived.
+- Native Ideas Kanban page with drag-and-drop stage changes, idea creation, platform targets, labels, owner name and due date.
+- Create-drafts action that uses the existing authenticated integrations and native `POST /posts` draft flow. When platform targets are specified, connected accounts are matched against those targets; otherwise drafts are created for all active connected accounts.
+
+### Not yet implemented
+
+- Rich card editing UI and reliable in-column ordering controls.
+- Client-facing review portal, expiring reviewer links, approval/request-changes workflow and approval audit history.
+- Advanced media library folders, collections, tags, favorites and asset usage tracking.
+- Full carousel/image editor and durable multi-track video editor.
+- Expanded queue rules, reusable queue templates and posting-slot controls.
+- Campaign management.
+
+### Validation and deployment notes
+
+- The Prisma schema has changed. Run `pnpm run prisma-generate` and `pnpm run prisma-db-push` against the intended database before starting the updated application.
+- Build and runtime checks have not yet been run from a complete local checkout. Do not treat this branch as production-ready until the schema update, backend build, frontend build and end-to-end idea-to-draft flow are verified.
+- No changes have been made to `main`; no external repository has been added as a deployable service.
+
 ## Current repository facts verified
 
 - Repository: `fkhan8811/wallza-social-studio`
