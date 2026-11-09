@@ -9,7 +9,7 @@ https://developers.chatwoot.com/self-hosted/deployment/docker
 
 Use a public HTTPS origin, persistent storage, Postgres and Redis. Do not expose its database or Redis ports to the public internet. The Chatwoot app's configured public URL must match `CHATWOOT_BASE_URL`.
 
-This is intentionally a separate service. Do not add a second Postgres/Redis stack inside Postiz's database or reuse Postiz's database for Chatwoot.
+This is intentionally a separate service. Do not add a second Postgres/Redis stack inside Postiz's database or reuse Postiz's database for Chatwoot. Chatwoot's current deployment guide recommends a production baseline of 4 CPU cores and 8 GB RAM; that is above the 2-core Oracle VM currently reserved for the wider Wallza stack. Do not install Chatwoot on that same VM without a capacity plan or a separate host.
 
 ## 2. Create a Chatwoot Platform App
 
@@ -56,10 +56,11 @@ Open **Engage** from the Postiz sidebar:
 - Each organization gets a separate Chatwoot account; users are added only to the account for the active Postiz organization.
 - Chatwoot user identities are global within the Chatwoot instance, consistent with Chatwoot's own account membership model.
 
-A Chatwoot user email already provisioned outside this Platform App may not be claimable by it. Resolve that identity with the Chatwoot administrator instead of silently attaching an unrelated user.
+A Chatwoot user email already provisioned outside this Platform App may not be claimable by it. Resolve that identity with the Chatwoot administrator instead of silently attaching an unrelated user. The Chatwoot account is provisioned automatically, but social messaging channels themselves must be connected in Chatwoot. Existing Postiz OAuth connections and encrypted provider tokens are not automatically shared with Chatwoot.
 
 ## Current limitations
 
 - The first slice launches the Chatwoot inbox; it does not yet mirror Chatwoot conversations inside a native Postiz React inbox.
 - Native post comments and replies still depend on each social network's API scopes and are not automatically imported into Chatwoot.
-- Channel connections (WhatsApp, Instagram, Facebook Messenger, etc.) must be configured in Chatwoot and remain subject to each network's provider rules.
+- Channel connections (WhatsApp, Instagram DMs, Facebook Messenger, TikTok Business messaging where enabled, etc.) must be configured in Chatwoot separately and remain subject to each network's provider rules.
+- Chatwoot is a support/messaging inbox, not a universal social engagement feed. It does not automatically collect all native post comments, public mentions, or Google Business reviews from Postiz accounts.
