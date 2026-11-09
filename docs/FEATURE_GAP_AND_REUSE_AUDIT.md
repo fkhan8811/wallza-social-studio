@@ -41,6 +41,25 @@ These are not new build targets. New modules should call or extend the native Po
 - SaaS tenancy mapping: one Chatwoot account per Postiz Organization; one Chatwoot identity per Postiz User; add the user to the corresponding Chatwoot account on launch. Postiz remains the identity and organization source of truth.
 - Important API constraint: Chatwoot's Platform App token can access only accounts/users provisioned/authorized for that Platform App. Do not assume it can take over objects created manually or by a different Platform App.
 
+### 2. OpenPost — strongest social-native inbox benchmark; not a drop-in module
+
+- Repository: https://github.com/getopenpost/openpost
+- License: AGPL-3.0-only.
+- Current self-hosted default: one container, SQLite and local media storage; provider capabilities vary by platform.
+- Its inbox is materially more social-specific than a generic support desk: comments, mentions, business reviews and direct messages, with durable reply receipts and retry handling. Its docs also describe moderation and provider-specific restrictions.
+- Its adapter seams and tests are useful references for safe comment/engagement synchronization.
+- **Not a direct drop-in for this Postiz fork:** it has its own OAuth connections, account model, workspace/authentication system and Go/SvelteKit/Expo stack. The trusted-proxy login option provisions an OpenPost identity/workspace; it does not automatically map Postiz organizations, users or encrypted provider tokens. A direct deployment would require a deliberate account/token migration or a maintained bridge.
+- Because it is AGPL-3.0-only, treat source modifications and network-service obligations as a release/legal review item before adopting code.
+
+### 3. BrightBean Studio — strongest feature reference and API candidate
+
+- Repository: https://github.com/brightbeanxyz/brightbean-studio
+- License: AGPL-3.0.
+- It demonstrates the breadth we should aim for: an ideas Kanban, team/client approvals, threaded external comments, a unified inbox for comments/mentions/DMs/reviews, sentiment, assignments, media library, and per-workspace RBAC.
+- It exposes a REST/MCP API. The documented inbox API supports listing messages, reading threads, creating/updating/discarding reply drafts and sending replies; API keys are workspace-scoped and can be allowlisted to social accounts.
+- **Not a drop-in UI:** it is a separate Django/HTMX app and requires its own OAuth-connected accounts. A native Postiz UI could call its API only after we provision a matching workspace and API key, and customers would still need their accounts connected there. Avoid importing its Django application into the NestJS/Next.js monorepo.
+- AGPL-3.0 obligations need review before any code is copied or modified.
+
 ### 2. Harken — shortlisted for a later Social Listening module
 
 - Repository: https://github.com/VladUZH/harken
@@ -71,7 +90,7 @@ The first slice adds an **Engage** entry to the Postiz navigation and a secure C
 5. Chatwoot issues the SSO URL; Postiz verifies the redirect stays on the configured Chatwoot origin.
 6. The inbox, realtime conversations, teams, automations and social channel connections remain upstream Chatwoot features.
 
-This is a companion integration, not a forked or rewritten inbox implementation.
+This is a companion integration, not a forked or rewritten inbox implementation. It is the first-stage support/DM inbox, **not** a complete social-native comments/mentions/reviews inbox. The connected social channels must also be authorized/configured in Chatwoot; Postiz account connections are not automatically imported.
 
 ## Runtime configuration
 
@@ -100,8 +119,8 @@ Then rebuild/restart Postiz. Configure the Chatwoot Platform App token and verif
 
 ## Next upgrades — in order
 
-1. **Complete Engage:** verify live Chatwoot provisioning against the deployed Community Edition; add admin connection diagnostics and a clear first-run setup guide.
-2. **Native social comment moderation:** connect supported official social APIs through existing Postiz integration credentials for platform-native comments/replies that are not handled by the Chatwoot channel connector. Do not promise every network supports the same actions.
+1. **Complete Engage:** verify live Chatwoot provisioning against the deployed Community Edition; add admin connection diagnostics and a clear first-run setup guide. Keep its scope to support channels and DMs unless a supported provider adapter can safely reuse Postiz authorizations.
+2. **Social-native inbox:** use OpenPost/BrightBean as implementation references for comments, mentions, reviews, per-provider permission gates, durable reply receipts and idempotent retry. First prove we can reuse Postiz's existing encrypted OAuth grants; do not make every customer connect the same account twice.
 3. **Social Listening:** evaluate Harken's ingestion/sentiment pipeline; first add strict organizationId to tracked projects, queries, mentions, API lookups, alerts and authorization before customer exposure.
 4. **Ideas & Production Pipeline:** reuse existing native drafts, posts, media, tags and composer to avoid duplicate publishing objects.
 5. **Client Approval Portal:** build on the existing preview and comments rather than a new media/post engine.
