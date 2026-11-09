@@ -148,7 +148,7 @@ export const IdeasComponent: FC = () => {
     const targets = (idea.platformTargets || []).map(normalized);
     const chosen = targets.length
       ? available.filter((integration) => {
-          const identifiers = [integration.identifier, integration.name, integration.originalName].map(normalized);
+          const identifiers = [integration.identifier, integration.name, integration.originalName].map(normalized).filter(Boolean);
           return targets.some((target) => identifiers.some((identifier) =>
             identifier === target || identifier.includes(target) || target.includes(identifier)
           ));
@@ -165,7 +165,7 @@ export const IdeasComponent: FC = () => {
     setConvertingIdeaId(idea.id);
     setMessage(null);
     try {
-      const content = [idea.title, idea.brief].filter(Boolean).join('\\n\\n');
+      const content = [idea.title, idea.brief].filter(Boolean).join('\n\n');
       const date = new Date(Date.now() + 60 * 60 * 1000).toISOString();
       const response = await fetch('/posts', {
         method: 'POST',
