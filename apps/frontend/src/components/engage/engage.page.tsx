@@ -139,8 +139,9 @@ export const EngagePage = () => {
               <li>Automation rules and inbox reporting</li>
             </ul>
             <p className="mt-5 border-t border-[#303644] pt-4 text-xs leading-5 text-[#858D9C]">
-              Powered by the self-hosted Chatwoot Community Edition. Social channel
-              availability depends on the channels enabled in your Chatwoot server.
+              Powered by the self-hosted Chatwoot Community Edition. Messaging channels must
+              be connected in Chatwoot separately; existing Postiz social-account connections
+              are not automatically imported.
             </p>
           </aside>
         </section>
