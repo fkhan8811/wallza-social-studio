@@ -43,6 +43,18 @@ export const useMenuItem = () => {
       path: '/launches',
     },
     {
+      name: t('ideas', 'Ideas'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <rect x="3" y="3" width="7" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+          <rect x="14" y="3" width="7" height="5" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+          <rect x="14" y="11" width="7" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+          <rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+        </svg>
+      ),
+      path: '/ideas',
+    },
+    {
       name: 'Agent',
       icon: (
         <svg
