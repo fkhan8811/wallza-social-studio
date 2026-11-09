@@ -27,6 +27,18 @@ type IdeaStage = {
   ideas: ContentIdea[];
 };
 
+type ConnectedIntegration = {
+  id: string;
+  name: string;
+  originalName: string;
+  identifier: string;
+  disabled: boolean;
+};
+
+type IntegrationResponse = { integrations: ConnectedIntegration[] };
+
+const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
 const splitList = (value: string) =>
   [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))];
 
@@ -49,6 +61,12 @@ export const IdeasComponent: FC = () => {
   }, [fetch]);
 
   const { data, isLoading, error, mutate } = useSWR<IdeaStage[]>('/ideas', load);
+  const loadIntegrations = useCallback(async (path: string): Promise<IntegrationResponse> => {
+    const response = await fetch(path);
+    if (!response.ok) throw new Error('Could not load connected social accounts.');
+    return response.json();
+  }, [fetch]);
+  const { data: integrationData } = useSWR<IntegrationResponse>('/integrations/list', loadIntegrations);
   const [showComposer, setShowComposer] = useState(false);
   const [title, setTitle] = useState('');
   const [brief, setBrief] = useState('');
@@ -60,6 +78,7 @@ export const IdeasComponent: FC = () => {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [draggedIdeaId, setDraggedIdeaId] = useState<string | null>(null);
+  const [convertingIdeaId, setConvertingIdeaId] = useState<string | null>(null);
   const [newStageName, setNewStageName] = useState('');
   const [addingStage, setAddingStage] = useState(false);
 
@@ -123,6 +142,63 @@ export const IdeasComponent: FC = () => {
     setMessage(null);
     await mutate();
   }, [fetch, mutate]);
+
+  const createDrafts = useCallback(async (idea: ContentIdea) => {
+    const available = (integrationData?.integrations || []).filter((integration) => !integration.disabled);
+    const targets = (idea.platformTargets || []).map(normalized);
+    const chosen = targets.length
+      ? available.filter((integration) => {
+          const identifiers = [integration.identifier, integration.name, integration.originalName].map(normalized);
+          return targets.some((target) => identifiers.some((identifier) =>
+            identifier === target || identifier.includes(target) || target.includes(identifier)
+          ));
+        })
+      : available;
+
+    if (!chosen.length) {
+      setMessage(targets.length
+        ? 'No connected account matches this idea’s target platforms. Check the connected account names or edit the idea.'
+        : 'Connect at least one social account before creating a draft.');
+      return;
+    }
+
+    setConvertingIdeaId(idea.id);
+    setMessage(null);
+    try {
+      const content = [idea.title, idea.brief].filter(Boolean).join('\\n\\n');
+      const date = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      const response = await fetch('/posts', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'draft',
+          date,
+          order: '',
+          shortLink: false,
+          tags: [],
+          posts: chosen.map((integration) => ({
+            group: `${idea.id}-${integration.id}`,
+            integration: { id: integration.id },
+            settings: {
+              __type: integration.identifier,
+              title: '',
+              tags: [],
+              subreddit: [],
+            },
+            value: [{ id: '', content, delay: 0, image: [] }],
+          })),
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.message || 'Could not create the Postiz drafts.');
+      }
+      setMessage(`${chosen.length} native Postiz ${chosen.length === 1 ? 'draft was' : 'drafts were'} created. Open Launches to review them.`);
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : 'Could not create the Postiz drafts.');
+    } finally {
+      setConvertingIdeaId(null);
+    }
+  }, [integrationData, fetch]);
 
   const deleteIdea = useCallback(async (ideaId: string) => {
     if (!window.confirm('Delete this idea? This cannot be undone.')) return;
@@ -264,6 +340,14 @@ export const IdeasComponent: FC = () => {
                     <span>{idea.ownerName || 'Unassigned'}</span>
                     {readableDate(idea.dueDate) && <span>Due {readableDate(idea.dueDate)}</span>}
                   </div>
+                  <button
+                    type="button"
+                    disabled={convertingIdeaId === idea.id}
+                    onClick={() => void createDrafts(idea)}
+                    className="mt-[9px] w-full rounded-[7px] border border-[#8b6cff]/30 px-[9px] py-[7px] text-[11px] font-[600] text-[#b7a5ff] hover:bg-[#6d4aff]/10 disabled:opacity-50"
+                  >
+                    {convertingIdeaId === idea.id ? 'Creating drafts...' : 'Create native Postiz drafts'}
+                  </button>
                 </article>
               ))}
               {stage.ideas.length === 0 && (
