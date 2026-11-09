@@ -21,28 +21,19 @@ Do not create duplicate modules for capabilities already present. Extend the exi
 
 ## Product modules to add or consolidate
 
-### 1. Engage — reusable inbox integration
-Add a dedicated engagement entry point without rebuilding a conversation engine. The committed first slice provisions Chatwoot accounts/users through its Platform API and SSO. Keep Chatwoot scoped to DMs/support conversations; it is not a substitute for native public comments, mentions or reviews. Do not duplicate Postiz publishing/account flows.
-
-### 2. Social-native engagement
-Use OpenPost and BrightBean Studio as technical references for comments, mentions, DMs, reviews, sentiment, reply receipts, idempotent retries and provider capability checks. The key architectural requirement is to reuse Postiz's existing encrypted OAuth grants rather than asking customers to authorize the same accounts again. Only implement providers where scopes and API terms permit it.
-
-### 3. Visual social automation
-Evaluate BrightBean Chat and OpenPost Workflows for comment-to-DM, keywords, delays, conditions, inbox handoff and webhook triggers. Reuse a mature workflow engine/API where licensing and tenancy allow it; do not duplicate the existing AI agent features.
-
-### 4. Ideas & Content Pipeline
+### 1. Ideas & Content Pipeline
 A visual Kanban workflow for ideas, briefs and drafts (e.g. Inbox, Idea, Brief, In production, Ready, Scheduled, Published, Archived). Each card should support owner, channel/platform targets, due date, labels, brief, attachments and conversion into a native Postiz draft. Persist data per organization; do not use browser-only storage as the source of truth.
 
-### 5. Creative Studio
+### 2. Creative Studio
 A unified workspace for creating and preparing social assets. Connect the existing media library, AI image/video generation and clipping pipeline. Add a consistent asset workflow and editor entry points. Do not claim full timeline editing until an actual editing engine and durable project format are implemented. Keep media processing asynchronous and store outputs through the configured storage provider.
 
-### 6. Client Review & Approvals
+### 3. Client Review & Approvals
 A secure review workflow for agencies and teams: invite/reviewer access, shareable expiring review links, post preview, approve/request changes, comments, audit trail and status visibility. Reviewers must not receive workspace-wide access. Approval must be distinct from the existing publish state and must not publish automatically unless the owner explicitly enables that policy.
 
-### 7. Campaigns & Content Operations
+### 4. Campaigns & Content Operations
 Group posts, assets and ideas into campaigns with goals, dates, owners and status. Reuse native post scheduling and analytics rather than creating parallel publishing or analytics systems.
 
-### 8. Unified workspace experience
+### 5. Unified workspace experience
 One sidebar, one workspace switcher, one account model, consistent page headers, shared media picker and coherent empty/loading/error states. New modules should look and behave like native Postiz pages.
 
 ## Engineering rules
@@ -59,13 +50,12 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 
 ## Delivery sequence
 
-1. **Foundation + Engage connector:** preserve Postiz auth/org boundaries, add Chatwoot SSO mapping and setup docs. Build/deployment/E2E validation is still pending; Chatwoot needs a separate capacity decision.
-2. **Social-native engagement:** prove reuse of existing Postiz OAuth grants; then add provider-backed comments, mentions, reviews and replies with durable receipts and capability gates. Use OpenPost/BrightBean as reference implementations, not as duplicate social-account stores.
-3. **Visual social automation:** integrate a suitable BrightBean Chat/OpenPost workflow capability only after tenant isolation, provider permissions and licence review.
-4. **Ideas & Content Pipeline:** reuse native Postiz drafts, media, composer and scheduling; compare BrightBean Studio's Kanban UX rather than importing its Django application.
-5. **Creative Studio integration:** consolidate existing AI/media/clipping flows; add editor only after choosing a real editing engine.
-6. **Client Review, campaigns and polish:** compare BrightBean's approval/client portal design, extend native preview/comment state, add campaign grouping and regression testing.
-7. **Release gate:** run schema/build/tests, document deployment, verify existing Postiz workflows, then plan WallzaOS integration.
+1. **Foundation:** establish feature branch, map architecture, confirm CI/build commands and define shared UI conventions.
+2. **Ideas & Content Pipeline:** database/API/UI, convert idea to native draft, tests.
+3. **Creative Studio integration:** consolidate existing AI/media/clipping flows; add editor only after choosing a real editing engine.
+4. **Client Review & Approvals:** secure external reviewer flow, audit trail and tests.
+5. **Campaign operations and polish:** campaign grouping, cross-module navigation, responsive states, accessibility and regression testing.
+6. **Release gate:** run migrations and full checks, document environment variables/deployment, verify existing Postiz flows, then plan WallzaOS integration.
 
 ## Current repository facts verified
 
@@ -79,4 +69,4 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 
 ## First implementation boundary
 
-The first committed implementation slice is the Engage/Chatwoot SSO connector. It is a thin integration, not a rebuilt inbox, and remains unvalidated until it is built against the real repo and a Chatwoot instance. The next critical engineering task is to determine how the social-native inbox can reuse Postiz's existing provider grants without duplicate account connections. Ideas, approvals and campaigns follow. No WallzaOS backend/frontend merge is part of this phase.
+The first feature to implement is Ideas & Content Pipeline, using the existing workspace and native post composer. The Creative Studio and approval portal follow as separate increments. No WallzaOS backend/frontend merge is part of this phase.

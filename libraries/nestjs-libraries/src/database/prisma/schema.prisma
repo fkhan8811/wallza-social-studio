@@ -45,7 +45,6 @@ model Organization {
   webhooks            Webhooks[]
   oauthApp            OAuthApp[]
   oauthAuthorizations OAuthAuthorization[]
-  chatwootAccount      ChatwootAccountMapping?
 
   @@index([apiKey])
   @@index([streakSince])
@@ -119,7 +118,6 @@ model User {
   sendFailureEmails     Boolean              @default(true)
   sendStreakEmails      Boolean              @default(true)
   oauthAuthorizations   OAuthAuthorization[]
-  chatwootUser           ChatwootUserMapping?
 
   @@unique([email, providerName])
   @@index([providerId, providerName])
@@ -1845,31 +1843,4 @@ model Announcement {
   description String
   color       AnnouncementColor @default(INFO)
   createdAt   DateTime          @default(now())
-}
-
-
-/// Maps a Postiz organization to an account created by this Chatwoot Platform App.
-/// The account is created lazily on the first authenticated Engage launch.
-model ChatwootAccountMapping {
-  id             String       @id @default(cuid())
-  organizationId String       @unique
-  accountId      Int          @unique
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-
-  @@index([accountId])
-}
-
-/// Maps one Postiz user to the Chatwoot identity provisioned by this Platform App.
-/// The identity can then be added to multiple organization-specific Chatwoot accounts.
-model ChatwootUserMapping {
-  id            String   @id @default(cuid())
-  userId        String   @unique
-  chatwootUserId Int     @unique
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([chatwootUserId])
 }

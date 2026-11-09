@@ -38,8 +38,6 @@ import { AutopostController } from '@gitroom/backend/api/routes/autopost.control
 import { SetsController } from '@gitroom/backend/api/routes/sets.controller';
 import { ThirdPartyController } from '@gitroom/backend/api/routes/third-party.controller';
 import { MonitorController } from '@gitroom/backend/api/routes/monitor.controller';
-import { EngageController } from '@gitroom/backend/api/routes/engage.controller';
-import { ChatwootService } from '@gitroom/backend/services/chatwoot/chatwoot.service';
 import { NoAuthIntegrationsController } from '@gitroom/backend/api/routes/no.auth.integrations.controller';
 import { EnterpriseController } from '@gitroom/backend/api/routes/enterprise.controller';
 import { OAuthAppController } from '@gitroom/backend/api/routes/oauth-app.controller';
@@ -61,7 +59,6 @@ import { StripeController } from '@gitroom/backend/api/routes/stripe.controller'
 
 const authenticatedController = [
   UsersController,
-  EngageController,
   AnalyticsController,
   IntegrationsController,
   SettingsController,
@@ -107,7 +104,6 @@ const authenticatedController = [
       ],
   providers: [
     AuthService,
-    ChatwootService,
     StripeService,
     PaymentService,
     PaymentProviderManager,
