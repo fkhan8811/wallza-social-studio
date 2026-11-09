@@ -45,6 +45,8 @@ model Organization {
   webhooks            Webhooks[]
   oauthApp            OAuthApp[]
   oauthAuthorizations OAuthAuthorization[]
+  contentIdeaStages  ContentIdeaStage[]
+  contentIdeas       ContentIdea[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -127,6 +129,41 @@ model User {
   @@index([lastOnline])
   @@index([pictureId])
   @@index([deletedAt])
+}
+
+model ContentIdeaStage {
+  id             String       @id @default(uuid())
+  name           String
+  color          String       @default("#64748b")
+  position       Int          @default(0)
+  organizationId String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  ideas          ContentIdea[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, position])
+}
+
+model ContentIdea {
+  id             String           @id @default(uuid())
+  title          String
+  brief          String           @default("")
+  stageId        String
+  position       Int              @default(0)
+  platformTargets String[]        @default([])
+  labels         String[]         @default([])
+  dueDate        DateTime?
+  ownerName      String?
+  organizationId String
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  stage          ContentIdeaStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, stageId, position])
+  @@index([dueDate])
 }
 
 model UsedCodes {
