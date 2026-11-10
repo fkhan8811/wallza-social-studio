@@ -225,7 +225,7 @@ export class IdeasController {
         dueDate,
         ownerName:
           typeof body.ownerName === 'string' ? body.ownerName.trim().slice(0, 80) || null : null,
-        campaign: campaign ? { connect: { id: campaign.id } } : undefined,
+        campaignId: campaign?.id ?? null,
       },
     });
   }
@@ -250,7 +250,7 @@ export class IdeasController {
     });
     if (!existing) throw new NotFoundException('Idea not found.');
 
-    const data: Prisma.ContentIdeaUpdateInput = {};
+    const data: Prisma.ContentIdeaUncheckedUpdateInput = {};
     if (body.title !== undefined) {
       const title = typeof body.title === 'string' ? body.title.trim() : '';
       if (!title || title.length > 160) {
@@ -282,19 +282,19 @@ export class IdeasController {
         select: { id: true },
       });
       if (!stage) throw new BadRequestException('Choose a pipeline stage belonging to this organization.');
-      data.stage = { connect: { id: stage.id } };
+      data.stageId = stage.id;
     }
     if (body.campaignId !== undefined) {
       const campaignId = typeof body.campaignId === 'string' ? body.campaignId.trim() : '';
       if (!campaignId) {
-        data.campaign = { disconnect: true };
+        data.campaignId = null;
       } else {
         const campaign = await this.prisma.contentCampaign.findFirst({
           where: { id: campaignId, organizationId: org.id },
           select: { id: true },
         });
         if (!campaign) throw new BadRequestException('Choose a campaign belonging to this organization.');
-        data.campaign = { connect: { id: campaign.id } };
+        data.campaignId = campaign.id;
       }
     }
     return this.prisma.contentIdea.update({ where: { id }, data });
