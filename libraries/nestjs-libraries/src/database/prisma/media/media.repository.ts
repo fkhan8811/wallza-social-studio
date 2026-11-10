@@ -1,6 +1,7 @@
 import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { Injectable } from '@nestjs/common';
 import { SaveMediaInformationDto } from '@gitroom/nestjs-libraries/dtos/media/save.media.information.dto';
+import { MEDIA_RETENTION_MS } from './media-retention.policy';
 
 @Injectable()
 export class MediaRepository {
@@ -16,6 +17,7 @@ export class MediaRepository {
         },
         name: fileName,
         path: filePath,
+        retentionExpiresAt: new Date(Date.now() + MEDIA_RETENTION_MS),
         originalName: originalName || null,
       },
       select: {
@@ -116,15 +118,16 @@ export class MediaRepository {
     });
   }
 
-  findRetentionCandidates(cutoff: Date, take = 100) {
+  findRetentionCandidates(cutoff: Date, take = 100, cursorId?: string) {
     return this._media.model.media.findMany({
       where: {
-        createdAt: { lt: cutoff },
+        retentionExpiresAt: { lt: cutoff },
         deletedAt: null,
         status: { not: 'processing' },
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       take,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
       select: {
         id: true,
         organizationId: true,
