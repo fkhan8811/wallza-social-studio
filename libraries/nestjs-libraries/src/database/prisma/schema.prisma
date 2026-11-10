@@ -353,6 +353,7 @@ model Media {
   organizationId     String
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
+  retentionExpiresAt DateTime?
   deletedAt          DateTime?
   fileSize           Int                 @default(0)
   type               String              @default("image")
