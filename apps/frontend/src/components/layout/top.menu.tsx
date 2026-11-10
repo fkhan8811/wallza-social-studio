@@ -43,6 +43,38 @@ export const useMenuItem = () => {
       path: '/launches',
     },
     {
+      name: t('ideas', 'Ideas'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <rect x="3" y="3" width="7" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+          <rect x="14" y="3" width="7" height="5" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+          <rect x="14" y="11" width="7" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+          <rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" strokeWidth="1.6" />
+        </svg>
+      ),
+      path: '/ideas',
+    },
+    {
+      name: t('campaigns', 'Campaigns'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M8 2.5V5.5M16 2.5V5.5M3 9H21M7 13H11M7 16H15" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      ),
+      path: '/campaigns',
+    },
+    {
+      name: t('reviews', 'Reviews'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <path d="M7 3.5H17A2.5 2.5 0 0 1 19.5 6V20.5L15.5 18L12 20.5L8.5 18L4.5 20.5V6A2.5 2.5 0 0 1 7 3.5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+          <path d="M8 9H16M8 12.5H16M8 16H12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      ),
+      path: '/reviews',
+    },
+    {
       name: 'Agent',
       icon: (
         <svg

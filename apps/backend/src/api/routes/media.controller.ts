@@ -6,6 +6,7 @@ import {
   Get,
   Param,
   Post,
+  Put,
   Query,
   Req,
   Res,
@@ -163,6 +164,135 @@ export class MediaController {
     );
   }
 
+  @Get('/collections')
+  getMediaCollections(@GetOrgFromRequest() org: Organization) {
+    return this._mediaService.getCollections(org.id);
+  }
+
+  @Post('/collections')
+  async createMediaCollection(
+    @GetOrgFromRequest() org: Organization,
+    @Body() body: { name?: string; description?: string }
+  ) {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const description = typeof body.description === 'string' ? body.description.trim() : '';
+    if (!name || name.length > 80) {
+      throw new BadRequestException('Collection name must be between 1 and 80 characters.');
+    }
+    if (description.length > 1000) {
+      throw new BadRequestException('Collection description must be 1000 characters or fewer.');
+    }
+    try {
+      return await this._mediaService.createCollection(org.id, name, description);
+    } catch (error: any) {
+      if (error?.code === 'P2002') {
+        throw new BadRequestException('A collection with this name already exists.');
+      }
+      throw error;
+    }
+  }
+
+  @Put('/collections/:id')
+  async updateMediaCollection(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: { name?: string; description?: string }
+  ) {
+    const name = body.name === undefined
+      ? undefined
+      : typeof body.name === 'string' ? body.name.trim() : '';
+    const description = body.description === undefined
+      ? undefined
+      : typeof body.description === 'string' ? body.description.trim() : '';
+    if (name !== undefined && (!name || name.length > 80)) {
+      throw new BadRequestException('Collection name must be between 1 and 80 characters.');
+    }
+    if (description !== undefined && description.length > 1000) {
+      throw new BadRequestException('Collection description must be 1000 characters or fewer.');
+    }
+    try {
+      const result = await this._mediaService.updateCollection(org.id, id, name, description);
+      if (!result) throw new BadRequestException('Collection not found.');
+      return result;
+    } catch (error: any) {
+      if (error?.code === 'P2002') {
+        throw new BadRequestException('A collection with this name already exists.');
+      }
+      throw error;
+    }
+  }
+
+  @Delete('/collections/:id')
+  async deleteMediaCollection(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const deleted = await this._mediaService.deleteCollection(org.id, id);
+    if (!deleted) throw new BadRequestException('Collection not found.');
+    return { success: true };
+  }
+
+  @Post('/collections/:collectionId/media')
+  async addMediaToCollection(
+    @GetOrgFromRequest() org: Organization,
+    @Param('collectionId') collectionId: string,
+    @Body('mediaId') mediaId: string
+  ) {
+    if (typeof mediaId !== 'string' || !mediaId.trim()) {
+      throw new BadRequestException('A media ID is required.');
+    }
+    const result = await this._mediaService.addToCollection(org.id, collectionId, mediaId.trim());
+    if (!result) {
+      throw new BadRequestException('The collection or media item was not found in this workspace.');
+    }
+    return result;
+  }
+
+  @Delete('/collections/:collectionId/media/:mediaId')
+  async removeMediaFromCollection(
+    @GetOrgFromRequest() org: Organization,
+    @Param('collectionId') collectionId: string,
+    @Param('mediaId') mediaId: string
+  ) {
+    const removed = await this._mediaService.removeFromCollection(org.id, collectionId, mediaId);
+    if (!removed) throw new BadRequestException('The media item is not in this collection.');
+    return { success: true };
+  }
+
+  @Post('/:id/favorite')
+  async setMediaFavorite(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body('favorite') favorite: boolean
+  ) {
+    if (typeof favorite !== 'boolean') {
+      throw new BadRequestException('Favorite must be true or false.');
+    }
+    const result = await this._mediaService.setFavorite(org.id, id, favorite);
+    if (!result) throw new BadRequestException('Media item not found.');
+    return result;
+  }
+
+  @Put('/:id/tags')
+  async setMediaTags(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body('tags') tags: unknown
+  ) {
+    if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== 'string')) {
+      throw new BadRequestException('Tags must be an array of text labels.');
+    }
+    const normalized = [...new Set(
+      tags.map((tag: string) => tag.trim().toLowerCase()).filter(Boolean)
+    )];
+    if (normalized.length > 20 || normalized.some((tag) => tag.length > 40)) {
+      throw new BadRequestException('Use at most 20 tags, each no longer than 40 characters.');
+    }
+    const result = await this._mediaService.setTags(org.id, id, normalized);
+    if (!result) throw new BadRequestException('Media item not found.');
+    return result;
+  }
+
   @Post('/:endpoint')
   async uploadFile(
     @GetOrgFromRequest() org: Organization,
@@ -203,9 +333,19 @@ export class MediaController {
   getMedia(
     @GetOrgFromRequest() org: Organization,
     @Query('page') page: number,
-    @Query('search') search?: string
+    @Query('search') search?: string,
+    @Query('favorite') favoriteQuery?: string,
+    @Query('tag') tag?: string,
+    @Query('collectionId') collectionId?: string
   ) {
-    return this._mediaService.getMedia(org.id, page, search);
+    let favorite: boolean | undefined;
+    if (favoriteQuery !== undefined) {
+      if (favoriteQuery !== 'true' && favoriteQuery !== 'false') {
+        throw new BadRequestException('Favorite filter must be true or false.');
+      }
+      favorite = favoriteQuery === 'true';
+    }
+    return this._mediaService.getMedia(org.id, page, search, favorite, tag, collectionId);
   }
 
   @Get('/video-options')

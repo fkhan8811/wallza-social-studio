@@ -30,6 +30,7 @@ model Organization {
   github              GitHub[]
   Integration         Integration[]
   media               Media[]
+  mediaCollections   MediaCollection[]
   buyerOrganization   MessagesGroup[]
   notifications       Notifications[]
   plugs               Plugs[]
@@ -45,6 +46,10 @@ model Organization {
   webhooks            Webhooks[]
   oauthApp            OAuthApp[]
   oauthAuthorizations OAuthAuthorization[]
+  contentIdeaStages  ContentIdeaStage[]
+  contentIdeas       ContentIdea[]
+  contentCampaigns   ContentCampaign[]
+  contentReviews     ContentReview[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -127,6 +132,132 @@ model User {
   @@index([lastOnline])
   @@index([pictureId])
   @@index([deletedAt])
+}
+
+model ContentCampaign {
+  id             String       @id @default(uuid())
+  name           String
+  description    String       @default("")
+  goal           String       @default("")
+  status         String       @default("planning")
+  startAt        DateTime?
+  endAt          DateTime?
+  organizationId String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  ideas          ContentIdea[]
+  postGroups     ContentCampaignPost[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, startAt, endAt])
+}
+
+model ContentCampaignPost {
+  id             String       @id @default(uuid())
+  campaignId     String
+  organizationId String
+  postGroup      String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  campaign       ContentCampaign @relation(fields: [campaignId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([organizationId, postGroup])
+  @@index([organizationId, campaignId])
+  @@index([organizationId, postGroup])
+}
+
+model ContentReview {
+  id             String       @id @default(uuid())
+  organizationId String
+  postGroup      String
+  reviewerEmail  String
+  reviewerName   String?
+  tokenHash      String       @unique
+  status         String       @default("pending")
+  comment        String?
+  expiresAt      DateTime
+  reviewedAt     DateTime?
+  createdById    String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  events         ContentReviewEvent[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, postGroup, createdAt])
+  @@index([organizationId, status, expiresAt])
+}
+
+model ContentReviewEvent {
+  id          String        @id @default(uuid())
+  reviewId    String
+  organizationId String
+  action      String
+  actorEmail  String?
+  actorName   String?
+  comment     String?
+  createdAt   DateTime      @default(now())
+  review      ContentReview @relation(fields: [reviewId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@index([organizationId, reviewId, createdAt])
+}
+
+model ContentIdeaStage {
+  id             String       @id @default(uuid())
+  name           String
+  color          String       @default("#64748b")
+  position       Int          @default(0)
+  organizationId String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  ideas          ContentIdea[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, name])
+  @@index([organizationId, position])
+}
+
+model ContentIdea {
+  id             String           @id @default(uuid())
+  title          String
+  brief          String           @default("")
+  stageId        String
+  position       Int              @default(0)
+  platformTargets String[]        @default([])
+  labels         String[]         @default([])
+  dueDate        DateTime?
+  ownerName      String?
+  campaignId     String?
+  organizationId String
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  stage          ContentIdeaStage @relation(fields: [stageId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  campaign       ContentCampaign? @relation(fields: [campaignId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  attachments    ContentIdeaMedia[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, stageId, position])
+  @@index([organizationId, campaignId])
+  @@index([dueDate])
+}
+
+model ContentIdeaMedia {
+  id             String      @id @default(uuid())
+  ideaId         String
+  mediaId        String
+  organizationId String
+  position       Int         @default(0)
+  createdAt      DateTime    @default(now())
+  idea           ContentIdea @relation(fields: [ideaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  media          Media       @relation(fields: [mediaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([ideaId, mediaId])
+  @@index([organizationId, ideaId, position])
+  @@index([organizationId, mediaId])
 }
 
 model UsedCodes {
@@ -230,16 +361,51 @@ model Media {
   thumbnailTimestamp Int?
   status             String              @default("ready")
   processingError    String?
+  isFavorite         Boolean             @default(false)
+  tags               String[]            @default([])
   organization       Organization        @relation(fields: [organizationId], references: [id])
   agencies           SocialMediaAgency[]
   userPicture        User[]
   oauthApps          OAuthApp[]
+  collectionItems    MediaCollectionItem[]
+  ideaAttachments    ContentIdeaMedia[]
 
+  @@unique([id, organizationId])
   @@index([name])
   @@index([organizationId])
+  @@index([organizationId, isFavorite])
   @@index([type])
 }
 
+model MediaCollection {
+  id             String               @id @default(uuid())
+  name           String
+  description    String               @default("")
+  organizationId String
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+  organization   Organization         @relation(fields: [organizationId], references: [id])
+  items          MediaCollectionItem[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, name])
+  @@index([organizationId, updatedAt])
+}
+
+model MediaCollectionItem {
+  id             String         @id @default(uuid())
+  collectionId   String
+  mediaId        String
+  organizationId String
+  position       Int            @default(0)
+  createdAt      DateTime       @default(now())
+  collection     MediaCollection @relation(fields: [collectionId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  media          Media          @relation(fields: [mediaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([collectionId, mediaId])
+  @@index([organizationId, collectionId, position])
+  @@index([organizationId, mediaId])
+}
 model SocialMediaAgency {
   id               String                   @id @default(uuid())
   userId           String                   @unique
