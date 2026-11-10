@@ -191,6 +191,10 @@ export class MediaService {
               media.organizationId,
               media.id
             );
+            await this._mediaRepository.markRetentionComplete(
+              media.organizationId,
+              media.id
+            );
             if (deleted.success) deletedCount += 1;
           } catch (error: any) {
             Logger.error(
