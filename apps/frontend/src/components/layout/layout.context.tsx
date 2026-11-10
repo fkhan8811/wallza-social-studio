@@ -29,7 +29,10 @@ function LayoutContextInner(params: { children: ReactNode }) {
       if (
         typeof window !== 'undefined' &&
         (window.location.href.includes('/p/') ||
-          window.location.pathname.startsWith('/provider/'))
+          window.location.pathname.startsWith('/provider/') ||
+          // Client review links are bearer-token public routes. They must not
+          // inherit the authenticated app's 401 redirect behavior.
+          window.location.pathname.startsWith('/review/'))
       ) {
         return true;
       }
