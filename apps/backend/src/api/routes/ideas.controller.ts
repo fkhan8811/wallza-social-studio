@@ -160,6 +160,7 @@ export class IdeasController {
       labels?: string[];
       dueDate?: string | null;
       ownerName?: string | null;
+      campaignId?: string | null;
     }
   ) {
     const title = typeof body.title === 'string' ? body.title.trim() : '';
@@ -176,6 +177,15 @@ export class IdeasController {
           orderBy: { position: 'asc' },
         });
     if (!stage) throw new BadRequestException('Choose a valid pipeline stage.');
+    const campaign = body.campaignId
+      ? await this.prisma.contentCampaign.findFirst({
+          where: { id: body.campaignId, organizationId: org.id },
+          select: { id: true },
+        })
+      : null;
+    if (body.campaignId && !campaign) {
+      throw new BadRequestException('Choose a campaign belonging to this organization.');
+    }
 
     const dueDate = body.dueDate ? new Date(body.dueDate) : null;
     if (dueDate && Number.isNaN(dueDate.getTime())) {
@@ -196,6 +206,7 @@ export class IdeasController {
         dueDate,
         ownerName:
           typeof body.ownerName === 'string' ? body.ownerName.trim().slice(0, 80) || null : null,
+        campaign: campaign ? { connect: { id: campaign.id } } : undefined,
       },
     });
   }
@@ -211,6 +222,7 @@ export class IdeasController {
       labels?: string[];
       dueDate?: string | null;
       ownerName?: string | null;
+      campaignId?: string | null;
     }
   ) {
     const existing = await this.prisma.contentIdea.findFirst({
@@ -244,6 +256,19 @@ export class IdeasController {
       data.ownerName =
         typeof body.ownerName === 'string' ? body.ownerName.trim().slice(0, 80) || null : null;
     }
+    if (body.campaignId !== undefined) {
+      const campaignId = typeof body.campaignId === 'string' ? body.campaignId.trim() : '';
+      if (!campaignId) {
+        data.campaign = { disconnect: true };
+      } else {
+        const campaign = await this.prisma.contentCampaign.findFirst({
+          where: { id: campaignId, organizationId: org.id },
+          select: { id: true },
+        });
+        if (!campaign) throw new BadRequestException('Choose a campaign belonging to this organization.');
+        data.campaign = { connect: { id: campaign.id } };
+      }
+    }
     return this.prisma.contentIdea.update({ where: { id }, data });
   }
 
@@ -262,15 +287,58 @@ export class IdeasController {
     ]);
     if (!idea) throw new NotFoundException('Idea not found.');
     if (!stage) throw new NotFoundException('Destination stage not found.');
-    const position =
-      Number.isInteger(body.position) && (body.position as number) >= 0
-        ? (body.position as number)
-        : await this.prisma.contentIdea.count({
-            where: { organizationId: org.id, stageId: stage.id },
-          });
-    return this.prisma.contentIdea.update({
-      where: { id },
-      data: { stageId: stage.id, position },
+    return this.prisma.$transaction(async (tx) => {
+      const destination = await tx.contentIdea.findMany({
+        where: {
+          organizationId: org.id,
+          stageId: stage.id,
+          id: { not: id },
+        },
+        orderBy: [{ position: 'asc' }, { updatedAt: 'asc' }],
+        select: { id: true },
+      });
+      const requestedPosition =
+        Number.isInteger(body.position) && (body.position as number) >= 0
+          ? (body.position as number)
+          : destination.length;
+      const insertAt = Math.min(requestedPosition, destination.length);
+      const orderedIds = destination.map((item) => item.id);
+      orderedIds.splice(insertAt, 0, id);
+
+      await tx.contentIdea.update({
+        where: { id },
+        data: { stageId: stage.id, position: insertAt },
+      });
+      await Promise.all(
+        orderedIds.map((ideaId, index) =>
+          tx.contentIdea.updateMany({
+            where: { id: ideaId, organizationId: org.id, stageId: stage.id },
+            data: { position: index },
+          })
+        )
+      );
+
+      if (idea.stageId !== stage.id) {
+        const source = await tx.contentIdea.findMany({
+          where: {
+            organizationId: org.id,
+            stageId: idea.stageId,
+          },
+          orderBy: [{ position: 'asc' }, { updatedAt: 'asc' }],
+          select: { id: true },
+        });
+        await Promise.all(
+          source.map((item, index) =>
+            tx.contentIdea.updateMany({
+              where: { id: item.id, organizationId: org.id, stageId: idea.stageId },
+              data: { position: index },
+            })
+          )
+        );
+      }
+      return tx.contentIdea.findFirst({
+        where: { id, organizationId: org.id },
+      });
     });
   }
 
