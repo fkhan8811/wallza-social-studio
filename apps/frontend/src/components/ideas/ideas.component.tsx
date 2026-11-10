@@ -15,6 +15,7 @@ type ContentIdea = {
   labels: string[];
   dueDate: string | null;
   ownerName: string | null;
+  campaignId: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -36,6 +37,7 @@ type ConnectedIntegration = {
 };
 
 type IntegrationResponse = { integrations: ConnectedIntegration[] };
+type ContentCampaign = { id: string; name: string; status: string };
 
 const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -67,6 +69,12 @@ export const IdeasComponent: FC = () => {
     return response.json();
   }, [fetch]);
   const { data: integrationData } = useSWR<IntegrationResponse>('/integrations/list', loadIntegrations);
+  const loadCampaigns = useCallback(async (path: string): Promise<ContentCampaign[]> => {
+    const response = await fetch(path);
+    if (!response.ok) throw new Error('Could not load campaigns.');
+    return response.json();
+  }, [fetch]);
+  const { data: campaigns } = useSWR<ContentCampaign[]>('/campaigns', loadCampaigns);
   const [showComposer, setShowComposer] = useState(false);
   const [title, setTitle] = useState('');
   const [brief, setBrief] = useState('');
@@ -75,6 +83,8 @@ export const IdeasComponent: FC = () => {
   const [ownerName, setOwnerName] = useState('');
   const [dueDate, setDueDate] = useState('');
   const [targetStageId, setTargetStageId] = useState('');
+  const [campaignId, setCampaignId] = useState('');
+  const [editingIdeaId, setEditingIdeaId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [draggedIdeaId, setDraggedIdeaId] = useState<string | null>(null);
@@ -97,8 +107,8 @@ export const IdeasComponent: FC = () => {
     setSaving(true);
     setMessage(null);
     try {
-      const response = await fetch('/ideas', {
-        method: 'POST',
+      const response = await fetch(editingIdeaId ? `/ideas/${editingIdeaId}` : '/ideas', {
+        method: editingIdeaId ? 'PUT' : 'POST',
         body: JSON.stringify({
           title: title.trim(),
           brief,
@@ -107,6 +117,7 @@ export const IdeasComponent: FC = () => {
           ownerName: ownerName.trim() || null,
           dueDate: dueDate || null,
           stageId: targetStageId || stages[0]?.id,
+          campaignId: campaignId || null,
         }),
       });
       if (!response.ok) {
@@ -119,6 +130,8 @@ export const IdeasComponent: FC = () => {
       setLabels('');
       setOwnerName('');
       setDueDate('');
+      setCampaignId('');
+      setEditingIdeaId(null);
       setShowComposer(false);
       await mutate();
     } catch (cause) {
@@ -126,14 +139,14 @@ export const IdeasComponent: FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [title, brief, targets, labels, ownerName, dueDate, targetStageId, stages, fetch, mutate]);
+  }, [title, brief, targets, labels, ownerName, dueDate, targetStageId, campaignId, editingIdeaId, stages, fetch, mutate]);
 
-  const moveIdea = useCallback(async (ideaId: string, stageId: string) => {
+  const moveIdea = useCallback(async (ideaId: string, stageId: string, position?: number) => {
     if (!ideaId || !stageId) return;
     setDraggedIdeaId(null);
     const response = await fetch(`/ideas/${ideaId}/move`, {
       method: 'POST',
-      body: JSON.stringify({ stageId }),
+      body: JSON.stringify({ stageId, position }),
     });
     if (!response.ok) {
       setMessage('The idea could not be moved. Please try again.');
@@ -142,6 +155,20 @@ export const IdeasComponent: FC = () => {
     setMessage(null);
     await mutate();
   }, [fetch, mutate]);
+
+  const editIdea = useCallback((idea: ContentIdea) => {
+    setEditingIdeaId(idea.id);
+    setTitle(idea.title);
+    setBrief(idea.brief || '');
+    setTargets((idea.platformTargets || []).join(', '));
+    setLabels((idea.labels || []).join(', '));
+    setOwnerName(idea.ownerName || '');
+    setDueDate(idea.dueDate ? idea.dueDate.slice(0, 10) : '');
+    setTargetStageId(idea.stageId);
+    setCampaignId(idea.campaignId || '');
+    setShowComposer(true);
+    setMessage(null);
+  }, []);
 
   const createDrafts = useCallback(async (idea: ContentIdea) => {
     const available = (integrationData?.integrations || []).filter((integration) => !integration.disabled);
@@ -241,7 +268,7 @@ export const IdeasComponent: FC = () => {
         </div>
         <button
           type="button"
-          onClick={() => setShowComposer((value) => !value)}
+          onClick={() => { if (showComposer) { setShowComposer(false); setEditingIdeaId(null); } else { setEditingIdeaId(null); setTitle(''); setBrief(''); setTargets(''); setLabels(''); setOwnerName(''); setDueDate(''); setCampaignId(''); setShowComposer(true); } }}
           className="rounded-[9px] bg-[#6d4aff] px-[16px] py-[10px] text-[13px] font-[600] text-white hover:opacity-90"
         >
           {showComposer ? 'Close' : '+ New idea'}
@@ -286,9 +313,17 @@ export const IdeasComponent: FC = () => {
               {stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}
             </select>
           </div>
-          <div className="flex justify-end lg:col-span-2">
+          <div className="flex flex-col gap-[6px]">
+            <label className="text-[12px] text-textItemBlur">Campaign</label>
+            <select value={campaignId} onChange={(event) => setCampaignId(event.target.value)} className="rounded-[8px] border border-blockSeparator bg-newBgColor px-[12px] py-[10px] text-[13px] outline-none focus:border-[#8b6cff]">
+              <option value="">No campaign</option>
+              {(campaigns || []).filter((campaign) => campaign.status !== 'archived').map((campaign) => <option key={campaign.id} value={campaign.id}>{campaign.name}</option>)}
+            </select>
+          </div>
+          <div className="flex justify-end gap-[8px] lg:col-span-2">
+            <button type="button" onClick={() => { setShowComposer(false); setEditingIdeaId(null); }} className="rounded-[8px] px-[12px] py-[10px] text-[12px] text-textItemBlur">Cancel</button>
             <button disabled={saving} type="submit" className="rounded-[8px] bg-[#6d4aff] px-[18px] py-[10px] text-[13px] font-[600] text-white disabled:opacity-50">
-              {saving ? 'Saving...' : 'Save idea'}
+              {saving ? 'Saving...' : editingIdeaId ? 'Update idea' : 'Save idea'}
             </button>
           </div>
         </form>
@@ -301,7 +336,7 @@ export const IdeasComponent: FC = () => {
             onDragOver={(event) => event.preventDefault()}
             onDrop={(event) => {
               event.preventDefault();
-              if (draggedIdeaId) void moveIdea(draggedIdeaId, stage.id);
+              if (draggedIdeaId) void moveIdea(draggedIdeaId, stage.id, stage.ideas.length);
             }}
             className="flex min-h-[400px] w-[280px] min-w-[280px] flex-col rounded-[12px] border border-blockSeparator bg-newBgColorInner"
           >
@@ -316,6 +351,8 @@ export const IdeasComponent: FC = () => {
               {stage.ideas.map((idea) => (
                 <article
                   key={idea.id}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => { event.preventDefault(); event.stopPropagation(); if (draggedIdeaId && draggedIdeaId !== idea.id) void moveIdea(draggedIdeaId, stage.id, idea.position); }}
                   draggable
                   onDragStart={() => setDraggedIdeaId(idea.id)}
                   onDragEnd={() => setDraggedIdeaId(null)}
@@ -323,8 +360,9 @@ export const IdeasComponent: FC = () => {
                 >
                   <div className="flex items-start justify-between gap-[8px]">
                     <h3 className="min-w-0 break-words text-[13px] font-[650]">{idea.title}</h3>
-                    <button type="button" aria-label="Delete idea" onClick={() => void deleteIdea(idea.id)} className="shrink-0 text-[12px] text-textItemBlur opacity-0 hover:text-red-400 group-hover:opacity-100">×</button>
+                    <div className="flex shrink-0 items-center gap-[7px]"><button type="button" aria-label="Edit idea" onClick={() => editIdea(idea)} className="text-[11px] text-textItemBlur hover:text-[#b7a5ff]">Edit</button><button type="button" aria-label="Delete idea" onClick={() => void deleteIdea(idea.id)} className="text-[12px] text-textItemBlur hover:text-red-400">×</button></div>
                   </div>
+                  {idea.campaignId && campaigns?.find((campaign) => campaign.id === idea.campaignId) && <div className="mt-[7px] inline-flex rounded-full bg-[#0ea5e9]/10 px-[8px] py-[3px] text-[10px] text-[#7dd3fc]">{campaigns.find((campaign) => campaign.id === idea.campaignId)?.name}</div>}
                   {idea.brief && <p className="mt-[8px] whitespace-pre-wrap break-words text-[12px] leading-[1.55] text-textItemBlur">{idea.brief}</p>}
                   {!!idea.platformTargets?.length && (
                     <div className="mt-[10px] flex flex-wrap gap-[5px]">
