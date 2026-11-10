@@ -26,6 +26,43 @@ const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export class ReviewsController {
   constructor(private readonly prisma: PrismaService) {}
 
+  @Get('/available-post-groups')
+  async availablePostGroups(@GetOrgFromRequest() org: Organization) {
+    const posts = await this.prisma.post.findMany({
+      where: { organizationId: org.id, deletedAt: null },
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+      select: {
+        group: true,
+        title: true,
+        publishDate: true,
+        integration: { select: { name: true } },
+      },
+    });
+    const groups = new Map<string, {
+      group: string;
+      title: string | null;
+      publishDate: Date;
+      channels: string[];
+    }>();
+    for (const post of posts) {
+      const current = groups.get(post.group);
+      if (current) {
+        if (post.integration?.name && !current.channels.includes(post.integration.name)) {
+          current.channels.push(post.integration.name);
+        }
+        continue;
+      }
+      groups.set(post.group, {
+        group: post.group,
+        title: post.title,
+        publishDate: post.publishDate,
+        channels: post.integration?.name ? [post.integration.name] : [],
+      });
+    }
+    return [...groups.values()];
+  }
+
   @Get('/')
   async list(@GetOrgFromRequest() org: Organization) {
     const rows = await this.prisma.contentReview.findMany({
