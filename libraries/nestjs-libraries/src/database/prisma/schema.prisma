@@ -376,6 +376,7 @@ model Media {
   @@index([organizationId])
   @@index([organizationId, isFavorite])
   @@index([type])
+  @@index([retentionExpiresAt])
 }
 
 model MediaCollection {
