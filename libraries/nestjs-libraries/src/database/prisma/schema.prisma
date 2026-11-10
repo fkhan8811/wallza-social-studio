@@ -48,6 +48,7 @@ model Organization {
   contentIdeaStages  ContentIdeaStage[]
   contentIdeas       ContentIdea[]
   contentCampaigns   ContentCampaign[]
+  contentCampaignPosts ContentCampaignPost[]
   contentReviews     ContentReview[]
 
   @@index([apiKey])
@@ -146,9 +147,25 @@ model ContentCampaign {
   updatedAt      DateTime     @updatedAt
   organization   Organization @relation(fields: [organizationId], references: [id])
   ideas          ContentIdea[]
+  postGroups     ContentCampaignPost[]
 
   @@index([organizationId, status])
   @@index([organizationId, startAt, endAt])
+}
+
+model ContentCampaignPost {
+  id             String       @id @default(uuid())
+  campaignId     String
+  organizationId String
+  postGroup      String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  campaign       ContentCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, postGroup])
+  @@index([organizationId, campaignId])
+  @@index([organizationId, postGroup])
 }
 
 model ContentReview {
@@ -166,9 +183,24 @@ model ContentReview {
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   organization   Organization @relation(fields: [organizationId], references: [id])
+  events         ContentReviewEvent[]
 
   @@index([organizationId, postGroup, createdAt])
   @@index([organizationId, status, expiresAt])
+}
+
+model ContentReviewEvent {
+  id          String        @id @default(uuid())
+  reviewId    String
+  organizationId String
+  action      String
+  actorEmail  String?
+  actorName   String?
+  comment     String?
+  createdAt   DateTime      @default(now())
+  review      ContentReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, reviewId, createdAt])
 }
 
 model ContentIdeaStage {
