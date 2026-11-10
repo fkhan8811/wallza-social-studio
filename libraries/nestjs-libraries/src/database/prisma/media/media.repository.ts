@@ -4,7 +4,7 @@ import { SaveMediaInformationDto } from '@gitroom/nestjs-libraries/dtos/media/sa
 
 @Injectable()
 export class MediaRepository {
-  constructor(private _media: PrismaRepository<'media' | 'mediaCollection' | 'mediaCollectionItem' | 'contentIdeaMedia' | '$transaction'>) {}
+  constructor(private _media: PrismaRepository<'media' | 'mediaCollection' | 'mediaCollectionItem' | 'contentIdeaMedia' | 'post' | '$transaction'>) {}
 
   saveFile(org: string, fileName: string, filePath: string, originalName?: string) {
     return this._media.model.media.create({
@@ -101,6 +101,73 @@ export class MediaRepository {
       ]);
       return { success: true };
     });
+  }
+
+  getMediaForOrganization(org: string, id: string) {
+    return this._media.model.media.findFirst({
+      where: { id, organizationId: org, deletedAt: null },
+      select: {
+        id: true,
+        organizationId: true,
+        name: true,
+        path: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  findRetentionCandidates(cutoff: Date, take = 100) {
+    return this._media.model.media.findMany({
+      where: {
+        createdAt: { lt: cutoff },
+        deletedAt: null,
+        status: { not: 'processing' },
+      },
+      orderBy: { createdAt: 'asc' },
+      take,
+      select: {
+        id: true,
+        organizationId: true,
+        name: true,
+        path: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  async getRetentionReferences(org: string, mediaId: string) {
+    const [posts, media] = await Promise.all([
+      this._media.model.post.findMany({
+        where: {
+          organizationId: org,
+          deletedAt: null,
+          image: { contains: mediaId },
+        },
+        select: { state: true, publishDate: true },
+      }),
+      this._media.model.media.findFirst({
+        where: { id: mediaId, organizationId: org, deletedAt: null },
+        select: {
+          _count: {
+            select: {
+              userPicture: true,
+              agencies: true,
+              oauthApps: true,
+              ideaAttachments: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    const counts = media?._count;
+    const permanentReferences =
+      (counts?.userPicture || 0) +
+      (counts?.agencies || 0) +
+      (counts?.oauthApps || 0) +
+      (counts?.ideaAttachments || 0);
+
+    return { posts, permanentReferences };
   }
 
   saveMediaInformation(org: string, data: SaveMediaInformationDto) {
