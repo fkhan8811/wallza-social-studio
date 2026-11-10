@@ -581,12 +581,7 @@ export const MediaBox: FC<{
   return (
     <DropFiles disabled={loading} className="flex flex-col flex-1" onDrop={dragAndDrop}>
       <div className="flex flex-col flex-1">
-        <div
-          className={clsx(
-            'flex items-center gap-[12px] mobile:flex-wrap',
-            ''
-          )}
-        >
+        <div className="flex items-center gap-[12px] mobile:flex-wrap">
           <div className="flex-1 mobile:basis-full">
             <input
               type="text"
@@ -889,7 +884,7 @@ export const MediaBox: FC<{
                       {media.originalName}
                     </div>
                     {!!media.tags?.length && (
-                      <div className="absolute bottom-[38px] start-[7px] end-[7px] z-[100] flex flex-wrap gap-[3px] overflow-hidden">
+                      <div className={clsx('absolute start-[7px] end-[7px] z-[100] flex flex-wrap gap-[3px] overflow-hidden', collectionId ? 'bottom-[65px]' : 'bottom-[38px]')}>
                         {media.tags.slice(0, 3).map((tag: string) => (
                           <span key={tag} className="max-w-full truncate rounded-[4px] bg-black/65 px-[5px] py-[2px] text-[9px] text-white">{tag}</span>
                         ))}
