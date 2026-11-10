@@ -234,7 +234,7 @@ model ContentIdea {
   updatedAt      DateTime         @updatedAt
   organization   Organization     @relation(fields: [organizationId], references: [id])
   stage          ContentIdeaStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
-  campaign       ContentCampaign? @relation(fields: [campaignId, organizationId], references: [id, organizationId], onDelete: SetNull)
+  campaign       ContentCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([organizationId, stageId, position])
   @@index([organizationId, campaignId])
