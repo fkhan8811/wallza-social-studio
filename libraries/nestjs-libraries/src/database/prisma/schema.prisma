@@ -47,6 +47,8 @@ model Organization {
   oauthAuthorizations OAuthAuthorization[]
   contentIdeaStages  ContentIdeaStage[]
   contentIdeas       ContentIdea[]
+  contentCampaigns   ContentCampaign[]
+  contentReviews     ContentReview[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -131,6 +133,44 @@ model User {
   @@index([deletedAt])
 }
 
+model ContentCampaign {
+  id             String       @id @default(uuid())
+  name           String
+  description    String       @default("")
+  goal           String       @default("")
+  status         String       @default("planning")
+  startAt        DateTime?
+  endAt          DateTime?
+  organizationId String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  ideas          ContentIdea[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, startAt, endAt])
+}
+
+model ContentReview {
+  id             String       @id @default(uuid())
+  organizationId String
+  postGroup      String
+  reviewerEmail  String
+  reviewerName   String?
+  tokenHash      String       @unique
+  status         String       @default("pending")
+  comment        String?
+  expiresAt      DateTime
+  reviewedAt     DateTime?
+  createdById    String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, postGroup, createdAt])
+  @@index([organizationId, status, expiresAt])
+}
+
 model ContentIdeaStage {
   id             String       @id @default(uuid())
   name           String
@@ -156,13 +196,16 @@ model ContentIdea {
   labels         String[]         @default([])
   dueDate        DateTime?
   ownerName      String?
+  campaignId     String?
   organizationId String
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
   organization   Organization     @relation(fields: [organizationId], references: [id])
   stage          ContentIdeaStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  campaign       ContentCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([organizationId, stageId, position])
+  @@index([organizationId, campaignId])
   @@index([dueDate])
 }
 
