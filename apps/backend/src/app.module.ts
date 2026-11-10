@@ -6,6 +6,7 @@ import { PoliciesGuard } from '@gitroom/backend/services/auth/permissions/permis
 import { PublicApiModule } from '@gitroom/backend/public-api/public.api.module';
 import { ThrottlerBehindProxyGuard } from '@gitroom/nestjs-libraries/throttler/throttler.provider';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AgentModule } from '@gitroom/nestjs-libraries/agent/agent.module';
 import { ThirdPartyModule } from '@gitroom/nestjs-libraries/3rdparties/thirdparty.module';
 import { VideoModule } from '@gitroom/nestjs-libraries/videos/video.module';
@@ -22,6 +23,7 @@ import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 @Module({
   imports: [
     SentryModule.forRoot(),
+    ScheduleModule.forRoot(),
     DatabaseModule,
     ApiModule,
     PublicApiModule,
