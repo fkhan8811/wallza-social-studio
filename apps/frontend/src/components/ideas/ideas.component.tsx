@@ -4,6 +4,7 @@ import { FC, FormEvent, useCallback, useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import { LoadingComponent } from '@gitroom/frontend/components/layout/loading';
+import { showMediaBox } from '@gitroom/frontend/components/media/media.component';
 
 type ContentIdea = {
   id: string;
@@ -16,6 +17,19 @@ type ContentIdea = {
   dueDate: string | null;
   ownerName: string | null;
   campaignId: string | null;
+  attachments?: Array<{
+    id: string;
+    mediaId: string;
+    media: {
+      id: string;
+      originalName: string | null;
+      name: string;
+      path: string;
+      thumbnail: string | null;
+      alt: string | null;
+      type: string;
+    };
+  }>;
   createdAt: string;
   updatedAt: string;
 };
@@ -227,6 +241,33 @@ export const IdeasComponent: FC = () => {
     }
   }, [integrationData, fetch]);
 
+  const attachMedia = useCallback((ideaId: string) => {
+    showMediaBox(async (media) => {
+      const response = await fetch(`/ideas/${ideaId}/attachments`, {
+        method: 'POST',
+        body: JSON.stringify({ mediaId: media.id }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        setMessage(payload.message || 'Could not attach this media item to the idea.');
+        return;
+      }
+      setMessage('Media attached to the idea.');
+      await mutate();
+    });
+  }, [fetch, mutate]);
+
+  const removeAttachment = useCallback(async (ideaId: string, mediaId: string) => {
+    const response = await fetch(`/ideas/${ideaId}/attachments/${mediaId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      setMessage('Could not remove this attachment.');
+      return;
+    }
+    await mutate();
+  }, [fetch, mutate]);
+
   const deleteIdea = useCallback(async (ideaId: string) => {
     if (!window.confirm('Delete this idea? This cannot be undone.')) return;
     const response = await fetch(`/ideas/${ideaId}`, { method: 'DELETE' });
@@ -374,6 +415,32 @@ export const IdeasComponent: FC = () => {
                       {idea.labels.map((label) => <span key={label} className="rounded-full bg-newBgColorInner px-[7px] py-[3px] text-[10px] text-textItemBlur">{label}</span>)}
                     </div>
                   )}
+                  {!!idea.attachments?.length && (
+                    <div className="mt-[10px] flex flex-col gap-[5px]">
+                      {idea.attachments.map((attachment) => (
+                        <div key={attachment.id} className="flex min-w-0 items-center justify-between gap-[7px] rounded-[7px] border border-blockSeparator bg-newBgColorInner px-[8px] py-[6px]">
+                          <span className="min-w-0 truncate text-[10px] text-textItemBlur" title={attachment.media.alt || attachment.media.originalName || attachment.media.name}>
+                            {attachment.media.originalName || attachment.media.name}
+                          </span>
+                          <button
+                            type="button"
+                            aria-label="Remove attachment"
+                            onClick={(event) => { event.stopPropagation(); void removeAttachment(idea.id, attachment.mediaId); }}
+                            className="shrink-0 text-[11px] text-textItemBlur hover:text-red-400"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={(event) => { event.stopPropagation(); attachMedia(idea.id); }}
+                    className="mt-[9px] w-full rounded-[7px] border border-blockSeparator px-[9px] py-[7px] text-[11px] text-textItemBlur hover:border-[#8b6cff] hover:text-[#b7a5ff]"
+                  >
+                    + Attach from Media Library
+                  </button>
                   <div className="mt-[12px] flex flex-wrap items-center justify-between gap-[8px] border-t border-blockSeparator pt-[9px] text-[10px] text-textItemBlur">
                     <span>{idea.ownerName || 'Unassigned'}</span>
                     {readableDate(idea.dueDate) && <span>Due {readableDate(idea.dueDate)}</span>}
