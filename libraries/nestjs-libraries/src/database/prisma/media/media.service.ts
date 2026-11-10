@@ -491,8 +491,47 @@ export class MediaService {
     );
   }
 
-  getMedia(org: string, page: number, search?: string) {
-    return this._mediaRepository.getMedia(org, page, search);
+  getMedia(
+    org: string,
+    page: number,
+    search?: string,
+    favorite?: boolean,
+    tag?: string,
+    collectionId?: string
+  ) {
+    return this._mediaRepository.getMedia(org, page, search, favorite, tag, collectionId);
+  }
+
+  setFavorite(org: string, id: string, favorite: boolean) {
+    return this._mediaRepository.setFavorite(org, id, favorite);
+  }
+
+  setTags(org: string, id: string, tags: string[]) {
+    return this._mediaRepository.setTags(org, id, tags);
+  }
+
+  getCollections(org: string) {
+    return this._mediaRepository.getCollections(org);
+  }
+
+  createCollection(org: string, name: string, description: string) {
+    return this._mediaRepository.createCollection(org, name, description);
+  }
+
+  updateCollection(org: string, id: string, name?: string, description?: string) {
+    return this._mediaRepository.updateCollection(org, id, name, description);
+  }
+
+  deleteCollection(org: string, id: string) {
+    return this._mediaRepository.deleteCollection(org, id);
+  }
+
+  addToCollection(org: string, collectionId: string, mediaId: string) {
+    return this._mediaRepository.addToCollection(org, collectionId, mediaId);
+  }
+
+  removeFromCollection(org: string, collectionId: string, mediaId: string) {
+    return this._mediaRepository.removeFromCollection(org, collectionId, mediaId);
   }
 
   saveMediaInformation(org: string, data: SaveMediaInformationDto) {
