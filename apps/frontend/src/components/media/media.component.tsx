@@ -230,6 +230,7 @@ export const MediaBox: FC<{
   const [debouncedSearch] = useDebounce(search, 300);
   const [favoriteOnly, setFavoriteOnly] = useState(false);
   const [activeTag, setActiveTag] = useState('');
+  const [debouncedTag] = useDebounce(activeTag, 300);
   const [collectionId, setCollectionId] = useState('');
   const [newCollectionName, setNewCollectionName] = useState('');
   const [showNewCollection, setShowNewCollection] = useState(false);
@@ -253,11 +254,11 @@ export const MediaBox: FC<{
     const params = new URLSearchParams({ page: String(page + 1) });
     if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim());
     if (favoriteOnly) params.set('favorite', 'true');
-    if (activeTag.trim()) params.set('tag', activeTag.trim().toLowerCase());
+    if (debouncedTag.trim()) params.set('tag', debouncedTag.trim().toLowerCase());
     if (collectionId) params.set('collectionId', collectionId);
     return (await fetch(`/media?${params.toString()}`)).json();
-  }, [page, debouncedSearch, favoriteOnly, activeTag, collectionId, fetch]);
-  const mediaKey = `get-media-${page}-${debouncedSearch}-${favoriteOnly}-${activeTag}-${collectionId}`;
+  }, [page, debouncedSearch, favoriteOnly, debouncedTag, collectionId, fetch]);
+  const mediaKey = `get-media-${page}-${debouncedSearch}-${favoriteOnly}-${debouncedTag}-${collectionId}`;
   const { data, mutate, isLoading } = useSWR(mediaKey, loadMedia);
 
   const toggleFavorite = useCallback(async (media: any) => {
@@ -303,6 +304,18 @@ export const MediaBox: FC<{
     }
     await Promise.all([mutate(), mutateCollections()]);
   }, [fetch, mutate, mutateCollections]);
+
+  const removeFromCollection = useCallback(async (mediaId: string) => {
+    if (!collectionId) return;
+    const response = await fetch(`/media/collections/${collectionId}/media/${mediaId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      toaster.show('Could not remove this asset from the collection.', 'warning');
+      return;
+    }
+    await Promise.all([mutate(), mutateCollections()]);
+  }, [collectionId, fetch, mutate, mutateCollections, toaster]);
 
   const createCollection = useCallback(async () => {
     const name = newCollectionName.trim();
@@ -571,7 +584,7 @@ export const MediaBox: FC<{
         <div
           className={clsx(
             'flex items-center gap-[12px] mobile:flex-wrap',
-            false && 'hidden'
+            ''
           )}
         >
           <div className="flex-1 mobile:basis-full">
@@ -855,10 +868,22 @@ export const MediaBox: FC<{
                         </select>
                       )}
                     </div>
+                    {collectionId && (
+                      <button
+                        type="button"
+                        onClick={(event) => { event.stopPropagation(); void removeFromCollection(media.id); }}
+                        title="Remove from this collection"
+                        aria-label="Remove from this collection"
+                        className="absolute bottom-[7px] start-[7px] z-[110] rounded-[5px] bg-black/75 px-[7px] py-[4px] text-[9px] text-white"
+                      >
+                        Remove
+                      </button>
+                    )}
                     <div
                       className={clsx(
                         'absolute bottom-[10px] start-[10px] end-[10px] z-[100] truncate text-end mobile:text-[12px] rounded-[4px] px-[6px] bg-black/60 text-white',
-                        !standalone && 'mobile:hidden'
+                        !standalone && 'mobile:hidden',
+                        collectionId && 'bottom-[38px]'
                       )}
                     >
                       {media.originalName}
