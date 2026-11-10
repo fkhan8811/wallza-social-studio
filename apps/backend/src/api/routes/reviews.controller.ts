@@ -97,7 +97,16 @@ export class ReviewsController {
       where: { organizationId: org.id },
       orderBy: { createdAt: 'desc' },
       take: 100,
-      include: {
+      select: {
+        id: true,
+        postGroup: true,
+        reviewerEmail: true,
+        reviewerName: true,
+        status: true,
+        comment: true,
+        expiresAt: true,
+        reviewedAt: true,
+        createdAt: true,
         events: {
           orderBy: { createdAt: 'asc' },
           select: {
