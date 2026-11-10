@@ -215,6 +215,7 @@ model ContentIdeaStage {
   organization   Organization @relation(fields: [organizationId], references: [id])
   ideas          ContentIdea[]
 
+  @@unique([id, organizationId])
   @@unique([organizationId, name])
   @@index([organizationId, position])
 }
@@ -234,8 +235,8 @@ model ContentIdea {
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
   organization   Organization     @relation(fields: [organizationId], references: [id])
-  stage          ContentIdeaStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
-  campaign       ContentCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  stage          ContentIdeaStage @relation(fields: [stageId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  campaign       ContentCampaign? @relation(fields: [campaignId, organizationId], references: [id, organizationId], onDelete: Restrict)
   attachments    ContentIdeaMedia[]
 
   @@unique([id, organizationId])
