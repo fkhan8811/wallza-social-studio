@@ -208,6 +208,14 @@ export const IdeasComponent: FC = () => {
     try {
       const content = [idea.title, idea.brief].filter(Boolean).join('\n\n');
       const date = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      // Reuse the existing Media Library records in native Postiz drafts.
+      // The API normalizes these IDs/paths against the organization-owned
+      // media records before saving or publishing.
+      const attachedMedia = (idea.attachments || []).map(({ media }) => ({
+        id: media.id,
+        path: media.path,
+        ...(media.alt ? { alt: media.alt } : {}),
+      }));
       const response = await fetch('/posts', {
         method: 'POST',
         body: JSON.stringify({
@@ -225,7 +233,7 @@ export const IdeasComponent: FC = () => {
               tags: [],
               subreddit: [],
             },
-            value: [{ id: '', content, delay: 0, image: [] }],
+            value: [{ id: '', content, delay: 0, image: attachedMedia }],
           })),
         }),
       });
