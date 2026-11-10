@@ -30,6 +30,7 @@ model Organization {
   github              GitHub[]
   Integration         Integration[]
   media               Media[]
+  mediaCollections   MediaCollection[]
   buyerOrganization   MessagesGroup[]
   notifications       Notifications[]
   plugs               Plugs[]
@@ -342,16 +343,50 @@ model Media {
   thumbnailTimestamp Int?
   status             String              @default("ready")
   processingError    String?
+  isFavorite         Boolean             @default(false)
+  tags               String[]            @default([])
   organization       Organization        @relation(fields: [organizationId], references: [id])
   agencies           SocialMediaAgency[]
   userPicture        User[]
   oauthApps          OAuthApp[]
+  collectionItems    MediaCollectionItem[]
 
+  @@unique([id, organizationId])
   @@index([name])
   @@index([organizationId])
+  @@index([organizationId, isFavorite])
   @@index([type])
 }
 
+model MediaCollection {
+  id             String               @id @default(uuid())
+  name           String
+  description    String               @default("")
+  organizationId String
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+  organization   Organization         @relation(fields: [organizationId], references: [id])
+  items          MediaCollectionItem[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, name])
+  @@index([organizationId, updatedAt])
+}
+
+model MediaCollectionItem {
+  id             String         @id @default(uuid())
+  collectionId   String
+  mediaId        String
+  organizationId String
+  position       Int            @default(0)
+  createdAt      DateTime       @default(now())
+  collection     MediaCollection @relation(fields: [collectionId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  media          Media          @relation(fields: [mediaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([collectionId, mediaId])
+  @@index([organizationId, collectionId, position])
+  @@index([organizationId, mediaId])
+}
 model SocialMediaAgency {
   id               String                   @id @default(uuid())
   userId           String                   @unique
