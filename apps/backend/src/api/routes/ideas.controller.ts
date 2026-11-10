@@ -410,9 +410,13 @@ export class IdeasController {
       const orderedIds = destination.map((item) => item.id);
       orderedIds.splice(insertAt, 0, id);
 
+      const moveData: Prisma.ContentIdeaUncheckedUpdateInput = {
+        stageId: stage.id,
+        position: insertAt,
+      };
       await tx.contentIdea.update({
         where: { id },
-        data: { stageId: stage.id, position: insertAt },
+        data: moveData,
       });
       await Promise.all(
         orderedIds.map((ideaId, index) =>
