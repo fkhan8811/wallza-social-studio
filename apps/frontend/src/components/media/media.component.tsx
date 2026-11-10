@@ -238,9 +238,12 @@ export const MediaBox: FC<{
   const fetch = useFetch();
   const modals = useModals();
   const toaster = useToaster();
+  // A filter change can reduce the result set below the current page.
+  // Return to the first page so filtered collections/favorites/tags never
+  // appear empty merely because the old page index is now out of range.
   useEffect(() => {
     setPage(0);
-  }, [debouncedSearch]);
+  }, [debouncedSearch, favoriteOnly, debouncedTag, collectionId]);
   const loadCollections = useCallback(async (): Promise<MediaCollectionOption[]> => {
     const response = await fetch('/media/collections');
     if (!response.ok) throw new Error('Could not load media collections.');
