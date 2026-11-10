@@ -30,13 +30,54 @@ const optionalDate = (value: unknown, label: string): Date | null | undefined =>
 export class CampaignsController {
   constructor(private readonly prisma: PrismaService) {}
 
+  @Get('/available-post-groups')
+  async availablePostGroups(@GetOrgFromRequest() org: Organization) {
+    const posts = await this.prisma.post.findMany({
+      where: { organizationId: org.id, deletedAt: null },
+      orderBy: { publishDate: 'desc' },
+      take: 1000,
+      select: {
+        group: true,
+        title: true,
+        publishDate: true,
+        state: true,
+        integration: { select: { name: true } },
+      },
+    });
+    const groups = new Map<string, {
+      group: string;
+      title: string | null;
+      publishDate: Date;
+      channels: string[];
+      postCount: number;
+    }>();
+    for (const post of posts) {
+      const current = groups.get(post.group);
+      if (current) {
+        current.postCount += 1;
+        if (post.integration?.name && !current.channels.includes(post.integration.name)) {
+          current.channels.push(post.integration.name);
+        }
+      } else {
+        groups.set(post.group, {
+          group: post.group,
+          title: post.title,
+          publishDate: post.publishDate,
+          channels: post.integration?.name ? [post.integration.name] : [],
+          postCount: 1,
+        });
+      }
+    }
+    return [...groups.values()];
+  }
+
   @Get('/')
   async list(@GetOrgFromRequest() org: Organization) {
     return this.prisma.contentCampaign.findMany({
       where: { organizationId: org.id },
       orderBy: [{ updatedAt: 'desc' }],
       include: {
-        _count: { select: { ideas: true } },
+        _count: { select: { ideas: true, postGroups: true } },
       },
     });
   }
@@ -136,6 +177,133 @@ export class CampaignsController {
     }
 
     return this.prisma.contentCampaign.update({ where: { id }, data });
+  }
+
+  @Post('/:id/post-groups')
+  async attachPostGroup(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: { postGroup?: string }
+  ) {
+    const campaign = await this.prisma.contentCampaign.findFirst({
+      where: { id, organizationId: org.id },
+      select: { id: true },
+    });
+    if (!campaign) throw new NotFoundException('Campaign not found.');
+
+    const postGroup = typeof body.postGroup === 'string' ? body.postGroup.trim() : '';
+    if (!postGroup || postGroup.length > 160) {
+      throw new BadRequestException('Choose a valid post group.');
+    }
+    const posts = await this.prisma.post.findMany({
+      where: { group: postGroup, organizationId: org.id, deletedAt: null },
+      select: { id: true },
+      take: 1,
+    });
+    if (!posts.length) throw new NotFoundException('Post group not found in this organization.');
+
+    // One post group belongs to at most one campaign in an organization.
+    // Re-attaching it moves the group rather than creating duplicates.
+    return this.prisma.contentCampaignPost.upsert({
+      where: {
+        organizationId_postGroup: {
+          organizationId: org.id,
+          postGroup,
+        },
+      },
+      create: {
+        organizationId: org.id,
+        campaignId: campaign.id,
+        postGroup,
+      },
+      update: { campaignId: campaign.id },
+    });
+  }
+
+  @Delete('/:id/post-groups/:postGroup')
+  async detachPostGroup(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Param('postGroup') postGroup: string
+  ) {
+    const result = await this.prisma.contentCampaignPost.deleteMany({
+      where: { campaignId: id, organizationId: org.id, postGroup },
+    });
+    if (result.count === 0) throw new NotFoundException('Campaign post group not found.');
+    return { success: true };
+  }
+
+  @Get('/:id/post-groups')
+  async campaignPostGroups(@GetOrgFromRequest() org: Organization, @Param('id') id: string) {
+    const campaign = await this.prisma.contentCampaign.findFirst({
+      where: { id, organizationId: org.id },
+      select: { id: true },
+    });
+    if (!campaign) throw new NotFoundException('Campaign not found.');
+
+    const links = await this.prisma.contentCampaignPost.findMany({
+      where: { campaignId: id, organizationId: org.id },
+      orderBy: { createdAt: 'desc' },
+      select: { postGroup: true, createdAt: true },
+    });
+    if (!links.length) return [];
+
+    const posts = await this.prisma.post.findMany({
+      where: {
+        organizationId: org.id,
+        deletedAt: null,
+        group: { in: links.map((link) => link.postGroup) },
+      },
+      orderBy: { publishDate: 'asc' },
+      select: {
+        group: true,
+        title: true,
+        content: true,
+        state: true,
+        publishDate: true,
+        releaseURL: true,
+        integration: { select: { name: true, providerIdentifier: true } },
+      },
+    });
+    const grouped = new Map<string, {
+      group: string;
+      createdAt: Date;
+      title: string | null;
+      channels: string[];
+      postCount: number;
+      states: Record<string, number>;
+      posts: Array<Record<string, unknown>>;
+    }>();
+    for (const link of links) {
+      grouped.set(link.postGroup, {
+        group: link.postGroup,
+        createdAt: link.createdAt,
+        title: null,
+        channels: [],
+        postCount: 0,
+        states: {},
+        posts: [],
+      });
+    }
+    for (const post of posts) {
+      const item = grouped.get(post.group);
+      if (!item) continue;
+      item.title ||= post.title;
+      item.postCount += 1;
+      item.states[String(post.state)] = (item.states[String(post.state)] || 0) + 1;
+      if (post.integration?.name && !item.channels.includes(post.integration.name)) {
+        item.channels.push(post.integration.name);
+      }
+      item.posts.push({
+        title: post.title,
+        state: post.state,
+        publishDate: post.publishDate,
+        releaseURL: post.releaseURL,
+        channel: post.integration?.name || post.integration?.providerIdentifier || 'Channel',
+        content: post.content,
+      });
+    }
+    return [...grouped.values()];
   }
 
   @Delete('/:id')
