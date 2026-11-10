@@ -59,39 +59,45 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 
 ## Feature implementation status — branch `wallza/social-studio-feature-upgrades`
 
-### Implemented in this branch (not yet merged into main)
+### Implemented in the feature branch (not yet merged into `main`)
 
-- Organization-scoped `ContentIdeaStage` and `ContentIdea` Prisma models.
-- Authenticated, organization-scoped Ideas API for listing stages, creating/updating/deleting ideas, adding/updating/deleting empty stages, and moving ideas between stages.
-- Default content pipeline stages: Inbox, Idea, Brief, In production, Ready, Scheduled, Published and Archived.
-- Native Ideas Kanban page with drag-and-drop stage changes, idea creation, platform targets, labels, owner name and due date.
-- Create-drafts action that uses the existing authenticated integrations and native `POST /posts` draft flow. When platform targets are specified, connected accounts are matched against those targets; otherwise drafts are created for all active connected accounts.
+- Organization-scoped `ContentIdeaStage` and `ContentIdea` models, default pipeline stages, authenticated APIs, stage management, idea create/edit/delete, campaign assignment and ordered Kanban moves.
+- Ideas Kanban UI with drag-and-drop between stages and positions, editable cards, platform targets, labels, owner, due date, campaign association and create-native-drafts action using existing connected social accounts.
+- Organization-scoped `ContentCampaign` model and CRUD API with name, description, goal, status and start/end dates; Campaigns page added to the sidebar. Ideas can be assigned to a campaign. Campaigns are not yet attached to already scheduled/published posts or analytics.
+- Organization-scoped `ContentReview` model and review-management API. Review links use 256-bit random tokens; only SHA-256 token hashes are stored. Links expire (1–30 days), can be revoked while pending, and return only the selected post data for the matching organization/post group.
+- Public, token-only review page with approve/request-changes decisions and reviewer comments. Decisions do not publish posts automatically. Reviewers do not receive a Postiz user or workspace membership.
+- Campaigns and Reviews navigation entries.
 
-### Not yet implemented
+### Still not implemented or not production-ready
 
-- Rich card editing UI and reliable in-column ordering controls.
-- Client-facing review portal, expiring reviewer links, approval/request-changes workflow and approval audit history.
+- Email invitations / automated reviewer notification. The review link is currently shown once in the UI and must be sent through an approved communication channel.
+- A detailed immutable approval audit/event history, multi-reviewer workflow, per-post decisions, revision rounds, and approval policy enforcement in the publishing pipeline.
+- Campaign-to-post linking, campaign calendars, campaign performance reporting and owner/member assignment.
 - Advanced media library folders, collections, tags, favorites and asset usage tracking.
 - Full carousel/image editor and durable multi-track video editor.
 - Expanded queue rules, reusable queue templates and posting-slot controls.
-- Campaign management.
+- Attachments and a shared creative asset picker inside idea cards.
+- Comprehensive API/controller tests and end-to-end tests for idea-to-draft, campaign workflows and public review decisions.
 
-### Validation and deployment notes
+### Validation and release gates
 
-- The Prisma schema has changed. Run `pnpm run prisma-generate` and `pnpm run prisma-db-push` against the intended database before starting the updated application.
-- Build and runtime checks have not yet been run from a complete local checkout. Do not treat this branch as production-ready until the schema update, backend build, frontend build and end-to-end idea-to-draft flow are verified.
-- No changes have been made to `main`; no external repository has been added as a deployable service.
+- The Prisma schema changed. Run `pnpm run prisma-generate` and `pnpm run prisma-db-push` only against a disposable test database first. Do not run schema push against production.
+- The repository's `.github/workflows/build.yml` runs dependency installation and the workspace build on pushes and pull requests. A green build is required on the final feature-branch commit before this branch can be marked code-complete.
+- No live Postiz app build, database migration, browser test or end-to-end workflow has been run from a complete checkout in this session.
+- Validate public review links with expiry, revoke, repeated submission, wrong-organization post groups, and safe preview rendering. The review URL is a bearer secret: never log or persist the raw token.
+- No production database, Render service, external account credentials or upstream Postiz branch has been changed.
 
 ## Current repository facts verified
 
 - Repository: `fkhan8811/wallza-social-studio`
+- Fork parent: `gitroomhq/postiz-app`
 - Default branch: `main`
-- Working branch: `wallza/integrated-studio-foundation`
+- Working branch: `wallza/social-studio-feature-upgrades`
 - Existing app shell: `apps/frontend/src/components/new-layout/layout.component.tsx`
 - Existing sidebar: `apps/frontend/src/components/layout/top.menu.tsx`
 - Existing route group: `apps/frontend/src/app/(app)/(site)/`
 - Existing product routes include Launches/Calendar, Agents, Analytics and Media.
 
-## First implementation boundary
+## Current integration boundary
 
-The first feature to implement is Ideas & Content Pipeline, using the existing workspace and native post composer. The Creative Studio and approval portal follow as separate increments. No WallzaOS backend/frontend merge is part of this phase.
+Keep Social Studio as a customized Postiz fork while Meta approval is pending. Use its existing social account connections and organization model; do not create duplicate OAuth or inbox systems. WallzaOS integration remains a separate later step. The current draft PR must stay unmerged until CI, database validation and feature-level end-to-end checks pass.
