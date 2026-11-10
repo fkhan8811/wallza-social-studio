@@ -73,6 +73,25 @@ export class IdeasController {
         ideas: {
           where: { organizationId: org.id },
           orderBy: [{ position: 'asc' }, { updatedAt: 'desc' }],
+          include: {
+            attachments: {
+              where: { organizationId: org.id },
+              orderBy: { position: 'asc' },
+              include: {
+                media: {
+                  select: {
+                    id: true,
+                    name: true,
+                    originalName: true,
+                    path: true,
+                    thumbnail: true,
+                    alt: true,
+                    type: true,
+                  },
+                },
+              },
+            },
+          },
         },
       },
     });
@@ -279,6 +298,83 @@ export class IdeasController {
       }
     }
     return this.prisma.contentIdea.update({ where: { id }, data });
+  }
+
+  @Post('/:id/attachments')
+  async addAttachment(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body('mediaId') mediaId: string
+  ) {
+    if (typeof mediaId !== 'string' || !mediaId.trim()) {
+      throw new BadRequestException('A media ID is required.');
+    }
+    const normalizedMediaId = mediaId.trim();
+    return this.prisma.$transaction(async (tx) => {
+      const [idea, media] = await Promise.all([
+        tx.contentIdea.findFirst({
+          where: { id, organizationId: org.id },
+          select: { id: true },
+        }),
+        tx.media.findFirst({
+          where: {
+            id: normalizedMediaId,
+            organizationId: org.id,
+            deletedAt: null,
+            status: { not: 'processing' },
+          },
+          select: { id: true },
+        }),
+      ]);
+      if (!idea) throw new NotFoundException('Idea not found.');
+      if (!media) throw new NotFoundException('Media item not found in this workspace.');
+
+      const last = await tx.contentIdeaMedia.aggregate({
+        where: { ideaId: id, organizationId: org.id },
+        _max: { position: true },
+      });
+      return tx.contentIdeaMedia.upsert({
+        where: { ideaId_mediaId: { ideaId: id, mediaId: normalizedMediaId } },
+        create: {
+          ideaId: id,
+          mediaId: normalizedMediaId,
+          organizationId: org.id,
+          position: (last._max.position ?? -1) + 1,
+        },
+        update: {},
+        include: {
+          media: {
+            select: {
+              id: true,
+              name: true,
+              originalName: true,
+              path: true,
+              thumbnail: true,
+              alt: true,
+              type: true,
+            },
+          },
+        },
+      });
+    });
+  }
+
+  @Delete('/:id/attachments/:mediaId')
+  async removeAttachment(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Param('mediaId') mediaId: string
+  ) {
+    const idea = await this.prisma.contentIdea.findFirst({
+      where: { id, organizationId: org.id },
+      select: { id: true },
+    });
+    if (!idea) throw new NotFoundException('Idea not found.');
+    const result = await this.prisma.contentIdeaMedia.deleteMany({
+      where: { ideaId: id, mediaId, organizationId: org.id },
+    });
+    if (!result.count) throw new NotFoundException('Attachment not found.');
+    return { success: true };
   }
 
   @Post('/:id/move')
