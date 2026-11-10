@@ -23,6 +23,32 @@ const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 type ReviewerInput = { email?: string; name?: string };
 
+type PublicReviewMedia = { url: string; alt: string };
+
+const safeReviewMedia = (serialized: string | null): PublicReviewMedia[] => {
+  if (!serialized || serialized.length > 100_000) return [];
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.slice(0, 10).flatMap((item: any) => {
+      const candidate = typeof item?.url === 'string' ? item.url : '';
+      if (!candidate || candidate.length > 2048) return [];
+      try {
+        const url = new URL(candidate);
+        if (url.protocol !== 'https:') return [];
+        return [{
+          url: url.toString(),
+          alt: typeof item?.alt === 'string' ? item.alt.slice(0, 300) : '',
+        }];
+      } catch {
+        return [];
+      }
+    });
+  } catch {
+    return [];
+  }
+};
+
 @ApiTags('Reviews')
 @Controller('/reviews')
 export class ReviewsController {
@@ -275,7 +301,13 @@ export class PublicReviewsController {
         expiresAt: review.expiresAt,
         reviewedAt: review.reviewedAt,
       },
-      posts,
+      // Do not expose the stored image JSON verbatim: it can contain the
+      // backend's local filesystem path. Return only validated public HTTPS
+      // URLs and bounded alt text for the external reviewer.
+      posts: posts.map(({ image, ...post }) => ({
+        ...post,
+        media: safeReviewMedia(image),
+      })),
     };
   }
 
