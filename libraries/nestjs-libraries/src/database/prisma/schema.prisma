@@ -48,7 +48,6 @@ model Organization {
   contentIdeaStages  ContentIdeaStage[]
   contentIdeas       ContentIdea[]
   contentCampaigns   ContentCampaign[]
-  contentCampaignPosts ContentCampaignPost[]
   contentReviews     ContentReview[]
 
   @@index([apiKey])
@@ -149,6 +148,7 @@ model ContentCampaign {
   ideas          ContentIdea[]
   postGroups     ContentCampaignPost[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, status])
   @@index([organizationId, startAt, endAt])
 }
@@ -160,8 +160,7 @@ model ContentCampaignPost {
   postGroup      String
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
-  campaign       ContentCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  campaign       ContentCampaign @relation(fields: [campaignId, organizationId], references: [id, organizationId], onDelete: Cascade)
 
   @@unique([organizationId, postGroup])
   @@index([organizationId, campaignId])
@@ -185,6 +184,7 @@ model ContentReview {
   organization   Organization @relation(fields: [organizationId], references: [id])
   events         ContentReviewEvent[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, postGroup, createdAt])
   @@index([organizationId, status, expiresAt])
 }
@@ -198,7 +198,7 @@ model ContentReviewEvent {
   actorName   String?
   comment     String?
   createdAt   DateTime      @default(now())
-  review      ContentReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  review      ContentReview @relation(fields: [reviewId, organizationId], references: [id, organizationId], onDelete: Cascade)
 
   @@index([organizationId, reviewId, createdAt])
 }
@@ -234,7 +234,7 @@ model ContentIdea {
   updatedAt      DateTime         @updatedAt
   organization   Organization     @relation(fields: [organizationId], references: [id])
   stage          ContentIdeaStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
-  campaign       ContentCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  campaign       ContentCampaign? @relation(fields: [campaignId, organizationId], references: [id, organizationId], onDelete: SetNull)
 
   @@index([organizationId, stageId, position])
   @@index([organizationId, campaignId])
