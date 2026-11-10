@@ -6,6 +6,11 @@ import {
 describe('media retention policy', () => {
   const createdAt = new Date('2026-01-01T00:00:00.000Z');
   const after72Hours = new Date(createdAt.getTime() + MEDIA_RETENTION_MS + 1);
+  const reference = (state: string, publishDate = createdAt, updatedAt = createdAt) => ({
+    state,
+    publishDate,
+    updatedAt,
+  });
 
   it('expires an unused upload after 72 hours', () => {
     expect(isMediaEligibleForDeletion(createdAt, [], 0, after72Hours)).toBe(true);
@@ -22,17 +27,32 @@ describe('media retention policy', () => {
     ).toBe(false);
   });
 
-  it('keeps media referenced by drafts, queued posts, or failed posts', () => {
-    for (const state of ['DRAFT', 'QUEUE', 'ERROR']) {
+  it('keeps media referenced by drafts and queued posts', () => {
+    for (const state of ['DRAFT', 'QUEUE']) {
       expect(
-        isMediaEligibleForDeletion(
-          createdAt,
-          [{ state, publishDate: createdAt }],
-          0,
-          after72Hours
-        )
+        isMediaEligibleForDeletion(createdAt, [reference(state)], 0, after72Hours)
       ).toBe(false);
     }
+  });
+
+  it('keeps failed-post media for 72 hours after the latest retry/update', () => {
+    const failedAt = new Date('2026-01-05T00:00:00.000Z');
+    expect(
+      isMediaEligibleForDeletion(
+        createdAt,
+        [reference('ERROR', createdAt, failedAt)],
+        0,
+        new Date(failedAt.getTime() + MEDIA_RETENTION_MS - 1)
+      )
+    ).toBe(false);
+    expect(
+      isMediaEligibleForDeletion(
+        createdAt,
+        [reference('ERROR', createdAt, failedAt)],
+        0,
+        new Date(failedAt.getTime() + MEDIA_RETENTION_MS + 1)
+      )
+    ).toBe(true);
   });
 
   it('keeps published media for 72 hours after its latest scheduled publish date', () => {
@@ -40,7 +60,7 @@ describe('media retention policy', () => {
     expect(
       isMediaEligibleForDeletion(
         createdAt,
-        [{ state: 'PUBLISHED', publishDate: publishedAt }],
+        [reference('PUBLISHED', publishedAt)],
         0,
         new Date(publishedAt.getTime() + MEDIA_RETENTION_MS - 1)
       )
@@ -48,14 +68,20 @@ describe('media retention policy', () => {
     expect(
       isMediaEligibleForDeletion(
         createdAt,
-        [{ state: 'PUBLISHED', publishDate: publishedAt }],
+        [reference('PUBLISHED', publishedAt)],
         0,
         new Date(publishedAt.getTime() + MEDIA_RETENTION_MS + 1)
       )
     ).toBe(true);
   });
 
-  it('keeps media referenced by profile, integration, or idea records', () => {
+  it('keeps media with permanent profile, integration, or idea references', () => {
     expect(isMediaEligibleForDeletion(createdAt, [], 1, after72Hours)).toBe(false);
+  });
+
+  it('fails closed for an unknown post state', () => {
+    expect(
+      isMediaEligibleForDeletion(createdAt, [reference('UNKNOWN')], 0, after72Hours)
+    ).toBe(false);
   });
 });
