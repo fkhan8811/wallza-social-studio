@@ -212,6 +212,13 @@ export const showMediaBox = (
 };
 const CHUNK_SIZE = 1024 * 1024;
 const MAX_UPLOAD_SIZE = 1024 * 1024 * 1024; // 1 GB
+type MediaCollectionOption = {
+  id: string;
+  name: string;
+  description: string;
+  _count?: { items: number };
+};
+
 export const MediaBox: FC<{
   setMedia: (params: { id: string; path: string }[]) => void;
   standalone?: boolean;
@@ -221,23 +228,110 @@ export const MediaBox: FC<{
   const [page, setPage] = useState(0);
   const [search, setSearch] = useState('');
   const [debouncedSearch] = useDebounce(search, 300);
+  const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const [activeTag, setActiveTag] = useState('');
+  const [collectionId, setCollectionId] = useState('');
+  const [newCollectionName, setNewCollectionName] = useState('');
+  const [showNewCollection, setShowNewCollection] = useState(false);
+  const [collectionSaving, setCollectionSaving] = useState(false);
   const fetch = useFetch();
   const modals = useModals();
   const toaster = useToaster();
   useEffect(() => {
     setPage(0);
   }, [debouncedSearch]);
+  const loadCollections = useCallback(async (): Promise<MediaCollectionOption[]> => {
+    const response = await fetch('/media/collections');
+    if (!response.ok) throw new Error('Could not load media collections.');
+    return response.json();
+  }, [fetch]);
+  const { data: collections, mutate: mutateCollections } = useSWR(
+    'media-collections',
+    loadCollections
+  );
   const loadMedia = useCallback(async () => {
     const params = new URLSearchParams({ page: String(page + 1) });
-    if (debouncedSearch.trim()) {
-      params.set('search', debouncedSearch.trim());
-    }
+    if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim());
+    if (favoriteOnly) params.set('favorite', 'true');
+    if (activeTag.trim()) params.set('tag', activeTag.trim().toLowerCase());
+    if (collectionId) params.set('collectionId', collectionId);
     return (await fetch(`/media?${params.toString()}`)).json();
-  }, [page, debouncedSearch]);
-  const { data, mutate, isLoading } = useSWR(
-    `get-media-${page}-${debouncedSearch}`,
-    loadMedia
-  );
+  }, [page, debouncedSearch, favoriteOnly, activeTag, collectionId, fetch]);
+  const mediaKey = `get-media-${page}-${debouncedSearch}-${favoriteOnly}-${activeTag}-${collectionId}`;
+  const { data, mutate, isLoading } = useSWR(mediaKey, loadMedia);
+
+  const toggleFavorite = useCallback(async (media: any) => {
+    const response = await fetch(`/media/${media.id}/favorite`, {
+      method: 'POST',
+      body: JSON.stringify({ favorite: !media.isFavorite }),
+    });
+    if (!response.ok) {
+      toaster.show('Could not update favorite status.', 'warning');
+      return;
+    }
+    await mutate();
+  }, [fetch, mutate, toaster]);
+
+  const updateTags = useCallback(async (media: any) => {
+    const entered = window.prompt('Enter tags separated by commas', (media.tags || []).join(', '));
+    if (entered === null) return;
+    const tags = [...new Set(entered.split(',').map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+    if (tags.length > 20 || tags.some((tag) => tag.length > 40)) {
+      toaster.show('Use no more than 20 tags, each 40 characters or fewer.', 'warning');
+      return;
+    }
+    const response = await fetch(`/media/${media.id}/tags`, {
+      method: 'PUT',
+      body: JSON.stringify({ tags }),
+    });
+    if (!response.ok) {
+      toaster.show('Could not save media tags.', 'warning');
+      return;
+    }
+    await mutate();
+  }, [fetch, mutate, toaster]);
+
+  const addToCollection = useCallback(async (mediaId: string, targetCollectionId: string) => {
+    if (!targetCollectionId) return;
+    const response = await fetch(`/media/collections/${targetCollectionId}/media`, {
+      method: 'POST',
+      body: JSON.stringify({ mediaId }),
+    });
+    if (!response.ok) {
+      toaster.show('Could not add this asset to the collection.', 'warning');
+      return;
+    }
+    await Promise.all([mutate(), mutateCollections()]);
+  }, [fetch, mutate, mutateCollections]);
+
+  const createCollection = useCallback(async () => {
+    const name = newCollectionName.trim();
+    if (!name || name.length > 80) {
+      toaster.show('Enter a collection name of 1–80 characters.', 'warning');
+      return;
+    }
+    setCollectionSaving(true);
+    try {
+      const response = await fetch('/media/collections', {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.message || 'Could not create collection.');
+      }
+      const created = await response.json();
+      setNewCollectionName('');
+      setShowNewCollection(false);
+      setCollectionId(created.id);
+      await mutateCollections();
+      await mutate();
+    } catch (error) {
+      toaster.show(error instanceof Error ? error.message : 'Could not create collection.', 'warning');
+    } finally {
+      setCollectionSaving(false);
+    }
+  }, [newCollectionName, fetch, mutate, mutateCollections, toaster]);
   const [selected, setSelected] = useState([]);
   const t = useT();
   const uploaderRef = useRef<any>(null);
