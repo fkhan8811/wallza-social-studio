@@ -184,6 +184,9 @@ export class MediaService {
             if (!eligible) continue;
 
             await this.removeManagedFile(media.path);
+            if (media.thumbnail && media.thumbnail !== media.path) {
+              await this.removeManagedFile(media.thumbnail);
+            }
             const deleted = await this._mediaRepository.deleteMedia(
               media.organizationId,
               media.id
