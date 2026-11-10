@@ -236,10 +236,27 @@ model ContentIdea {
   organization   Organization     @relation(fields: [organizationId], references: [id])
   stage          ContentIdeaStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
   campaign       ContentCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  attachments    ContentIdeaMedia[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, stageId, position])
   @@index([organizationId, campaignId])
   @@index([dueDate])
+}
+
+model ContentIdeaMedia {
+  id             String      @id @default(uuid())
+  ideaId         String
+  mediaId        String
+  organizationId String
+  position       Int         @default(0)
+  createdAt      DateTime    @default(now())
+  idea           ContentIdea @relation(fields: [ideaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  media          Media       @relation(fields: [mediaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([ideaId, mediaId])
+  @@index([organizationId, ideaId, position])
+  @@index([organizationId, mediaId])
 }
 
 model UsedCodes {
@@ -350,6 +367,7 @@ model Media {
   userPicture        User[]
   oauthApps          OAuthApp[]
   collectionItems    MediaCollectionItem[]
+  ideaAttachments    ContentIdeaMedia[]
 
   @@unique([id, organizationId])
   @@index([name])
