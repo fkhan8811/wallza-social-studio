@@ -1,4 +1,5 @@
-import { BadRequestException, HttpException, Injectable } from '@nestjs/common';
+import { BadRequestException, HttpException, Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { MediaRepository } from '@gitroom/nestjs-libraries/database/prisma/media/media.repository';
 import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
 import { generationError } from '@gitroom/nestjs-libraries/openai/generation.error';
@@ -18,7 +19,8 @@ import { TypedSearchAttributes } from '@temporalio/common';
 import { organizationId } from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { MediaProcessorJob } from '@gitroom/nestjs-libraries/upload/media.processor.interface';
-import { extname } from 'path';
+import { extname, resolve, sep } from 'path';
+import { isMediaEligibleForDeletion, MEDIA_RETENTION_MS } from './media-retention.policy';
 import { randomBytes } from 'crypto';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import { ssrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
@@ -95,7 +97,94 @@ export class MediaService {
   ) {}
 
   async deleteMedia(org: string, id: string) {
+    const media = await this._mediaRepository.getMediaForOrganization(org, id);
+    if (!media) {
+      return { success: false };
+    }
+
+    await this.removeManagedFile(media.path);
     return this._mediaRepository.deleteMedia(org, id);
+  }
+
+  private isManagedStoragePath(filePath: string): boolean {
+    const provider = process.env.STORAGE_PROVIDER || 'local';
+
+    if (provider === 'local') {
+      const uploadDirectory = process.env.UPLOAD_DIRECTORY;
+      if (!uploadDirectory) return false;
+
+      const resolvedBase = resolve(uploadDirectory);
+      const resolvedPath = resolve(filePath);
+      if (resolvedPath.startsWith(resolvedBase + sep)) return true;
+
+      const frontendUrl = process.env.FRONTEND_URL?.replace(/\\/+$/, '');
+      return !!frontendUrl && filePath.startsWith(frontendUrl + '/uploads/');
+    }
+
+    if (provider === 'cloudflare') {
+      const bucketUrl = process.env.CLOUDFLARE_BUCKET_URL?.replace(/\\/+$/, '');
+      return !!bucketUrl && filePath.startsWith(bucketUrl + '/');
+    }
+
+    return false;
+  }
+
+  private async removeManagedFile(filePath: string): Promise<void> {
+    // Never delete remote URLs or files outside the configured storage root.
+    if (!this.isManagedStoragePath(filePath)) return;
+
+    try {
+      await this.storage.removeFile(filePath);
+    } catch (error: any) {
+      // A previous cleanup may have removed the object before the DB update
+      // failed. Treat an already-missing local file as a successful removal.
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async cleanupExpiredMedia(): Promise<void> {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - MEDIA_RETENTION_MS);
+    const candidates = await this._mediaRepository.findRetentionCandidates(cutoff, 100);
+    let deletedCount = 0;
+
+    for (const media of candidates) {
+      try {
+        const references = await this._mediaRepository.getRetentionReferences(
+          media.organizationId,
+          media.id
+        );
+
+        const eligible = isMediaEligibleForDeletion(
+          media.createdAt,
+          references.posts,
+          references.permanentReferences,
+          now
+        );
+        if (!eligible) continue;
+
+        await this.removeManagedFile(media.path);
+        const deleted = await this._mediaRepository.deleteMedia(
+          media.organizationId,
+          media.id
+        );
+        if (deleted.success) deletedCount += 1;
+      } catch (error: any) {
+        Logger.error(
+          `72-hour media cleanup failed for media ${media.id}: ${error?.message || error}`,
+          error?.stack,
+          MediaService.name
+        );
+      }
+    }
+
+    if (deletedCount > 0) {
+      Logger.log(
+        `72-hour media cleanup removed ${deletedCount} expired media item(s)`,
+        MediaService.name
+      );
+    }
   }
 
   getMediaById(id: string) {
