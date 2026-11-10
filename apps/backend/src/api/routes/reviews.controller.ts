@@ -175,7 +175,7 @@ export class PublicReviewsController {
       where: { tokenHash: hashToken(token) },
     });
     if (!review) throw new NotFoundException('Review link not found.');
-    if (review.expiresAt.getTime() <= Date.now() && review.status === 'pending') {
+    if (review.expiresAt.getTime() <= Date.now()) {
       throw new GoneException('This review link has expired.');
     }
     return review;
