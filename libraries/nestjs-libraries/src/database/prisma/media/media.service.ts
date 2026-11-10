@@ -98,12 +98,8 @@ export class MediaService {
   ) {}
 
   async deleteMedia(org: string, id: string) {
-    const media = await this._mediaRepository.getMediaForOrganization(org, id);
-    if (!media) {
-      return { success: false };
-    }
-
-    await this.removeManagedFile(media.path);
+    // Keep the existing manual-delete behavior. The 72-hour worker performs
+    // physical deletion only after checking every active reference.
     return this._mediaRepository.deleteMedia(org, id);
   }
 
