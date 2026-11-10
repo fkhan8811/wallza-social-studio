@@ -105,24 +105,10 @@ export class MediaRepository {
     });
   }
 
-  getMediaForOrganization(org: string, id: string) {
-    return this._media.model.media.findFirst({
-      where: { id, organizationId: org, deletedAt: null },
-      select: {
-        id: true,
-        organizationId: true,
-        name: true,
-        path: true,
-        createdAt: true,
-      },
-    });
-  }
-
   findRetentionCandidates(cutoff: Date, take = 100, cursorId?: string) {
     return this._media.model.media.findMany({
       where: {
         retentionExpiresAt: { lt: cutoff },
-        deletedAt: null,
         status: { not: 'processing' },
       },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -139,6 +125,17 @@ export class MediaRepository {
     });
   }
 
+  markRetentionComplete(org: string, mediaId: string) {
+    return this._media.model.media.updateMany({
+      where: {
+        id: mediaId,
+        organizationId: org,
+        retentionExpiresAt: { not: null },
+      },
+      data: { retentionExpiresAt: null },
+    });
+  }
+
   async getRetentionReferences(org: string, mediaId: string) {
     const [posts, media] = await Promise.all([
       this._media.model.post.findMany({
@@ -150,7 +147,7 @@ export class MediaRepository {
         select: { state: true, publishDate: true, updatedAt: true },
       }),
       this._media.model.media.findFirst({
-        where: { id: mediaId, organizationId: org, deletedAt: null },
+        where: { id: mediaId, organizationId: org },
         select: {
           _count: {
             select: {
