@@ -87,6 +87,7 @@ const USABLE_AS_IS = new Set([
 export class MediaService {
   private storage = UploadFactory.createStorage();
   private processor = UploadFactory.createProcessor();
+  private mediaCleanupRunning = false;
 
   constructor(
     private _mediaRepository: MediaRepository,
@@ -106,6 +107,14 @@ export class MediaService {
     return this._mediaRepository.deleteMedia(org, id);
   }
 
+  private trimTrailingSlashes(value?: string): string {
+    let result = value || '';
+    while (result.endsWith('/')) {
+      result = result.slice(0, -1);
+    }
+    return result;
+  }
+
   private isManagedStoragePath(filePath: string): boolean {
     const provider = process.env.STORAGE_PROVIDER || 'local';
 
@@ -117,12 +126,12 @@ export class MediaService {
       const resolvedPath = resolve(filePath);
       if (resolvedPath.startsWith(resolvedBase + sep)) return true;
 
-      const frontendUrl = process.env.FRONTEND_URL?.replace(/\\/+$/, '');
+      const frontendUrl = this.trimTrailingSlashes(process.env.FRONTEND_URL);
       return !!frontendUrl && filePath.startsWith(frontendUrl + '/uploads/');
     }
 
     if (provider === 'cloudflare') {
-      const bucketUrl = process.env.CLOUDFLARE_BUCKET_URL?.replace(/\\/+$/, '');
+      const bucketUrl = this.trimTrailingSlashes(process.env.CLOUDFLARE_BUCKET_URL);
       return !!bucketUrl && filePath.startsWith(bucketUrl + '/');
     }
 
@@ -144,46 +153,72 @@ export class MediaService {
 
   @Cron(CronExpression.EVERY_HOUR)
   async cleanupExpiredMedia(): Promise<void> {
-    const now = new Date();
-    const cutoff = new Date(now.getTime() - MEDIA_RETENTION_MS);
-    const candidates = await this._mediaRepository.findRetentionCandidates(cutoff, 100);
-    let deletedCount = 0;
+    if (this.mediaCleanupRunning) return;
+    this.mediaCleanupRunning = true;
 
-    for (const media of candidates) {
-      try {
-        const references = await this._mediaRepository.getRetentionReferences(
-          media.organizationId,
-          media.id
-        );
+    try {
+      const now = new Date();
+      let cursorId: string | undefined;
+      let deletedCount = 0;
 
-        const eligible = isMediaEligibleForDeletion(
-          media.createdAt,
-          references.posts,
-          references.permanentReferences,
-          now
+      // Cursor through every page so protected older media cannot starve newer
+      // unreferenced uploads from being cleaned up.
+      while (true) {
+        const candidates = await this._mediaRepository.findRetentionCandidates(
+          now,
+          100,
+          cursorId
         );
-        if (!eligible) continue;
+        if (candidates.length === 0) break;
+        cursorId = candidates[candidates.length - 1].id;
 
-        await this.removeManagedFile(media.path);
-        const deleted = await this._mediaRepository.deleteMedia(
-          media.organizationId,
-          media.id
-        );
-        if (deleted.success) deletedCount += 1;
-      } catch (error: any) {
-        Logger.error(
-          `72-hour media cleanup failed for media ${media.id}: ${error?.message || error}`,
-          error?.stack,
+        for (const media of candidates) {
+          try {
+            const references = await this._mediaRepository.getRetentionReferences(
+              media.organizationId,
+              media.id
+            );
+
+            const eligible = isMediaEligibleForDeletion(
+              media.createdAt,
+              references.posts,
+              references.permanentReferences,
+              now
+            );
+            if (!eligible) continue;
+
+            await this.removeManagedFile(media.path);
+            const deleted = await this._mediaRepository.deleteMedia(
+              media.organizationId,
+              media.id
+            );
+            if (deleted.success) deletedCount += 1;
+          } catch (error: any) {
+            Logger.error(
+              `72-hour media cleanup failed for media ${media.id}: ${error?.message || error}`,
+              error?.stack,
+              MediaService.name
+            );
+          }
+        }
+
+        if (candidates.length < 100) break;
+      }
+
+      if (deletedCount > 0) {
+        Logger.log(
+          `72-hour media cleanup removed ${deletedCount} expired media item(s)`,
           MediaService.name
         );
       }
-    }
-
-    if (deletedCount > 0) {
-      Logger.log(
-        `72-hour media cleanup removed ${deletedCount} expired media item(s)`,
+    } catch (error: any) {
+      Logger.error(
+        `72-hour media cleanup sweep failed: ${error?.message || error}`,
+        error?.stack,
         MediaService.name
       );
+    } finally {
+      this.mediaCleanupRunning = false;
     }
   }
 
