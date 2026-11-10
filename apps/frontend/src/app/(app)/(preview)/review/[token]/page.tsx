@@ -46,6 +46,36 @@ export default async function PublicReviewPage(props: {
               <span className="rounded-full bg-newBgColor px-[9px] py-[4px] text-[11px] text-textItemBlur">{post.integration?.name || post.integration?.providerIdentifier || 'Channel'}</span>
             </div>
             <p className="whitespace-pre-wrap break-words text-[13px] leading-[1.7]">{post.content}</p>
+            {!!post.media?.length && (
+              <div className={post.media.length > 1 ? 'grid grid-cols-1 gap-[8px] sm:grid-cols-2' : 'flex flex-col gap-[8px]'}>
+                {post.media.map((asset: { url: string; alt?: string }, index: number) => {
+                  const isVideo = /\.(mp4|mov|webm)(?:[?#]|$)/i.test(asset.url);
+                  return (
+                    <div key={asset.url + index} className="overflow-hidden rounded-[10px] border border-blockSeparator bg-newBgColor">
+                      {isVideo ? (
+                        <video
+                          controls
+                          playsInline
+                          preload="metadata"
+                          src={asset.url}
+                          className="max-h-[520px] w-full object-contain"
+                        />
+                      ) : (
+                        <a href={asset.url} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">
+                          <img
+                            src={asset.url}
+                            alt={asset.alt || 'Post media preview'}
+                            loading="lazy"
+                            referrerPolicy="no-referrer"
+                            className="max-h-[520px] w-full object-contain"
+                          />
+                        </a>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             <p className="text-[11px] text-textItemBlur">Planned date: {new Date(post.publishDate).toLocaleString()}</p>
           </article>
         ))}
