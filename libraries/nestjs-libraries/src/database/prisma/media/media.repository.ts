@@ -133,6 +133,7 @@ export class MediaRepository {
         organizationId: true,
         name: true,
         path: true,
+        thumbnail: true,
         createdAt: true,
       },
     });
