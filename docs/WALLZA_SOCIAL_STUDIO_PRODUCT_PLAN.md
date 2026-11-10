@@ -63,28 +63,28 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 
 - Organization-scoped `ContentIdeaStage` and `ContentIdea` models, default pipeline stages, authenticated APIs, stage management, idea create/edit/delete, campaign assignment and ordered Kanban moves.
 - Ideas Kanban UI with drag-and-drop between stages and positions, editable cards, platform targets, labels, owner, due date, campaign association and create-native-drafts action using existing connected social accounts.
-- Organization-scoped `ContentCampaign` model and CRUD API with name, description, goal, status and start/end dates; Campaigns page added to the sidebar. Ideas can be assigned to a campaign. Campaigns are not yet attached to already scheduled/published posts or analytics.
-- Organization-scoped `ContentReview` model and review-management API. Review links use 256-bit random tokens; only SHA-256 token hashes are stored. Links expire (1–30 days), can be revoked while pending, and return only the selected post data for the matching organization/post group.
-- Public, token-only review page with approve/request-changes decisions and reviewer comments. Decisions do not publish posts automatically. Reviewers do not receive a Postiz user or workspace membership.
+- Organization-scoped `ContentCampaign` model and CRUD API with name, description, goal, status and start/end dates; Campaigns page added to the sidebar. Ideas can be assigned to a campaign. `ContentCampaignPost` links existing Postiz post groups to a campaign without republishing or rescheduling them. Campaign detail displays channels, post counts, planned dates and native Postiz publishing states. This is operational status reporting, not aggregated reach/engagement analytics.
+- Organization-scoped `ContentReview` and `ContentReviewEvent` models. A request can issue separate 256-bit bearer links to up to 10 reviewers; only SHA-256 token hashes are stored. Links expire (1–30 days), each reviewer responds independently, and revocation is a soft status transition with an event record rather than deletion.
+- Public, token-only review page with approve/request-changes decisions and reviewer comments. Created/approved/requested-changes/revoked events are retained in the tenant-scoped audit history. Decisions do not publish posts automatically and there is no quorum/aggregate approval policy yet. Reviewers do not receive a Postiz user or workspace membership.
 - Campaigns and Reviews navigation entries.
 
 ### Still not implemented or not production-ready
 
-- Email invitations / automated reviewer notification. The review link is currently shown once in the UI and must be sent through an approved communication channel.
-- A detailed immutable approval audit/event history, multi-reviewer workflow, per-post decisions, revision rounds, and approval policy enforcement in the publishing pipeline.
-- Campaign-to-post linking, campaign calendars, campaign performance reporting and owner/member assignment.
+- Email invitations / automated reviewer notification. Links are shown once and must be sent through an approved communication channel.
+- Per-post decisions, revision rounds, consolidated multi-reviewer/quorum policies, and approval enforcement in the publishing pipeline.
+- Campaign calendars, reach/engagement conversion reporting and owner/member assignment.
 - Advanced media library folders, collections, tags, favorites and asset usage tracking.
 - Full carousel/image editor and durable multi-track video editor.
 - Expanded queue rules, reusable queue templates and posting-slot controls.
 - Attachments and a shared creative asset picker inside idea cards.
-- Comprehensive API/controller tests and end-to-end tests for idea-to-draft, campaign workflows and public review decisions.
+- Automated API/controller and browser end-to-end tests for idea-to-draft, campaign workflows, public review decisions, expiry, revocation, replays and cross-organization access.
 
 ### Validation and release gates
 
 - The Prisma schema changed. Run `pnpm run prisma-generate` and `pnpm run prisma-db-push` only against a disposable test database first. Do not run schema push against production.
-- The repository's `.github/workflows/build.yml` runs dependency installation and the workspace build on pushes and pull requests. A green build is required on the final feature-branch commit before this branch can be marked code-complete.
-- No live Postiz app build, database migration, browser test or end-to-end workflow has been run from a complete checkout in this session.
-- Validate public review links with expiry, revoke, repeated submission, wrong-organization post groups, and safe preview rendering. The review URL is a bearer secret: never log or persist the raw token.
+- The repository's `.github/workflows/build.yml` is configured for pushes and pull requests, but GitHub currently reports zero workflow runs and zero check runs for this fork's PR head. Do not mark the branch green; confirm Actions is enabled and run the workflow or a full local checkout build.
+- No `prisma generate`, disposable-database `prisma db push`, live Postiz app build, browser test or end-to-end workflow has been run from a complete checkout in this session. Postiz uses Prisma `db push` rather than checked-in SQL migrations for this schema.
+- Validate public review links with expiry, revoke, repeated submission, wrong-organization post groups, independent reviewer decisions and safe preview rendering. The review URL is a bearer secret: never log or persist the raw token. Campaign post-group links and review events use organization-scoped composite relations where supported.
 - No production database, Render service, external account credentials or upstream Postiz branch has been changed.
 
 ## Current repository facts verified
