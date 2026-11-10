@@ -21,6 +21,8 @@ const hashToken = (token: string) =>
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+type ReviewerInput = { email?: string; name?: string };
+
 @ApiTags('Reviews')
 @Controller('/reviews')
 export class ReviewsController {
@@ -69,16 +71,18 @@ export class ReviewsController {
       where: { organizationId: org.id },
       orderBy: { createdAt: 'desc' },
       take: 100,
-      select: {
-        id: true,
-        postGroup: true,
-        reviewerEmail: true,
-        reviewerName: true,
-        status: true,
-        comment: true,
-        expiresAt: true,
-        reviewedAt: true,
-        createdAt: true,
+      include: {
+        events: {
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            action: true,
+            actorEmail: true,
+            actorName: true,
+            comment: true,
+            createdAt: true,
+          },
+        },
       },
     });
     return rows.map((row) => ({
@@ -95,23 +99,38 @@ export class ReviewsController {
       postGroup?: string;
       reviewerEmail?: string;
       reviewerName?: string;
+      reviewers?: ReviewerInput[];
       expiresInDays?: number;
     }
   ) {
     const postGroup = typeof body.postGroup === 'string' ? body.postGroup.trim() : '';
-    const reviewerEmail = typeof body.reviewerEmail === 'string'
-      ? body.reviewerEmail.trim().toLowerCase()
-      : '';
-    const reviewerName = typeof body.reviewerName === 'string'
-      ? body.reviewerName.trim().slice(0, 120)
-      : '';
-
     if (!postGroup || postGroup.length > 160) {
       throw new BadRequestException('Provide a valid Postiz post group.');
     }
-    if (!emailPattern.test(reviewerEmail) || reviewerEmail.length > 254) {
-      throw new BadRequestException('Provide a valid reviewer email address.');
+
+    // Support the earlier single-reviewer request while allowing up to 10
+    // independent recipients. Each recipient receives a distinct bearer link.
+    const suppliedReviewers = Array.isArray(body.reviewers) && body.reviewers.length
+      ? body.reviewers
+      : [{ email: body.reviewerEmail, name: body.reviewerName }];
+    if (suppliedReviewers.length > 10) {
+      throw new BadRequestException('A review request can have no more than 10 reviewers.');
     }
+
+    const reviewers = suppliedReviewers.map((item) => ({
+      email: typeof item?.email === 'string' ? item.email.trim().toLowerCase() : '',
+      name: typeof item?.name === 'string' ? item.name.trim().slice(0, 120) : '',
+    }));
+    const uniqueEmails = new Set(reviewers.map((reviewer) => reviewer.email));
+    if (
+      reviewers.some((reviewer) =>
+        !emailPattern.test(reviewer.email) || reviewer.email.length > 254
+      ) ||
+      uniqueEmails.size !== reviewers.length
+    ) {
+      throw new BadRequestException('Provide up to 10 unique, valid reviewer email addresses.');
+    }
+
     const expiresInDays = body.expiresInDays ?? 7;
     if (!Number.isInteger(expiresInDays) || expiresInDays < 1 || expiresInDays > 30) {
       throw new BadRequestException('Review links must expire between 1 and 30 days.');
@@ -121,44 +140,82 @@ export class ReviewsController {
       where: { group: postGroup, organizationId: org.id, deletedAt: null },
       select: { id: true },
     });
-    if (!post) throw new NotFoundException('No active posts were found for this organization and post group.');
+    if (!post) {
+      throw new NotFoundException('No active posts were found for this organization and post group.');
+    }
 
-    const token = randomBytes(32).toString('base64url');
     const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000);
-    const review = await this.prisma.contentReview.create({
-      data: {
-        organizationId: org.id,
-        postGroup,
-        reviewerEmail,
-        reviewerName: reviewerName || null,
-        tokenHash: hashToken(token),
-        expiresAt,
-        createdById: user.id,
-      },
-      select: {
-        id: true,
-        postGroup: true,
-        reviewerEmail: true,
-        reviewerName: true,
-        status: true,
-        expiresAt: true,
-        createdAt: true,
-      },
+    const created = await this.prisma.$transaction(async (tx) => {
+      const results: Array<Record<string, unknown>> = [];
+      for (const reviewer of reviewers) {
+        const token = randomBytes(32).toString('base64url');
+        const review = await tx.contentReview.create({
+          data: {
+            organizationId: org.id,
+            postGroup,
+            reviewerEmail: reviewer.email,
+            reviewerName: reviewer.name || null,
+            tokenHash: hashToken(token),
+            expiresAt,
+            createdById: user.id,
+          },
+          select: {
+            id: true,
+            postGroup: true,
+            reviewerEmail: true,
+            reviewerName: true,
+            status: true,
+            expiresAt: true,
+            createdAt: true,
+          },
+        });
+        await tx.contentReviewEvent.create({
+          data: {
+            reviewId: review.id,
+            organizationId: org.id,
+            action: 'created',
+            actorEmail: user.email,
+            actorName: user.name || null,
+          },
+        });
+        // The raw token is returned once. Only its SHA-256 hash is stored.
+        results.push({ ...review, reviewPath: `/review/${token}` });
+      }
+      return results;
     });
 
-    // The raw token is returned once. Only its SHA-256 hash is stored.
-    return { ...review, reviewPath: `/review/${token}` };
+    return {
+      reviews: created,
+      // Backwards-compatible convenience for clients issuing one review link.
+      ...(created.length === 1 ? { reviewPath: created[0].reviewPath } : {}),
+    };
   }
 
   @Delete('/:id')
-  async revoke(@GetOrgFromRequest() org: Organization, @Param('id') id: string) {
-    const result = await this.prisma.contentReview.deleteMany({
-      where: { id, organizationId: org.id, status: 'pending' },
+  async revoke(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Param('id') id: string
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      const result = await tx.contentReview.updateMany({
+        where: { id, organizationId: org.id, status: 'pending', expiresAt: { gt: new Date() } },
+        data: { status: 'revoked', reviewedAt: new Date() },
+      });
+      if (result.count === 0) {
+        throw new NotFoundException('Pending review link not found. It may already be used, expired or revoked.');
+      }
+      await tx.contentReviewEvent.create({
+        data: {
+          reviewId: id,
+          organizationId: org.id,
+          action: 'revoked',
+          actorEmail: user.email,
+          actorName: user.name || null,
+        },
+      });
+      return { success: true };
     });
-    if (result.count === 0) {
-      throw new NotFoundException('Pending review link not found. It may already have been used or revoked.');
-    }
-    return { success: true };
   }
 }
 
@@ -175,6 +232,9 @@ export class PublicReviewsController {
       where: { tokenHash: hashToken(token) },
     });
     if (!review) throw new NotFoundException('Review link not found.');
+    if (review.status === 'revoked') {
+      throw new GoneException('This review link has been revoked.');
+    }
     if (review.expiresAt.getTime() <= Date.now()) {
       throw new GoneException('This review link has expired.');
     }
@@ -203,7 +263,9 @@ export class PublicReviewsController {
         },
       },
     });
-    if (!posts.length) throw new NotFoundException('The posts for this review are no longer available.');
+    if (!posts.length) {
+      throw new NotFoundException('The posts for this review are no longer available.');
+    }
 
     return {
       review: {
@@ -235,21 +297,34 @@ export class PublicReviewsController {
     if (review.status !== 'pending') {
       throw new BadRequestException('This review has already been submitted.');
     }
-    const updated = await this.prisma.contentReview.updateMany({
-      where: {
-        id: review.id,
-        status: 'pending',
-        expiresAt: { gt: new Date() },
-      },
-      data: {
-        status: decision,
-        comment: comment || null,
-        reviewedAt: new Date(),
-      },
+
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.contentReview.updateMany({
+        where: {
+          id: review.id,
+          status: 'pending',
+          expiresAt: { gt: new Date() },
+        },
+        data: {
+          status: decision,
+          comment: comment || null,
+          reviewedAt: new Date(),
+        },
+      });
+      if (updated.count !== 1) {
+        throw new GoneException('This review link has expired or has already been submitted.');
+      }
+      await tx.contentReviewEvent.create({
+        data: {
+          reviewId: review.id,
+          organizationId: review.organizationId,
+          action: decision,
+          actorEmail: review.reviewerEmail,
+          actorName: review.reviewerName,
+          comment: comment || null,
+        },
+      });
+      return { success: true, status: decision };
     });
-    if (updated.count !== 1) {
-      throw new GoneException('This review link has expired or has already been submitted.');
-    }
-    return { success: true, status: decision };
   }
 }
