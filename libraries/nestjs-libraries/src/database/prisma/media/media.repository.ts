@@ -146,7 +146,7 @@ export class MediaRepository {
           deletedAt: null,
           image: { contains: mediaId },
         },
-        select: { state: true, publishDate: true },
+        select: { state: true, publishDate: true, updatedAt: true },
       }),
       this._media.model.media.findFirst({
         where: { id: mediaId, organizationId: org, deletedAt: null },
