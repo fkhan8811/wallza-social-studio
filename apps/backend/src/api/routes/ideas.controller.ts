@@ -223,6 +223,7 @@ export class IdeasController {
       dueDate?: string | null;
       ownerName?: string | null;
       campaignId?: string | null;
+      stageId?: string;
     }
   ) {
     const existing = await this.prisma.contentIdea.findFirst({
@@ -255,6 +256,14 @@ export class IdeasController {
     if (body.ownerName !== undefined) {
       data.ownerName =
         typeof body.ownerName === 'string' ? body.ownerName.trim().slice(0, 80) || null : null;
+    }
+    if (body.stageId !== undefined) {
+      const stage = await this.prisma.contentIdeaStage.findFirst({
+        where: { id: body.stageId, organizationId: org.id },
+        select: { id: true },
+      });
+      if (!stage) throw new BadRequestException('Choose a pipeline stage belonging to this organization.');
+      data.stage = { connect: { id: stage.id } };
     }
     if (body.campaignId !== undefined) {
       const campaignId = typeof body.campaignId === 'string' ? body.campaignId.trim() : '';
