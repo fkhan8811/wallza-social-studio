@@ -67,13 +67,14 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 - Organization-scoped `ContentReview` and `ContentReviewEvent` models. A request can issue separate 256-bit bearer links to up to 10 reviewers; only SHA-256 token hashes are stored. Links expire (1–30 days), each reviewer responds independently, and revocation is a soft status transition with an event record rather than deletion.
 - Public, token-only review page with approve/request-changes decisions and reviewer comments. Created/approved/requested-changes/revoked events are retained in the tenant-scoped audit history. Decisions do not publish posts automatically and there is no quorum/aggregate approval policy yet. Reviewers do not receive a Postiz user or workspace membership.
 - Campaigns and Reviews navigation entries.
+- Existing Media Library extended in place with organization-scoped collections, favorites and tags. Existing upload, object-storage, thumbnail and media-processing flows are reused. The API supports collection create/update/delete, adding/removing media, favorite status, tags, and server-side collection/favorite/tag filters. Media-to-collection links use composite organization-scoped relations; soft-deleting a media item removes its collection links.
 
 ### Still not implemented or not production-ready
 
 - Email invitations / automated reviewer notification. Links are shown once and must be sent through an approved communication channel.
 - Per-post decisions, revision rounds, consolidated multi-reviewer/quorum policies, and approval enforcement in the publishing pipeline.
 - Campaign calendars, reach/engagement conversion reporting and owner/member assignment.
-- Advanced media library folders, collections, tags, favorites and asset usage tracking.
+- Hierarchical media folders, asset usage tracking, bulk tagging and richer asset metadata (basic tags/favorites/collections are implemented).
 - Full carousel/image editor and durable multi-track video editor.
 - Expanded queue rules, reusable queue templates and posting-slot controls.
 - Attachments and a shared creative asset picker inside idea cards.
@@ -83,7 +84,7 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 
 - The Prisma schema changed. Run `pnpm run prisma-generate` and `pnpm run prisma-db-push` only against a disposable test database first. Do not run schema push against production.
 - The repository's `.github/workflows/build.yml` is configured for pushes and pull requests, but GitHub currently reports zero workflow runs and zero check runs for this fork's PR head. Do not mark the branch green; confirm Actions is enabled and run the workflow or a full local checkout build.
-- No `prisma generate`, disposable-database `prisma db push`, live Postiz app build, browser test or end-to-end workflow has been run from a complete checkout in this session. Postiz uses Prisma `db push` rather than checked-in SQL migrations for this schema.
+- No `prisma generate`, disposable-database `prisma db push`, live Postiz app build, browser test or end-to-end workflow has been run from a complete checkout in this session. The latest branch schema now includes campaign/review relations plus Media collections and must pass `pnpm run prisma-generate` and `pnpm run prisma-db-push` against a disposable PostgreSQL database before code-complete status.
 - Validate public review links with expiry, revoke, repeated submission, wrong-organization post groups, independent reviewer decisions and safe preview rendering. The review URL is a bearer secret: never log or persist the raw token. Campaign post-group links and review events use organization-scoped composite relations where supported.
 - No production database, Render service, external account credentials or upstream Postiz branch has been changed.
 
