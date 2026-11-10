@@ -16,6 +16,8 @@ import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integ
 import { SettingsController } from '@gitroom/backend/api/routes/settings.controller';
 import { PostsController } from '@gitroom/backend/api/routes/posts.controller';
 import { IdeasController } from '@gitroom/backend/api/routes/ideas.controller';
+import { CampaignsController } from '@gitroom/backend/api/routes/campaigns.controller';
+import { ReviewsController, PublicReviewsController } from '@gitroom/backend/api/routes/reviews.controller';
 import { MediaController } from '@gitroom/backend/api/routes/media.controller';
 import { ClippingController } from '@gitroom/backend/api/routes/clipping.controller';
 import { MediaWidgetController } from '@gitroom/backend/api/routes/media.widget.controller';
@@ -65,6 +67,8 @@ const authenticatedController = [
   SettingsController,
   PostsController,
   IdeasController,
+  CampaignsController,
+  ReviewsController,
   MediaController,
   ClippingController,
   BillingController,
@@ -92,6 +96,7 @@ const authenticatedController = [
       ]
     : [
         RootController,
+        PublicReviewsController,
         PaymentController,
         StripeController,
         AuthController,
