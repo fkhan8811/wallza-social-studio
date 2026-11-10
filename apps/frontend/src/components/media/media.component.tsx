@@ -571,10 +571,7 @@ export const MediaBox: FC<{
         <div
           className={clsx(
             'flex items-center gap-[12px] mobile:flex-wrap',
-            !isLoading &&
-              !data?.results?.length &&
-              !debouncedSearch &&
-              'hidden'
+            false && 'hidden'
           )}
         >
           <div className="flex-1 mobile:basis-full">
@@ -615,6 +612,90 @@ export const MediaBox: FC<{
             </div>
           )}
         </div>
+        <div className="flex flex-wrap items-center gap-[8px] rounded-[8px] border border-newColColor bg-newBgColorInner px-[10px] py-[9px]">
+          <label className="flex items-center gap-[7px] text-[11px] text-textItemBlur">
+            Collection
+            <select
+              value={collectionId}
+              onChange={(event) => { setCollectionId(event.target.value); setPage(0); }}
+              className="max-w-[220px] rounded-[6px] border border-newColColor bg-newBgColor px-[9px] py-[7px] text-[12px] text-newTextColor"
+            >
+              <option value="">All media</option>
+              {(collections || []).map((collection) => (
+                <option key={collection.id} value={collection.id}>{collection.name} ({collection._count?.items ?? 0})</option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            onClick={() => { setFavoriteOnly((value) => !value); setPage(0); }}
+            aria-pressed={favoriteOnly}
+            className={clsx('rounded-[6px] border px-[10px] py-[7px] text-[11px]', favoriteOnly ? 'border-[#f59e0b] text-[#fbbf24]' : 'border-newColColor text-textItemBlur')}
+          >
+            {favoriteOnly ? '★ Favorites only' : '☆ Favorites'}
+          </button>
+          <label className="flex items-center gap-[7px] text-[11px] text-textItemBlur">
+            Tag
+            <input
+              value={activeTag}
+              onChange={(event) => { setActiveTag(event.target.value); setPage(0); }}
+              placeholder="Filter by tag"
+              className="w-[130px] rounded-[6px] border border-newColColor bg-newBgColor px-[9px] py-[7px] text-[12px] text-newTextColor"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={() => { setFavoriteOnly(false); setActiveTag(''); setCollectionId(''); setPage(0); }}
+            className="rounded-[6px] px-[9px] py-[7px] text-[11px] text-textItemBlur hover:text-newTextColor"
+          >
+            Clear filters
+          </button>
+          {collectionId && (
+            <button
+              type="button"
+              onClick={async () => {
+                const collection = collections?.find((item) => item.id === collectionId);
+                if (!collection || !window.confirm(`Delete collection "${collection.name}"? The media files will remain in your library.`)) return;
+                const response = await fetch(`/media/collections/${collectionId}`, { method: 'DELETE' });
+                if (!response.ok) { toaster.show('Could not delete collection.', 'warning'); return; }
+                setCollectionId('');
+                await Promise.all([mutate(), mutateCollections()]);
+              }}
+              className="rounded-[6px] px-[9px] py-[7px] text-[11px] text-red-400 hover:text-red-300"
+            >
+              Delete collection
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowNewCollection((value) => !value)}
+            className="ml-auto rounded-[6px] bg-[#612BD3] px-[11px] py-[7px] text-[11px] font-[600] text-white"
+          >
+            + New collection
+          </button>
+        </div>
+        {showNewCollection && (
+          <form
+            onSubmit={(event) => { event.preventDefault(); void createCollection(); }}
+            className="flex flex-wrap items-center gap-[8px] rounded-[8px] border border-newColColor bg-newBgColorInner px-[10px] py-[9px]"
+          >
+            <input
+              autoFocus
+              value={newCollectionName}
+              onChange={(event) => setNewCollectionName(event.target.value)}
+              maxLength={80}
+              required
+              placeholder="Collection name"
+              className="min-w-[180px] flex-1 rounded-[6px] border border-newColColor bg-newBgColor px-[10px] py-[8px] text-[12px] text-newTextColor"
+            />
+            <button disabled={collectionSaving} type="submit" className="rounded-[6px] bg-[#612BD3] px-[12px] py-[8px] text-[11px] text-white disabled:opacity-50">
+              {collectionSaving ? 'Creating…' : 'Create'}
+            </button>
+            <button type="button" onClick={() => setShowNewCollection(false)} className="rounded-[6px] px-[10px] py-[8px] text-[11px] text-textItemBlur">
+              Cancel
+            </button>
+          </form>
+        )}
         <div
           className={clsx(
             'w-full pointer-events-none relative mt-[5px] mb-[5px]',
@@ -742,6 +823,38 @@ export const MediaBox: FC<{
                         onClick={deleteImage(media)}
                       />
                     )}
+                    <div className="absolute z-[110] top-[7px] end-[7px] flex items-center gap-[4px]" onClick={(event) => event.stopPropagation()}>
+                      <button
+                        type="button"
+                        title={media.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+                        aria-label={media.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+                        onClick={() => void toggleFavorite(media)}
+                        className="flex h-[27px] min-w-[27px] items-center justify-center rounded-[6px] bg-black/70 px-[6px] text-[15px] text-[#fbbf24]"
+                      >
+                        {media.isFavorite ? '★' : '☆'}
+                      </button>
+                      <button
+                        type="button"
+                        title="Edit tags"
+                        aria-label="Edit media tags"
+                        onClick={() => void updateTags(media)}
+                        className="flex h-[27px] items-center justify-center rounded-[6px] bg-black/70 px-[7px] text-[10px] font-[600] text-white"
+                      >
+                        Tags
+                      </button>
+                      {!!collections?.length && (
+                        <select
+                          aria-label="Add to collection"
+                          title="Add to collection"
+                          defaultValue=""
+                          onChange={(event) => { const target = event.target.value; event.target.value = ''; void addToCollection(media.id, target); }}
+                          className="h-[27px] max-w-[88px] rounded-[6px] bg-black/80 px-[4px] text-[9px] text-white"
+                        >
+                          <option value="">+ Collection</option>
+                          {collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}
+                        </select>
+                      )}
+                    </div>
                     <div
                       className={clsx(
                         'absolute bottom-[10px] start-[10px] end-[10px] z-[100] truncate text-end mobile:text-[12px] rounded-[4px] px-[6px] bg-black/60 text-white',
@@ -750,6 +863,13 @@ export const MediaBox: FC<{
                     >
                       {media.originalName}
                     </div>
+                    {!!media.tags?.length && (
+                      <div className="absolute bottom-[38px] start-[7px] end-[7px] z-[100] flex flex-wrap gap-[3px] overflow-hidden">
+                        {media.tags.slice(0, 3).map((tag: string) => (
+                          <span key={tag} className="max-w-full truncate rounded-[4px] bg-black/65 px-[5px] py-[2px] text-[9px] text-white">{tag}</span>
+                        ))}
+                      </div>
+                    )}
                     <div className="w-full h-full rounded-[6px] overflow-hidden relative">
                       <div className="absolute z-[20] left-[50%] top-[50%] -translate-x-[50%] -translate-y-[50%]">
                         <div
@@ -781,7 +901,7 @@ export const MediaBox: FC<{
                           height="100%"
                           className="w-full h-full object-cover"
                           src={mediaDirectory.set(media.path)}
-                          alt="media"
+                          alt={media.alt || media.originalName || 'media'}
                         />
                       )}
                     </div>
