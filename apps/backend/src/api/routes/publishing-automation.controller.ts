@@ -378,42 +378,173 @@ export class PublishingAutomationController {
     @Param('id') id: string,
     @Body() eventPayload: any
   ) {
+    return this.executeRule(org, id, { mode: 'dry_run', eventPayload });
+  }
+
+  @Post('/rules/:id/execute')
+  async executeRule(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body()
+    body: {
+      mode?: 'dry_run' | 'execute';
+      eventPayload?: any;
+      targetPostId?: string;
+    }
+  ) {
     const rule = await (this.prisma as any).automationRule.findFirst({
       where: { id, organizationId: org.id },
     });
     if (!rule) throw new NotFoundException('Rule not found.');
 
-    // Evaluate conditions against eventPayload
+    const mode = body.mode || 'dry_run';
+    const payload = body.eventPayload || {};
     const conditions = rule.conditions || {};
+
     let matched = true;
     const matchReasons: string[] = [];
 
-    if (conditions.platform && eventPayload.platform) {
-      if (conditions.platform.toLowerCase() !== eventPayload.platform.toLowerCase()) {
+    if (conditions.platform && payload.platform) {
+      if (
+        conditions.platform.toLowerCase() !== payload.platform.toLowerCase()
+      ) {
         matched = false;
-        matchReasons.push(`Platform mismatch: expected ${conditions.platform}, got ${eventPayload.platform}`);
+        matchReasons.push(
+          `Platform mismatch: expected ${conditions.platform}, got ${payload.platform}`
+        );
       } else {
         matchReasons.push(`Platform matched: ${conditions.platform}`);
       }
     }
 
-    if (conditions.campaignId && eventPayload.campaignId) {
-      if (conditions.campaignId !== eventPayload.campaignId) {
+    if (conditions.campaignId && payload.campaignId) {
+      if (conditions.campaignId !== payload.campaignId) {
         matched = false;
-        matchReasons.push(`Campaign mismatch`);
+        matchReasons.push('Campaign mismatch');
       } else {
-        matchReasons.push(`Campaign matched`);
+        matchReasons.push('Campaign matched');
       }
+    }
+
+    if (!matched) {
+      return {
+        ruleId: rule.id,
+        ruleName: rule.name,
+        trigger: rule.trigger,
+        mode,
+        matched: false,
+        matchReasons,
+        executedActions: [],
+        message: 'Rule conditions did not match event payload.',
+      };
+    }
+
+    const actions = rule.actions || {};
+    const executionResults: any[] = [];
+
+    // Real Execution Path
+    if (mode === 'execute') {
+      // 1. Assign to queue / schedule action
+      if (actions.targetQueueId || actions.action === 'assign_to_queue') {
+        const queueId = actions.targetQueueId;
+        const targetQueue = await (this.prisma as any).publishingQueue.findFirst(
+          {
+            where: { id: queueId, organizationId: org.id },
+          }
+        );
+
+        if (targetQueue) {
+          const nextSlotResult = await this.getNextAvailableSlot(
+            org,
+            targetQueue.id
+          );
+          const scheduledDate = new Date(nextSlotResult.nextSlot);
+
+          const candidatePosts = await this.prisma.post.findMany({
+            where: {
+              organizationId: org.id,
+              id: body.targetPostId || payload.postId || undefined,
+              state: 'DRAFT',
+              deletedAt: null,
+            },
+            take: body.targetPostId || payload.postId ? 1 : 5,
+          });
+
+          for (const post of candidatePosts) {
+            await this.prisma.post.update({
+              where: { id: post.id },
+              data: {
+                publishDate: scheduledDate,
+                state: 'QUEUE',
+              },
+            });
+            executionResults.push({
+              action: 'assign_to_queue',
+              postId: post.id,
+              queueId: targetQueue.id,
+              scheduledFor: scheduledDate.toISOString(),
+              status: 'SUCCESS',
+            });
+          }
+        }
+      }
+
+      // 2. Auto-retry failed posts action
+      if (actions.autoRetry || actions.action === 'auto_retry') {
+        const failedPosts = await this.prisma.post.findMany({
+          where: {
+            organizationId: org.id,
+            id: body.targetPostId || payload.postId || undefined,
+            state: 'ERROR',
+            deletedAt: null,
+          },
+          take: 3,
+        });
+
+        const retryDate = new Date(Date.now() + 15 * 60 * 1000); // 15-minute retry backoff
+        for (const post of failedPosts) {
+          await this.prisma.post.update({
+            where: { id: post.id },
+            data: {
+              publishDate: retryDate,
+              state: 'QUEUE',
+            },
+          });
+          executionResults.push({
+            action: 'auto_retry',
+            postId: post.id,
+            rescheduledFor: retryDate.toISOString(),
+            status: 'SUCCESS',
+          });
+        }
+      }
+
+      // Increment execution count and record timestamp
+      await (this.prisma as any).automationRule.update({
+        where: { id: rule.id },
+        data: {
+          executionCount: { increment: 1 },
+          lastExecutedAt: new Date(),
+        },
+      });
     }
 
     return {
       ruleId: rule.id,
       ruleName: rule.name,
       trigger: rule.trigger,
-      evaluatedPayload: eventPayload,
-      matched,
+      mode,
+      matched: true,
       matchReasons,
-      projectedActions: matched ? rule.actions : [],
+      projectedActions: actions,
+      executedActions: executionResults,
+      executedCount: executionResults.length,
+      executedAt: mode === 'execute' ? new Date().toISOString() : null,
+      message:
+        mode === 'execute'
+          ? `Successfully executed automation rule. ${executionResults.length} post action(s) processed.`
+          : 'Dry-run evaluation passed. Ready for execution.',
     };
   }
 }
+

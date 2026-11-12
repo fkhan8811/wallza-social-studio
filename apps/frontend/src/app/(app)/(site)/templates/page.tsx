@@ -3,3 +3,4 @@ import { TemplatesComponent } from '@gitroom/frontend/components/templates/templ
 export default function TemplatesPage() {
   return <TemplatesComponent />;
 }
+

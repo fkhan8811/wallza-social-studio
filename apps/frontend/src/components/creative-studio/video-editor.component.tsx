@@ -419,3 +419,4 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
     </div>
   );
 };
+

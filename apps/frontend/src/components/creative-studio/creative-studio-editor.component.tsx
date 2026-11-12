@@ -56,3 +56,4 @@ export const CreativeStudioEditorComponent: FC<{ projectId: string }> = ({ proje
 
   return <ImageEditorComponent project={project} onProjectUpdated={mutate} />;
 };
+

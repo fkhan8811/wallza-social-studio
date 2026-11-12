@@ -15,26 +15,19 @@ import { ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 
-const DEFAULT_VARIABLES = [
-  { name: 'brand_name', fallbackValue: 'Wallza', description: 'Primary brand display name' },
-  { name: 'website', fallbackValue: 'https://wallza.com', description: 'Main organization website' },
-  { name: 'support_email', fallbackValue: 'support@wallza.com', description: 'Customer support email' },
-  { name: 'call_to_action', fallbackValue: 'Explore the full guide at the link in bio ➔', description: 'Standard CTA closing line' },
-];
-
 const DEFAULT_HASHTAG_GROUPS = [
   {
-    name: 'SaaS & Tech Marketing',
-    category: 'SaaS & Growth',
-    tags: ['#SaaS', '#B2BMarketing', '#GrowthHacking', '#Productivity', '#TechStartup', '#MarketingAutomation'],
+    name: 'Tech & Marketing',
+    category: 'Growth & Business',
+    tags: ['#Tech', '#B2BMarketing', '#Growth', '#Productivity', '#Automation'],
   },
   {
-    name: 'Social Media Management',
+    name: 'Social Media Strategy',
     category: 'Social Media',
     tags: ['#SocialMediaMarketing', '#ContentCreator', '#ContentStrategy', '#SocialMediaTips', '#DigitalMarketing'],
   },
   {
-    name: 'Design & Visuals',
+    name: 'Creative & Design',
     category: 'Creative Design',
     tags: ['#DesignInspiration', '#VisualContent', '#BrandIdentity', '#CreativeStudio', '#GraphicDesign'],
   },
@@ -45,23 +38,29 @@ const DEFAULT_HASHTAG_GROUPS = [
 export class ContentEfficiencyController {
   constructor(private readonly prisma: PrismaService) {}
 
-  private async ensureDefaults(organizationId: string) {
+  private async ensureDefaults(org: Organization) {
     const varCount = await (this.prisma as any).dynamicVariable.count({
-      where: { organizationId },
+      where: { organizationId: org.id },
     });
     if (varCount === 0) {
+      const orgDefaults = [
+        { name: 'brand_name', fallbackValue: org.name || 'Your Brand', description: 'Primary brand display name' },
+        { name: 'website', fallbackValue: 'https://example.com', description: 'Main organization website' },
+        { name: 'support_email', fallbackValue: 'support@example.com', description: 'Customer support email' },
+        { name: 'call_to_action', fallbackValue: 'Learn more at the link in bio', description: 'Standard CTA closing line' },
+      ];
       await (this.prisma as any).dynamicVariable.createMany({
-        data: DEFAULT_VARIABLES.map((v) => ({ ...v, organizationId })),
+        data: orgDefaults.map((v) => ({ ...v, organizationId: org.id })),
         skipDuplicates: true,
       }).catch(() => null);
     }
 
     const tagCount = await (this.prisma as any).hashtagGroup.count({
-      where: { organizationId },
+      where: { organizationId: org.id },
     });
     if (tagCount === 0) {
       await (this.prisma as any).hashtagGroup.createMany({
-        data: DEFAULT_HASHTAG_GROUPS.map((g) => ({ ...g, organizationId })),
+        data: DEFAULT_HASHTAG_GROUPS.map((g) => ({ ...g, organizationId: org.id })),
         skipDuplicates: true,
       }).catch(() => null);
     }
@@ -190,7 +189,7 @@ export class ContentEfficiencyController {
 
   @Get('/variables')
   async listVariables(@GetOrgFromRequest() org: Organization) {
-    await this.ensureDefaults(org.id);
+    await this.ensureDefaults(org);
     return (this.prisma as any).dynamicVariable.findMany({
       where: { organizationId: org.id },
       orderBy: { name: 'asc' },
@@ -286,7 +285,7 @@ export class ContentEfficiencyController {
     @GetOrgFromRequest() org: Organization,
     @Query('category') category?: string
   ) {
-    await this.ensureDefaults(org.id);
+    await this.ensureDefaults(org);
     const where: any = { organizationId: org.id };
     if (category && category !== 'all') {
       where.category = category;
@@ -392,3 +391,4 @@ export class ContentEfficiencyController {
     };
   }
 }
+

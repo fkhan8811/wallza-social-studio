@@ -719,3 +719,4 @@ export const TemplatesComponent: FC = () => {
     </div>
   );
 };
+

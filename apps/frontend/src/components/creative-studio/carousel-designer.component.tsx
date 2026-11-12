@@ -172,13 +172,36 @@ export const CarouselDesignerComponent: FC<{ project: any; onProjectUpdated: () 
     setIsExporting(true);
     try {
       await handleSave();
+
+      // Render current slide to offscreen canvas for authentic file export
+      const offscreen = document.createElement('canvas');
+      offscreen.width = 1080;
+      offscreen.height = 1350;
+      const ctx = offscreen.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = currentSlide.bgColor || '#18181b';
+        ctx.fillRect(0, 0, 1080, 1350);
+        ctx.fillStyle = currentSlide.textColor || '#ffffff';
+        ctx.font = 'bold 54px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(currentSlide.title || 'Slide Title', 540, 500);
+        ctx.font = '32px sans-serif';
+        ctx.fillText(currentSlide.body || '', 540, 640);
+        ctx.font = '24px sans-serif';
+        ctx.fillStyle = '#9ca3af';
+        ctx.fillText(`Slide ${activeSlideIndex + 1} of ${slides.length}`, 540, 1250);
+      }
+      const slideDataUrl = offscreen.toDataURL('image/png');
+
       const res = await fetch(`/creative-studio/projects/${project.id}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exportFormat: 'png' }),
+        body: JSON.stringify({ exportFormat: 'png', dataUrl: slideDataUrl }),
       });
       const data = await res.json();
-      alert(`All ${slides.length} slides exported successfully and registered in Media Library!`);
+      if (!res.ok) throw new Error(data.message || 'Export failed');
+
+      alert(`Slide ${activeSlideIndex + 1} exported successfully and registered in Media Library (${data.exportedMedia?.name})!`);
     } catch (err: any) {
       alert(`Export error: ${err.message}`);
     } finally {
@@ -420,3 +443,4 @@ export const CarouselDesignerComponent: FC<{ project: any; onProjectUpdated: () 
     </div>
   );
 };
+

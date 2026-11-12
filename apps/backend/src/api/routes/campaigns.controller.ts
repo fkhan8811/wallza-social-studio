@@ -8,9 +8,12 @@ import {
   Param,
   Post,
   Put,
+  Query,
+  Res,
 } from '@nestjs/common';
 import { Organization } from '@prisma/client';
 import { ApiTags } from '@nestjs/swagger';
+import { Response } from 'express';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 
@@ -397,33 +400,154 @@ export class CampaignsController {
   @Get('/:id/report')
   async exportCampaignReport(
     @GetOrgFromRequest() org: Organization,
-    @Param('id') id: string
+    @Param('id') id: string,
+    @Query('format') format: string,
+    @Res() res: Response
   ) {
-    const analytics = await this.getCampaignAnalytics(org, id);
+    const campaign = await this.prisma.contentCampaign.findFirst({
+      where: { id, organizationId: org.id },
+    });
+    if (!campaign) throw new NotFoundException('Campaign not found.');
 
-    const csvRows = [
-      ['Campaign Report', analytics.campaignName],
-      ['Status', analytics.status],
-      ['Total Posts', String(analytics.totalPosts)],
-      ['Total Post Groups', String(analytics.totalPostGroups)],
-      ['Linked Ideas', String(analytics.linkedIdeasCount)],
+    const links = await this.prisma.contentCampaignPost.findMany({
+      where: { campaignId: id, organizationId: org.id },
+    });
+    const postGroups = links.map((l) => l.postGroup);
+
+    // Fetch ALL posts in this campaign (not just a 10-post slice)
+    const posts = await this.prisma.post.findMany({
+      where: {
+        organizationId: org.id,
+        group: { in: postGroups },
+        deletedAt: null,
+      },
+      include: {
+        integration: { select: { name: true, providerIdentifier: true } },
+      },
+      orderBy: { publishDate: 'desc' },
+    });
+
+    const statesSummary: Record<string, number> = {
+      PUBLISHED: 0,
+      SCHEDULED: 0,
+      DRAFT: 0,
+      ERROR: 0,
+    };
+    const platformBreakdown: Record<
+      string,
+      { total: number; published: number }
+    > = {};
+
+    posts.forEach((post) => {
+      const stateStr = String(post.state);
+      statesSummary[stateStr] = (statesSummary[stateStr] || 0) + 1;
+      const plat =
+        post.integration?.name ||
+        post.integration?.providerIdentifier ||
+        'Unknown';
+      if (!platformBreakdown[plat])
+        platformBreakdown[plat] = { total: 0, published: 0 };
+      platformBreakdown[plat].total += 1;
+      if (stateStr === 'PUBLISHED') platformBreakdown[plat].published += 1;
+    });
+
+    const safeFilename = `campaign_${campaign.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_report.csv`;
+
+    const csvRows: string[][] = [
+      ['WALLZA SOCIAL STUDIO — CAMPAIGN PERFORMANCE REPORT'],
+      ['Campaign Name', campaign.name],
+      ['Status', campaign.status],
+      [
+        'Date Range',
+        `${
+          campaign.startDate
+            ? new Date(campaign.startDate).toISOString().slice(0, 10)
+            : 'N/A'
+        } to ${
+          campaign.endDate
+            ? new Date(campaign.endDate).toISOString().slice(0, 10)
+            : 'N/A'
+        }`,
+      ],
+      ['Generated At', new Date().toISOString()],
       [],
-      ['Post Title', 'Platform', 'State', 'Publish Date', 'URL'],
-      ...analytics.topPosts.map((p) => [
-        p.title || 'Untitled',
-        p.platform || '',
+      ['1. PUBLISHING ANALYTICS SUMMARY (ACTUAL REPOSITORY COUNTS)'],
+      ['Metric', 'Count'],
+      ['Total Posts', String(posts.length)],
+      ['Total Post Groups', String(postGroups.length)],
+      ['Published Posts', String(statesSummary.PUBLISHED || 0)],
+      ['Scheduled Posts', String(statesSummary.SCHEDULED || 0)],
+      ['Draft Posts', String(statesSummary.DRAFT || 0)],
+      ['Failed / Error Posts', String(statesSummary.ERROR || 0)],
+      [],
+      ['2. PLATFORM CHANNEL DISTRIBUTION'],
+      ['Platform', 'Total Posts', 'Published'],
+      ...Object.entries(platformBreakdown).map(([plat, counts]) => [
+        plat,
+        String(counts.total),
+        String(counts.published),
+      ]),
+      [],
+      ['3. PROVIDER PERFORMANCE & ENGAGEMENT METRICS'],
+      ['Metric', 'Status', 'Value / Note'],
+      [
+        'Reach',
+        'PENDING_INSIGHTS_SCOPE',
+        'Requires live provider read_insights token scope',
+      ],
+      [
+        'Impressions',
+        'PENDING_INSIGHTS_SCOPE',
+        'Requires live provider read_insights token scope',
+      ],
+      [
+        'Engagement Rate',
+        'PENDING_INSIGHTS_SCOPE',
+        'Aggregated on active provider token connection',
+      ],
+      [],
+      ['4. COMPLETE POST MANIFEST'],
+      [
+        'Post ID',
+        'Post Title',
+        'Platform',
+        'Publish Status',
+        'Scheduled / Published Date',
+        'Release URL',
+      ],
+      ...posts.map((p) => [
+        p.id,
+        p.title || 'Untitled Post',
+        p.integration?.name || p.integration?.providerIdentifier || 'N/A',
         String(p.state),
-        p.publishDate ? new Date(p.publishDate).toISOString() : '',
-        p.releaseURL || '',
+        p.publishDate ? new Date(p.publishDate).toISOString() : 'N/A',
+        p.releaseURL || 'N/A',
       ]),
     ];
 
-    const csvContent = csvRows.map((r) => r.map((c) => `"${(c || '').replace(/"/g, '""')}"`).join(',')).join('\n');
+    const csvContent = csvRows
+      .map((row) =>
+        row.map((cell) => `"${(cell || '').replace(/"/g, '""')}"`).join(',')
+      )
+      .join('\r\n');
 
-    return {
-      campaignName: analytics.campaignName,
-      analytics,
-      csvContent,
-    };
+    // Support JSON format if explicitly requested
+    if (format === 'json') {
+      return res.status(200).json({
+        campaignName: campaign.name,
+        totalPosts: posts.length,
+        csvContent,
+        filename: safeFilename,
+      });
+    }
+
+    // Direct RFC 4180 CSV attachment response
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${safeFilename}"`
+    );
+    res.setHeader('Content-Length', Buffer.byteLength(csvContent, 'utf-8'));
+    return res.status(200).send(csvContent);
   }
 }

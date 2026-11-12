@@ -2118,7 +2118,7 @@ model HashtagGroup {
   organizationId String
   name           String
   category       String       @default("General")
-  tags           String[]     // ['#saas', '#marketing']
+  tags           String[]     @default([]) // ['#saas', '#marketing']
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 

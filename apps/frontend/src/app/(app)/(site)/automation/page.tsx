@@ -3,3 +3,4 @@ import { AutomationComponent } from '@gitroom/frontend/components/automation/aut
 export default function AutomationPage() {
   return <AutomationComponent />;
 }
+

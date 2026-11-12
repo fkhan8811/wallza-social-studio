@@ -3,3 +3,4 @@ import { CreativeStudioComponent } from '@gitroom/frontend/components/creative-s
 export default function CreativeStudioPage() {
   return <CreativeStudioComponent />;
 }
+

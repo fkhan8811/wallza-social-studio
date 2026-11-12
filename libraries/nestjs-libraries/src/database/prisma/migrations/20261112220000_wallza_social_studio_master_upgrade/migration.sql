@@ -120,3 +120,4 @@ CREATE TABLE IF NOT EXISTS "HashtagGroup" (
 
 CREATE INDEX IF NOT EXISTS "HashtagGroup_organizationId_category_idx" ON "HashtagGroup"("organizationId", "category");
 CREATE INDEX IF NOT EXISTS "HashtagGroup_organizationId_updatedAt_idx" ON "HashtagGroup"("organizationId", "updatedAt");
+

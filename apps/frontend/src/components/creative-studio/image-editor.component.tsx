@@ -263,20 +263,22 @@ export const ImageEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
     setIsExporting(true);
     try {
       await handleSave();
+      const renderedDataUrl = canvas.toDataURL(`image/${format}`, 0.95);
       const res = await fetch(`/creative-studio/projects/${project.id}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exportFormat: format }),
+        body: JSON.stringify({ exportFormat: format, dataUrl: renderedDataUrl }),
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Export failed');
 
       // Trigger browser download
       const a = document.createElement('a');
-      a.href = canvas.toDataURL(`image/${format}`, 0.95);
+      a.href = renderedDataUrl;
       a.download = `${project.name}.${format}`;
       a.click();
 
-      alert(`Export complete! Asset saved to your Media Library and downloaded locally.`);
+      alert(`Export complete! Real asset saved to your Media Library (${data.exportedMedia?.name}) and downloaded locally.`);
     } catch (err: any) {
       alert(`Export error: ${err.message}`);
     } finally {
@@ -581,3 +583,4 @@ export const ImageEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
     </div>
   );
 };
+

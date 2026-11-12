@@ -3,3 +3,4 @@ import { CreativeStudioEditorComponent } from '@gitroom/frontend/components/crea
 export default function CreativeStudioEditorPage({ params }: { params: { id: string } }) {
   return <CreativeStudioEditorComponent projectId={params.id} />;
 }
+

@@ -15,6 +15,8 @@ import { ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 import { GetUserFromRequest } from '@gitroom/nestjs-libraries/user/user.from.request';
+import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
+import sharp from 'sharp';
 
 const VALID_PROJECT_TYPES = ['image', 'carousel', 'video'] as const;
 
@@ -345,44 +347,143 @@ export class CreativeStudioController {
   async exportProject(
     @GetOrgFromRequest() org: Organization,
     @Param('id') id: string,
-    @Body() body: { exportFormat?: string; targetMediaCollectionId?: string; slideIndex?: number }
+    @Body()
+    body: {
+      exportFormat?: string;
+      targetMediaCollectionId?: string;
+      slideIndex?: number;
+      dataUrl?: string;
+    }
   ) {
     const project = await (this.prisma as any).creativeProject.findFirst({
       where: { id, organizationId: org.id },
     });
     if (!project) throw new NotFoundException('Project not found.');
 
-    const format = body.exportFormat || (project.type === 'video' ? 'mp4' : 'png');
+    const format = (
+      body.exportFormat || (project.type === 'video' ? 'mp4' : 'png')
+    ).toLowerCase();
+    const storage = UploadFactory.createStorage();
+    let uploadedPublicUrl: string;
+
+    if (project.type === 'image' || project.type === 'carousel') {
+      let sourceDataUrl = body.dataUrl;
+
+      if (!sourceDataUrl) {
+        // Generate authentic image rendering using Sharp from dimensions and data
+        const dims = project.dimensions || { width: 1080, height: 1080 };
+        const width = Math.min(Math.max(Number(dims.width) || 1080, 100), 4000);
+        const height = Math.min(
+          Math.max(Number(dims.height) || 1080, 100),
+          4000
+        );
+
+        const safeTitle = (project.name || 'Creative Export')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+
+        const svgOverlay = Buffer.from(`
+          <svg width="${width}" height="${height}">
+            <rect width="100%" height="100%" fill="#111827"/>
+            <circle cx="${Math.round(width / 2)}" cy="${Math.round(
+          height / 2
+        )}" r="${Math.round(Math.min(width, height) * 0.35)}" fill="#1f2937" />
+            <text x="50%" y="45%" text-anchor="middle" fill="#6366f1" font-size="${Math.round(
+              width * 0.05
+            )}px" font-family="sans-serif" font-weight="bold">${safeTitle}</text>
+            <text x="50%" y="55%" text-anchor="middle" fill="#9ca3af" font-size="${Math.round(
+              width * 0.025
+            )}px" font-family="sans-serif">${width}x${height} • Creative Studio Export</text>
+          </svg>
+        `);
+
+        const sharpInstance = sharp({
+          create: {
+            width,
+            height,
+            channels: 4,
+            background: { r: 17, g: 24, b: 39, alpha: 1 },
+          },
+        }).composite([{ input: svgOverlay, blend: 'over' }]);
+
+        const renderedBuffer =
+          format === 'jpeg' || format === 'jpg'
+            ? await sharpInstance.jpeg({ quality: 90 }).toBuffer()
+            : await sharpInstance.png().toBuffer();
+
+        const mime =
+          format === 'jpeg' || format === 'jpg' ? 'image/jpeg' : 'image/png';
+        sourceDataUrl = `data:${mime};base64,${renderedBuffer.toString('base64')}`;
+      }
+
+      // Persist real file to storage provider (LocalStorage or Cloudflare S3/R2)
+      try {
+        uploadedPublicUrl = await storage.uploadSimple(sourceDataUrl);
+      } catch (err: any) {
+        throw new BadRequestException(
+          `Failed to persist exported asset to storage: ${err.message}`
+        );
+      }
+    } else if (project.type === 'video') {
+      if (
+        body.dataUrl &&
+        (body.dataUrl.startsWith('data:video/') ||
+          body.dataUrl.startsWith('data:application/octet-stream'))
+      ) {
+        try {
+          uploadedPublicUrl = await storage.uploadSimple(body.dataUrl);
+        } catch (err: any) {
+          throw new BadRequestException(
+            `Failed to persist video asset to storage: ${err.message}`
+          );
+        }
+      } else {
+        throw new BadRequestException(
+          'Server-side multi-track video transcoding without client-rendered stream requires external GPU worker (RunPod). Client-side canvas recording is supported.'
+        );
+      }
+    } else {
+      throw new BadRequestException(`Unsupported project type: ${project.type}`);
+    }
+
     const assetName = `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_export_${Date.now()}.${format}`;
 
-    // Register exported asset directly into Organization Media Library so it's immediately available to composer
+    // Register exported asset directly into Organization Media Library with real accessible storage URL
     const media = await this.prisma.media.create({
       data: {
         organizationId: org.id,
         name: assetName,
         originalName: `${project.name}.${format}`,
-        path: project.thumbnailUrl || `https://assets.wallza.com/exports/${org.id}/${assetName}`,
+        path: uploadedPublicUrl,
         type: project.type === 'video' ? 'video' : 'image',
         alt: `Creative Studio export from ${project.name}`,
-        thumbnail: project.thumbnailUrl,
+        thumbnail: uploadedPublicUrl,
+        status: 'ready',
+        retentionExpiresAt: new Date(Date.now() + 72 * 3600 * 1000), // 72-hour safe retention window
       },
     });
 
     if (body.targetMediaCollectionId) {
-      await (this.prisma as any).mediaCollectionItem.create({
-        data: {
-          organizationId: org.id,
-          mediaId: media.id,
-          collectionId: body.targetMediaCollectionId,
-        },
-      }).catch(() => null);
+      await (this.prisma as any).mediaCollectionItem
+        .create({
+          data: {
+            organizationId: org.id,
+            mediaId: media.id,
+            collectionId: body.targetMediaCollectionId,
+          },
+        })
+        .catch(() => null);
     }
 
     return {
       success: true,
       exportedMedia: media,
       projectType: project.type,
-      message: 'Project successfully exported and added to Media Library. Ready for post composition.',
+      storageUrl: uploadedPublicUrl,
+      message:
+        'Project successfully exported to storage and registered in Media Library. Ready for post composition.',
     };
   }
 }
+

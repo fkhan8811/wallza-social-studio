@@ -85,12 +85,12 @@ export const CampaignsComponent: FC = () => {
   const downloadReport = async (id: string) => {
     try {
       const res = await fetch(`/campaigns/${id}/report`);
-      const data = await res.json();
-      const blob = new Blob([data.csvContent], { type: 'text/csv;charset=utf-8;' });
+      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+      const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${data.campaignName.replace(/[^a-zA-Z0-9_-]/g, '_')}_analytics_report.csv`;
+      a.download = `campaign_${id}_report.csv`;
       a.click();
     } catch (err: any) {
       alert(`Report download failed: ${err.message}`);
