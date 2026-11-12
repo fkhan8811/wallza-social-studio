@@ -276,3 +276,48 @@ This task is complete only when:
 - The final report contains evidence, exact commit SHA and no unsupported claims.
 
 **Start by producing the actual inventory and baseline results. Then implement the work in this order. Do not stop after writing a plan, and do not claim completion until the definition of done is met.**
+
+
+---
+
+## 9. Explicitly agreed repository-to-Postiz feature selections (authoritative scope)
+
+**Important product decision from the November 8–9, 2026 side-by-side repository comparisons:** Postiz is the selected foundation. The other repositories are feature references. We are importing only the advanced capabilities that were missing or weaker in Postiz into this one customized Postiz fork. We are NOT merging five complete applications, replacing Postiz, or duplicating capabilities Postiz already provides well.
+
+The coding agent must inspect the actual source repositories/commits and compare each selected capability against the current fork before implementing it. The table below records the agreed selection; it does not claim every feature is already present in our fork.
+
+### BrightBean Studio — selected capabilities
+- **Unified social inbox improvements:** strengthen Postiz's existing inbox/conversation experience with the selected advanced handling for DMs, comments, mentions and reviews where supported by provider APIs; reply workflows, assignment, sentiment signals, SLA/response tracking and conversation management.
+- **Client approval portal:** client-facing review and approval workflow, preview, feedback, request-changes, audit history and controlled reviewer access.
+- **Campaign/Kanban board:** agency content/campaign operations, linking content and scheduled posts to campaigns.
+- **Agency analytics/reporting:** useful client/campaign reporting built on real platform/Postiz metrics, never fabricated numbers.
+- **Recurring slot queues:** stronger recurring publishing schedules and slot-based queue management.
+
+### OpenPost — selected capabilities
+- **Advanced carousel/graphic studio:** richer visual content design and multi-slide/carousel creation, with editable projects and export to Postiz's native publishing flow.
+- **Professional multi-track video studio:** timeline-based editing, tracks, trim/split, captions/titles, audio and export. Only claim completion when a real editing engine, persisted project format and render/export pipeline exist.
+- **Advanced media asset manager:** stronger asset organization, search, metadata, tagging, collections and reuse, integrated with the existing Postiz Media Library rather than a competing library.
+- **Visual automation builder contribution:** inspect the OpenPost automation capabilities alongside TryPost and implement the agreed shared automation feature once, not twice.
+
+### TryPost — selected capabilities
+- **Visual automation builder:** a visual workflow/automation system for content operations and publishing, with triggers, conditions, actions, execution history, safe retries and permission controls. Reuse Postiz APIs and queues; do not build a separate publishing engine.
+- **Advanced publishing queue rules:** configurable queue slots, posting windows, recurring schedules, timezone-aware rules, queue prioritization and controls beyond Postiz's existing queue behavior.
+
+### Mixpost — supporting selected capabilities
+- Reusable post/content templates.
+- Dynamic variables/placeholders for reusable content.
+- Saved hashtag groups/collections.
+- Platform-specific post versions and conditional content rules.
+These are supporting improvements, not a reason to replace Postiz's composer or duplicate its publishing system. Verify exactly which capabilities are already supported by the current Postiz fork and add only genuine gaps.
+
+### Critical non-duplication decisions
+- Postiz remains the core publishing engine: preserve its existing multi-platform publishing, OAuth/account connections, calendar, composer, scheduling, evergreen/recurring publishing, AI captions/images/video/clipping, analytics, teams/customer groups, APIs, webhooks, CLI/MCP and other working native capabilities.
+- **Inbox nuance:** BrightBean was selected for advanced unified-inbox/conversation-management capabilities, but the implementation must enhance/extend the existing Postiz inbox where appropriate. Do not create a second disconnected inbox. Keep Wallza Connect's WhatsApp inbox/integration distinct and do not duplicate its WhatsApp ownership.
+- Do not rebuild existing Postiz functionality merely because another repository also has it. Compare quality and gaps first; improve Postiz only where the selected source demonstrably offers a stronger capability.
+- Do not integrate unrelated modules or whole applications from the source repositories. No separate BrightBean/OpenPost/TryPost/Mixpost runtime products inside the customer experience.
+- Keep each imported feature modular and integrated into the same Social Studio navigation, identity, workspace, permissions and tenant model.
+
+### Required source-to-feature verification before coding
+For every selected capability, create a row containing: source repository and exact commit/release; source feature path; current Postiz implementation path; gap/weakness evidence; selected behavior; reuse/extension strategy; dependencies/license; implementation status; tests. Inspect the source repositories directly. If a source repo, commit, or feature cannot be accessed or verified, say so and do not invent its behavior.
+
+The previous broad task sections must be interpreted in accordance with this agreed scope. In particular, do not expand the project into unrelated features that were never selected, and do not label planned features as already implemented.
