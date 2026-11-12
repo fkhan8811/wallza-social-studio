@@ -66,6 +66,36 @@ export const CampaignsComponent: FC = () => {
   const [message, setMessage] = useState<string | null>(null);
   const [selectedCampaignId, setSelectedCampaignId] = useState<string | null>(null);
   const [selectedPostGroup, setSelectedPostGroup] = useState('');
+  const [analyticsData, setAnalyticsData] = useState<any | null>(null);
+  const [isLoadingAnalytics, setIsLoadingAnalytics] = useState(false);
+
+  const loadAnalytics = async (id: string) => {
+    setIsLoadingAnalytics(true);
+    try {
+      const res = await fetch(`/campaigns/${id}/analytics`);
+      const data = await res.json();
+      setAnalyticsData(data);
+    } catch (err: any) {
+      alert(`Could not load analytics: ${err.message}`);
+    } finally {
+      setIsLoadingAnalytics(false);
+    }
+  };
+
+  const downloadReport = async (id: string) => {
+    try {
+      const res = await fetch(`/campaigns/${id}/report`);
+      const data = await res.json();
+      const blob = new Blob([data.csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${data.campaignName.replace(/[^a-zA-Z0-9_-]/g, '_')}_analytics_report.csv`;
+      a.click();
+    } catch (err: any) {
+      alert(`Report download failed: ${err.message}`);
+    }
+  };
 
   const { data: campaignPosts, mutate: mutateCampaignPosts } = useSWR<CampaignPostGroup[]>(
     selectedCampaignId ? `/campaigns/${selectedCampaignId}/post-groups` : null,
@@ -244,6 +274,7 @@ export const CampaignsComponent: FC = () => {
               {campaign.startAt ? new Date(campaign.startAt).toLocaleDateString() : 'No start date'} — {campaign.endAt ? new Date(campaign.endAt).toLocaleDateString() : 'No end date'}
             </div>
             <div className="flex flex-wrap justify-end gap-[8px]">
+              <button type="button" onClick={() => loadAnalytics(campaign.id)} className="rounded-[7px] bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 px-[10px] py-[7px] text-[11px] font-semibold hover:bg-indigo-600/40">Analytics 📊</button>
               <button type="button" onClick={() => { setSelectedCampaignId(campaign.id === selectedCampaignId ? null : campaign.id); setMessage(null); }} className="rounded-[7px] border border-blockSeparator px-[10px] py-[7px] text-[11px]">{campaign.id === selectedCampaignId ? 'Close posts' : 'Manage posts'}</button>
               <button type="button" onClick={() => edit(campaign)} className="rounded-[7px] border border-blockSeparator px-[10px] py-[7px] text-[11px]">Edit</button>
               <button type="button" onClick={() => void remove(campaign)} className="rounded-[7px] border border-red-500/30 px-[10px] py-[7px] text-[11px] text-red-400">Delete</button>
@@ -295,6 +326,130 @@ export const CampaignsComponent: FC = () => {
             {!linkedGroups.length && <div className="rounded-[9px] border border-dashed border-blockSeparator p-[16px] text-[12px] text-textItemBlur">No published or scheduled groups attached to this campaign yet.</div>}
           </div>
         </section>
+      )}
+
+      {/* Campaign Analytics & Reporting Modal */}
+      {analyticsData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="w-full max-w-2xl bg-newBgColorInner rounded-2xl border border-blockSeparator p-6 shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center border-b border-blockSeparator pb-4">
+              <div>
+                <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                  📊 {analyticsData.campaignName} — Performance Analytics
+                </h3>
+                <p className="text-xs text-textItemBlur mt-0.5">
+                  Real operational and platform telemetry across attached post groups.
+                </p>
+              </div>
+              <button
+                onClick={() => setAnalyticsData(null)}
+                className="text-textItemBlur hover:text-white text-lg"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* KPI Cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="p-3 rounded-xl bg-newBgColor border border-blockSeparator">
+                <span className="text-[11px] text-textItemBlur block">Total Posts</span>
+                <span className="text-xl font-bold text-white mt-1 block">{analyticsData.totalPosts}</span>
+              </div>
+              <div className="p-3 rounded-xl bg-newBgColor border border-blockSeparator">
+                <span className="text-[11px] text-textItemBlur block">Published</span>
+                <span className="text-xl font-bold text-emerald-400 mt-1 block">
+                  {analyticsData.statesSummary?.PUBLISHED || 0}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-newBgColor border border-blockSeparator">
+                <span className="text-[11px] text-textItemBlur block">Scheduled</span>
+                <span className="text-xl font-bold text-sky-400 mt-1 block">
+                  {analyticsData.statesSummary?.SCHEDULED || 0}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-newBgColor border border-blockSeparator">
+                <span className="text-[11px] text-textItemBlur block">Linked Ideas</span>
+                <span className="text-xl font-bold text-purple-400 mt-1 block">
+                  {analyticsData.linkedIdeasCount || 0}
+                </span>
+              </div>
+            </div>
+
+            {/* Platform Distribution */}
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-textItemBlur">
+                Platform Breakdown
+              </h4>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {Object.entries(analyticsData.platformBreakdown || {}).map(([plat, stat]: [string, any]) => (
+                  <div key={plat} className="p-2.5 rounded-lg bg-newBgColor border border-blockSeparator flex justify-between items-center text-xs">
+                    <span className="capitalize font-medium text-white">{plat}</span>
+                    <span className="text-textItemBlur font-mono">{stat.published}/{stat.posts} pub</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Top Posts Table */}
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-textItemBlur">
+                Campaign Social Posts ({analyticsData.topPosts?.length || 0})
+              </h4>
+              <div className="rounded-xl border border-blockSeparator overflow-hidden bg-newBgColor">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-newBgColorInner border-b border-blockSeparator text-[10px] uppercase text-textItemBlur font-mono">
+                    <tr>
+                      <th className="p-2.5">Title / Content</th>
+                      <th className="p-2.5">Platform</th>
+                      <th className="p-2.5">Status</th>
+                      <th className="p-2.5">Publish Date</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-blockSeparator">
+                    {(analyticsData.topPosts || []).map((post: any) => (
+                      <tr key={post.id} className="hover:bg-white/[0.02]">
+                        <td className="p-2.5 max-w-xs truncate text-white">{post.title || 'Untitled Post'}</td>
+                        <td className="p-2.5 text-textItemBlur capitalize">{post.platform}</td>
+                        <td className="p-2.5">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            post.state === 'PUBLISHED' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-blue-500/20 text-blue-300'
+                          }`}>
+                            {post.state}
+                          </span>
+                        </td>
+                        <td className="p-2.5 text-textItemBlur font-mono text-[11px]">
+                          {post.publishDate ? new Date(post.publishDate).toLocaleDateString() : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="flex justify-between items-center pt-4 border-t border-blockSeparator">
+              <span className="text-[11px] text-textItemBlur font-mono">
+                {analyticsData.metricsSupported?.note}
+              </span>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => downloadReport(analyticsData.campaignId)}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition"
+                >
+                  Download CSV Report ⬇️
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAnalyticsData(null)}
+                  className="px-4 py-2 rounded-xl border border-blockSeparator text-xs font-semibold text-textItemBlur hover:text-white"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

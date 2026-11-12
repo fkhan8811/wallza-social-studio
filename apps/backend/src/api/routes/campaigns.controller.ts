@@ -321,4 +321,109 @@ export class CampaignsController {
     ]);
     return { success: true };
   }
+
+  @Get('/:id/analytics')
+  async getCampaignAnalytics(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const campaign = await this.prisma.contentCampaign.findFirst({
+      where: { id, organizationId: org.id },
+    });
+    if (!campaign) throw new NotFoundException('Campaign not found.');
+
+    const links = await this.prisma.contentCampaignPost.findMany({
+      where: { campaignId: id, organizationId: org.id },
+    });
+    const postGroups = links.map((l) => l.postGroup);
+
+    const posts = await this.prisma.post.findMany({
+      where: { organizationId: org.id, group: { in: postGroups }, deletedAt: null },
+      include: {
+        integration: { select: { name: true, providerIdentifier: true } },
+      },
+    });
+
+    const statesSummary: Record<string, number> = {
+      PUBLISHED: 0,
+      SCHEDULED: 0,
+      DRAFT: 0,
+      ERROR: 0,
+    };
+    const platformBreakdown: Record<string, { posts: number; published: number }> = {};
+
+    posts.forEach((post) => {
+      const stateStr = String(post.state);
+      statesSummary[stateStr] = (statesSummary[stateStr] || 0) + 1;
+
+      const plat = post.integration?.providerIdentifier || 'unknown';
+      if (!platformBreakdown[plat]) platformBreakdown[plat] = { posts: 0, published: 0 };
+      platformBreakdown[plat].posts += 1;
+      if (stateStr === 'PUBLISHED') platformBreakdown[plat].published += 1;
+    });
+
+    // Count linked ideas
+    const ideaCount = await this.prisma.contentIdea.count({
+      where: { organizationId: org.id, campaignId: id },
+    });
+
+    return {
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      status: campaign.status,
+      startDate: campaign.startDate,
+      endDate: campaign.endDate,
+      totalPostGroups: postGroups.length,
+      totalPosts: posts.length,
+      statesSummary,
+      platformBreakdown,
+      linkedIdeasCount: ideaCount,
+      metricsSupported: {
+        reach: false,
+        impressions: false,
+        note: 'Live provider impressions will stream when connected account tokens provide read_insights permissions.',
+      },
+      topPosts: posts.slice(0, 10).map((p) => ({
+        id: p.id,
+        title: p.title,
+        platform: p.integration?.name || p.integration?.providerIdentifier,
+        state: p.state,
+        publishDate: p.publishDate,
+        releaseURL: p.releaseURL,
+      })),
+    };
+  }
+
+  @Get('/:id/report')
+  async exportCampaignReport(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const analytics = await this.getCampaignAnalytics(org, id);
+
+    const csvRows = [
+      ['Campaign Report', analytics.campaignName],
+      ['Status', analytics.status],
+      ['Total Posts', String(analytics.totalPosts)],
+      ['Total Post Groups', String(analytics.totalPostGroups)],
+      ['Linked Ideas', String(analytics.linkedIdeasCount)],
+      [],
+      ['Post Title', 'Platform', 'State', 'Publish Date', 'URL'],
+      ...analytics.topPosts.map((p) => [
+        p.title || 'Untitled',
+        p.platform || '',
+        String(p.state),
+        p.publishDate ? new Date(p.publishDate).toISOString() : '',
+        p.releaseURL || '',
+      ]),
+    ];
+
+    const csvContent = csvRows.map((r) => r.map((c) => `"${(c || '').replace(/"/g, '""')}"`).join(',')).join('\n');
+
+    return {
+      campaignName: analytics.campaignName,
+      analytics,
+      csvContent,
+    };
+  }
 }

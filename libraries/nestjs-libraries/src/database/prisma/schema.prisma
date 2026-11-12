@@ -50,6 +50,12 @@ model Organization {
   contentIdeas       ContentIdea[]
   contentCampaigns   ContentCampaign[]
   contentReviews     ContentReview[]
+  creativeProjects   CreativeProject[]
+  publishingQueues   PublishingQueue[]
+  automationRules    AutomationRule[]
+  postTemplates      PostTemplate[]
+  dynamicVariables   DynamicVariable[]
+  hashtagGroups      HashtagGroup[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -123,6 +129,7 @@ model User {
   sendFailureEmails     Boolean              @default(true)
   sendStreakEmails      Boolean              @default(true)
   oauthAuthorizations   OAuthAuthorization[]
+  creativeProjects      CreativeProject[]
 
   @@unique([email, providerName])
   @@index([providerId, providerName])
@@ -2011,4 +2018,112 @@ model Announcement {
   description String
   color       AnnouncementColor @default(INFO)
   createdAt   DateTime          @default(now())
+}
+
+model CreativeProject {
+  id              String       @id @default(uuid())
+  organizationId  String
+  ownerId         String
+  name            String
+  type            String       // 'image' | 'carousel' | 'video'
+  data            Json         // Canvas layers, elements, slides array, or timeline tracks & clips
+  dimensions      Json         // { width: number, height: number, preset?: string }
+  thumbnailUrl    String?
+  assetReferences String[]     @default([])
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner           User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, updatedAt])
+  @@index([organizationId, type])
+}
+
+model PublishingQueue {
+  id                String       @id @default(uuid())
+  organizationId    String
+  name              String
+  description       String?
+  isDefault         Boolean      @default(false)
+  isActive          Boolean      @default(true)
+  timezone          String       @default("UTC")
+  scheduleSlots     Json         // Array of { dayOfWeek: number, time: string, integrations?: string[] }
+  minSpacingMinutes Int          @default(30)
+  capacityLimit     Int?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, isActive])
+  @@index([organizationId, isDefault])
+}
+
+model AutomationRule {
+  id              String       @id @default(uuid())
+  organizationId  String
+  name            String
+  description     String?
+  isActive        Boolean      @default(true)
+  trigger         String       // 'draft_approved' | 'post_failed' | 'post_scheduled' | 'queue_low' | 'campaign_assigned'
+  conditions      Json         // { platform?: string, campaignId?: string, tag?: string }
+  actions         Json         // { targetQueueId?: string, autoRetry?: boolean, notifyEmail?: string }
+  executionCount  Int          @default(0)
+  lastExecutedAt  DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, isActive])
+  @@index([organizationId, trigger])
+}
+
+model PostTemplate {
+  id               String       @id @default(uuid())
+  organizationId   String
+  name             String
+  category         String       @default("General")
+  content          String
+  platformVersions Json?        // { [platform]: { content: string, mediaIds?: string[], firstComment?: string } }
+  mediaIds         String[]     @default([])
+  tags             String[]     @default([])
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, category])
+  @@index([organizationId, updatedAt])
+}
+
+model DynamicVariable {
+  id             String       @id @default(uuid())
+  organizationId String
+  name           String       // e.g. 'brand_name', 'website', 'discount'
+  fallbackValue  String
+  description    String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model HashtagGroup {
+  id             String       @id @default(uuid())
+  organizationId String
+  name           String
+  category       String       @default("General")
+  tags           String[]     // ['#saas', '#marketing']
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, category])
+  @@index([organizationId, updatedAt])
 }

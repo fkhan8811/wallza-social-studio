@@ -18,6 +18,9 @@ import { PostsController } from '@gitroom/backend/api/routes/posts.controller';
 import { IdeasController } from '@gitroom/backend/api/routes/ideas.controller';
 import { CampaignsController } from '@gitroom/backend/api/routes/campaigns.controller';
 import { ReviewsController, PublicReviewsController } from '@gitroom/backend/api/routes/reviews.controller';
+import { CreativeStudioController } from '@gitroom/backend/api/routes/creative-studio.controller';
+import { PublishingAutomationController } from '@gitroom/backend/api/routes/publishing-automation.controller';
+import { ContentEfficiencyController } from '@gitroom/backend/api/routes/content-efficiency.controller';
 import { MediaController } from '@gitroom/backend/api/routes/media.controller';
 import { ClippingController } from '@gitroom/backend/api/routes/clipping.controller';
 import { MediaWidgetController } from '@gitroom/backend/api/routes/media.widget.controller';
@@ -69,6 +72,9 @@ const authenticatedController = [
   IdeasController,
   CampaignsController,
   ReviewsController,
+  CreativeStudioController,
+  PublishingAutomationController,
+  ContentEfficiencyController,
   MediaController,
   ClippingController,
   BillingController,

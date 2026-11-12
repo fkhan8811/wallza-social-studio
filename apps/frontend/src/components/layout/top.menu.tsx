@@ -55,6 +55,38 @@ export const useMenuItem = () => {
       path: '/ideas',
     },
     {
+      name: t('creative_studio', 'Creative Studio'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C13.66 22 15 20.66 15 19C15 18.23 14.69 17.53 14.19 17.02C13.69 16.51 13.38 15.82 13.38 15.05C13.38 13.4 14.73 12.05 16.38 12.05H18C20.21 12.05 22 10.26 22 8.05C22 4.71 17.52 2 12 2Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="6.5" cy="11.5" r="1.5" fill="currentColor" />
+          <circle cx="9.5" cy="7.5" r="1.5" fill="currentColor" />
+          <circle cx="14.5" cy="7.5" r="1.5" fill="currentColor" />
+          <circle cx="17.5" cy="11.5" r="1.5" fill="currentColor" />
+        </svg>
+      ),
+      path: '/creative-studio',
+    },
+    {
+      name: t('automation', 'Automation'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ),
+      path: '/automation',
+    },
+    {
+      name: t('templates', 'Templates'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <path d="M14 2H6C4.9 2 4 2.9 4 4V20C4 21.1 4.9 22 6 22H18C19.1 22 20 21.1 20 20V8L14 2Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M14 2V8H20M16 13H8M16 17H8M10 9H8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ),
+      path: '/templates',
+    },
+    {
       name: t('campaigns', 'Campaigns'),
       icon: (
         <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
