@@ -8,6 +8,19 @@ import { LoadingComponent } from '@gitroom/frontend/components/layout/loading';
 interface ScheduleSlot {
   dayOfWeek: number;
   time: string;
+  integrations?: string[];
+}
+
+interface ConnectedIntegration {
+  id: string;
+  name: string;
+  originalName?: string;
+  identifier: string;
+  disabled: boolean;
+}
+
+interface IntegrationResponse {
+  integrations: ConnectedIntegration[];
 }
 
 interface PublishingQueue {
@@ -35,6 +48,14 @@ interface AutomationRule {
   lastExecutedAt: string | null;
 }
 
+interface QueueDraft {
+  id: string;
+  content: string;
+  publishDate: string;
+  integrationName: string;
+  platform: string;
+}
+
 const DAYS_OF_WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 export const AutomationComponent: FC = () => {
@@ -56,6 +77,12 @@ export const AutomationComponent: FC = () => {
   ]);
   const [selectedQueueForNextSlot, setSelectedQueueForNextSlot] = useState<string | null>(null);
   const [nextSlotInfo, setNextSlotInfo] = useState<any>(null);
+  const [enqueueQueue, setEnqueueQueue] = useState<PublishingQueue | null>(null);
+  const [queueDrafts, setQueueDrafts] = useState<QueueDraft[]>([]);
+  const [selectedDraftIds, setSelectedDraftIds] = useState<string[]>([]);
+  const [loadingQueueDrafts, setLoadingQueueDrafts] = useState(false);
+  const [submittingQueueDrafts, setSubmittingQueueDrafts] = useState(false);
+  const [queueDraftMessage, setQueueDraftMessage] = useState<string | null>(null);
 
   // Rule state
   const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
@@ -66,7 +93,7 @@ export const AutomationComponent: FC = () => {
 
   const { data: queues = [], mutate: mutateQueues, isLoading: queuesLoading } = useSWR<PublishingQueue[]>(
     '/automation/queues',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
@@ -74,11 +101,40 @@ export const AutomationComponent: FC = () => {
 
   const { data: rules = [], mutate: mutateRules, isLoading: rulesLoading } = useSWR<AutomationRule[]>(
     '/automation/rules',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
   );
+
+  const { data: integrationData } = useSWR<IntegrationResponse>(
+    '/integrations/list',
+    async (url: string) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Could not load connected social accounts.');
+      return res.json();
+    }
+  );
+  const availableIntegrations = (integrationData?.integrations || []).filter((item) => !item.disabled);
+
+  const updateQueueSlot = (slotIndex: number, changes: Partial<ScheduleSlot>) => {
+    setQueueSlots((current) =>
+      current.map((slot, index) => (index === slotIndex ? { ...slot, ...changes } : slot))
+    );
+  };
+
+  const toggleQueueSlotIntegration = (slotIndex: number, integrationId: string, checked: boolean) => {
+    setQueueSlots((current) =>
+      current.map((slot, index) => {
+        if (index !== slotIndex) return slot;
+        const existing = slot.integrations || [];
+        const integrations = checked
+          ? [...new Set([...existing, integrationId])]
+          : existing.filter((id) => id !== integrationId);
+        return { ...slot, integrations: integrations.length ? integrations : undefined };
+      })
+    );
+  };
 
   const handleCreateQueue = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -124,6 +180,74 @@ export const AutomationComponent: FC = () => {
       setNextSlotInfo(data);
     } catch (err: any) {
       alert(`Failed to calculate next slot: ${err.message}`);
+    }
+  };
+
+  const openEnqueueModal = async (queue: PublishingQueue) => {
+    setEnqueueQueue(queue);
+    setQueueDrafts([]);
+    setSelectedDraftIds([]);
+    setQueueDraftMessage(null);
+    setLoadingQueueDrafts(true);
+    try {
+      const response = await fetch('/posts/list?state=draft&limit=100&page=0');
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || 'Could not load draft posts.');
+      }
+
+      // Postiz minifies this endpoint's response to keep calendar/list payloads small.
+      const rows = payload.p || payload.posts || [];
+      const drafts = rows
+        .map((post: any) => ({
+          id: post.i || post.id,
+          content: post.c || post.content || '',
+          publishDate: post.d || post.publishDate || '',
+          integrationName: post.n?.n || post.integration?.name || 'Social account',
+          platform: post.n?.pi || post.integration?.providerIdentifier || '',
+        }))
+        .filter((post: QueueDraft) => Boolean(post.id));
+      setQueueDrafts(drafts);
+      setQueueDraftMessage(drafts.length ? null : 'No upcoming drafts are available to add to this queue.');
+    } catch (error) {
+      setQueueDraftMessage(error instanceof Error ? error.message : 'Could not load drafts.');
+    } finally {
+      setLoadingQueueDrafts(false);
+    }
+  };
+
+  const toggleDraftSelection = (draftId: string) => {
+    setSelectedDraftIds((current) =>
+      current.includes(draftId)
+        ? current.filter((id) => id !== draftId)
+        : [...current, draftId]
+    );
+  };
+
+  const submitQueueDrafts = async () => {
+    if (!enqueueQueue || !selectedDraftIds.length) return;
+    setSubmittingQueueDrafts(true);
+    setQueueDraftMessage(null);
+    try {
+      const response = await fetch(`/automation/queues/${enqueueQueue.id}/enqueue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ postIds: selectedDraftIds }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || 'Could not schedule the selected drafts.');
+      }
+      setQueueDraftMessage(`Scheduled ${payload.scheduled?.length || 0} draft(s) in ${enqueueQueue.name}.`);
+      setSelectedDraftIds([]);
+      await mutateQueues();
+      setQueueDrafts((current) =>
+        current.filter((draft) => !payload.scheduled?.some((item: any) => item.postId === draft.id))
+      );
+    } catch (error) {
+      setQueueDraftMessage(error instanceof Error ? error.message : 'Could not schedule drafts.');
+    } finally {
+      setSubmittingQueueDrafts(false);
     }
   };
 
@@ -293,12 +417,22 @@ export const AutomationComponent: FC = () => {
                     <span className="text-muted-foreground font-mono text-[11px]">
                       Spacing: {q.minSpacingMinutes}m
                     </span>
-                    <button
-                      onClick={() => checkNextSlot(q.id)}
-                      className="px-3 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 font-semibold transition"
-                    >
-                      Next Slot ➔
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => openEnqueueModal(q)}
+                        disabled={!q.isActive}
+                        className="px-3 py-1 rounded-lg border border-indigo-500/30 bg-indigo-600/10 hover:bg-indigo-600/25 text-indigo-300 font-semibold transition disabled:opacity-40"
+                      >
+                        Add drafts
+                      </button>
+                      <button
+                        onClick={() => checkNextSlot(q.id)}
+                        disabled={!q.isActive}
+                        className="px-3 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 font-semibold transition disabled:opacity-40"
+                      >
+                        Next Slot ➔
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -311,7 +445,7 @@ export const AutomationComponent: FC = () => {
               <div>
                 <p className="text-xs font-bold text-white">Next Available Posting Slot Calculated</p>
                 <p className="text-sm font-mono text-indigo-300 mt-0.5">
-                  {new Date(nextSlotInfo.nextSlot).toUTCString()} ({nextSlotInfo.timezone})
+                  {nextSlotInfo.localFormatted || `${new Date(nextSlotInfo.nextSlot).toLocaleString()} (${nextSlotInfo.timezone})`}
                 </p>
               </div>
               <button
@@ -386,10 +520,86 @@ export const AutomationComponent: FC = () => {
         </div>
       )}
 
+      {/* Modal: Add drafts to a queue */}
+      {enqueueQueue && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-border/60 p-5">
+              <div>
+                <h3 className="text-base font-bold text-white">Add drafts to {enqueueQueue.name}</h3>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Select up to 50 upcoming drafts. Each draft is placed in the next free slot for its connected account.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEnqueueQueue(null)}
+                className="rounded-lg border border-border px-2.5 py-1.5 text-xs text-muted-foreground hover:text-white"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              {loadingQueueDrafts ? (
+                <div className="flex justify-center py-12"><LoadingComponent /></div>
+              ) : queueDrafts.length ? (
+                <div className="space-y-2">
+                  {queueDrafts.map((draft) => (
+                    <label key={draft.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/60 p-3 hover:border-indigo-500/40">
+                      <input
+                        type="checkbox"
+                        checked={selectedDraftIds.includes(draft.id)}
+                        onChange={() => toggleDraftSelection(draft.id)}
+                        className="mt-1"
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-center gap-2 text-xs font-semibold text-white">
+                          {draft.integrationName}
+                          {draft.platform && <span className="text-[10px] font-normal text-muted-foreground">{draft.platform}</span>}
+                        </span>
+                        <span className="mt-1 block break-words text-xs text-muted-foreground">
+                          {draft.content || 'Media-only draft'}
+                        </span>
+                        <span className="mt-1 block text-[10px] text-muted-foreground">
+                          {draft.publishDate ? new Date(draft.publishDate).toLocaleString() : 'No date'}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-12 text-center text-xs text-muted-foreground">
+                  No upcoming drafts are available. Create or save a draft in the composer first.
+                </div>
+              )}
+            </div>
+
+            {queueDraftMessage && (
+              <div role="status" className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground">
+                {queueDraftMessage}
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 p-4">
+              <span className="text-xs text-muted-foreground">{selectedDraftIds.length} selected (maximum 50)</span>
+              <button
+                type="button"
+                onClick={submitQueueDrafts}
+                disabled={!selectedDraftIds.length || selectedDraftIds.length > 50 || submittingQueueDrafts || loadingQueueDrafts}
+                className="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {submittingQueueDrafts ? 'Scheduling…' : 'Schedule selected drafts'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Modal: Create Queue */}
       {isQueueModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="w-full max-w-md bg-card rounded-2xl border border-border p-6 shadow-2xl space-y-4">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto bg-card rounded-2xl border border-border p-6 shadow-2xl space-y-4">
             <h3 className="text-lg font-bold text-white">Create Publishing Queue</h3>
             <form onSubmit={handleCreateQueue} className="space-y-4">
               <div>
@@ -412,13 +622,78 @@ export const AutomationComponent: FC = () => {
                   className="w-full px-3 py-2 rounded-xl bg-background border border-border text-sm text-white focus:outline-none focus:border-indigo-500"
                 >
                   <option value="UTC">UTC (Coordinated Universal Time)</option>
-                  <option value="America/New_York">America/New_York (EST)</option>
-                  <option value="America/Los_Angeles">America/Los_Angeles (PST)</option>
-                  <option value="Europe/London">Europe/London (GMT)</option>
-                  <option value="Europe/Paris">Europe/Paris (CET)</option>
-                  <option value="Asia/Dubai">Asia/Dubai (GST)</option>
+                  <option value="America/New_York">America/New_York</option>
+                  <option value="America/Los_Angeles">America/Los_Angeles</option>
+                  <option value="Europe/London">Europe/London</option>
+                  <option value="Europe/Paris">Europe/Paris</option>
+                  <option value="Asia/Dubai">Asia/Dubai</option>
                   <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
                 </select>
+              </div>
+
+              <div className="space-y-3 rounded-xl border border-border/60 bg-background/50 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h4 className="text-xs font-bold text-white">Weekly posting slots</h4>
+                    <p className="text-[10px] text-muted-foreground">Choose days, local times and optional accounts for each slot.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setQueueSlots((current) => [...current, { dayOfWeek: 1, time: '09:00' }])}
+                    className="rounded-lg border border-indigo-500/40 px-2.5 py-1.5 text-[10px] font-semibold text-indigo-300 hover:bg-indigo-500/10"
+                  >
+                    + Add slot
+                  </button>
+                </div>
+
+                {queueSlots.map((slot, index) => (
+                  <div key={index} className="space-y-2 rounded-lg border border-border/50 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={slot.dayOfWeek}
+                        onChange={(e) => updateQueueSlot(index, { dayOfWeek: Number(e.target.value) })}
+                        className="min-w-[110px] flex-1 rounded-lg border border-border bg-card px-2 py-2 text-xs text-white"
+                        aria-label={`Slot ${index + 1} day`}
+                      >
+                        {DAYS_OF_WEEK.map((day, dayIndex) => <option key={dayIndex} value={dayIndex}>{day}</option>)}
+                      </select>
+                      <input
+                        type="time"
+                        value={slot.time}
+                        onChange={(e) => updateQueueSlot(index, { time: e.target.value })}
+                        className="rounded-lg border border-border bg-card px-2 py-2 text-xs text-white"
+                        aria-label={`Slot ${index + 1} time`}
+                      />
+                      <button
+                        type="button"
+                        disabled={queueSlots.length <= 1}
+                        onClick={() => setQueueSlots((current) => current.filter((_, slotIndex) => slotIndex !== index))}
+                        className="rounded-lg border border-red-500/30 px-2.5 py-2 text-[10px] text-red-300 disabled:opacity-30"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <div>
+                      <p className="mb-1.5 text-[10px] font-semibold text-muted-foreground">Apply to accounts (empty = all accounts)</p>
+                      {availableIntegrations.length ? (
+                        <div className="flex flex-wrap gap-x-3 gap-y-1.5">
+                          {availableIntegrations.map((integration) => (
+                            <label key={integration.id} className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                              <input
+                                type="checkbox"
+                                checked={(slot.integrations || []).includes(integration.id)}
+                                onChange={(e) => toggleQueueSlotIntegration(index, integration.id, e.target.checked)}
+                              />
+                              {integration.name || integration.originalName || integration.identifier}
+                            </label>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-amber-300">Connect social accounts first to configure account-specific slots.</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-border/40">

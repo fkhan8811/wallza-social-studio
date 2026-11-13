@@ -180,6 +180,48 @@ const BUILTIN_TEMPLATES: BuiltinTemplate[] = [
 export class CreativeStudioController {
   constructor(private readonly prisma: PrismaService) {}
 
+  private async saveVersionSnapshot(organizationId: string, userId: string, project: any) {
+    const versions = (this.prisma as any).creativeProjectVersion;
+    const latest = await versions.findFirst({
+      where: { projectId: project.id, organizationId },
+      orderBy: { version: 'desc' },
+      select: { version: true },
+    });
+    await versions.create({
+      data: {
+        projectId: project.id,
+        organizationId,
+        version: (latest?.version || 0) + 1,
+        name: project.name,
+        type: project.type,
+        data: project.data,
+        dimensions: project.dimensions,
+        // Browser data URLs are deliberately not copied into each database snapshot.
+        thumbnailUrl:
+          typeof project.thumbnailUrl === 'string' && project.thumbnailUrl.startsWith('data:')
+            ? null
+            : project.thumbnailUrl || null,
+        assetReferences: Array.isArray(project.assetReferences) ? project.assetReferences : [],
+        createdById: userId,
+      },
+    });
+
+    // Bound database growth: retain the latest 20 recoverable versions per project.
+    const retained = await versions.findMany({
+      where: { projectId: project.id, organizationId },
+      orderBy: { version: 'desc' },
+      take: 20,
+      select: { id: true },
+    });
+    await versions.deleteMany({
+      where: {
+        projectId: project.id,
+        organizationId,
+        id: { notIn: retained.map((item: { id: string }) => item.id) },
+      },
+    });
+  }
+
   @Get('/templates')
   async listTemplates(@Query('type') type?: string) {
     if (type && VALID_PROJECT_TYPES.includes(type as any)) {
@@ -293,13 +335,78 @@ export class CreativeStudioController {
         assetReferences: Array.isArray(body.assetReferences) ? body.assetReferences : [],
       },
     });
+    await this.saveVersionSnapshot(org.id, user.id, project);
 
     return project;
+  }
+
+  @Get('/projects/:id/versions')
+  async listProjectVersions(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const project = await (this.prisma as any).creativeProject.findFirst({
+      where: { id, organizationId: org.id },
+      select: { id: true },
+    });
+    if (!project) throw new NotFoundException('Project not found in this organization.');
+
+    return (this.prisma as any).creativeProjectVersion.findMany({
+      where: { projectId: id, organizationId: org.id },
+      orderBy: { version: 'desc' },
+      take: 20,
+      select: {
+        id: true,
+        version: true,
+        name: true,
+        type: true,
+        createdAt: true,
+        createdById: true,
+      },
+    });
+  }
+
+  @Post('/projects/:id/versions/:version/restore')
+  async restoreProjectVersion(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Param('id') id: string,
+    @Param('version') versionRaw: string
+  ) {
+    const version = Number.parseInt(versionRaw, 10);
+    if (!Number.isInteger(version) || version < 1) {
+      throw new BadRequestException('Choose a valid project version.');
+    }
+    const project = await (this.prisma as any).creativeProject.findFirst({
+      where: { id, organizationId: org.id },
+    });
+    if (!project) throw new NotFoundException('Project not found in this organization.');
+
+    const snapshot = await (this.prisma as any).creativeProjectVersion.findFirst({
+      where: { projectId: id, organizationId: org.id, version },
+    });
+    if (!snapshot) throw new NotFoundException('Project version not found. It may have expired from version retention.');
+
+    const restored = await (this.prisma as any).creativeProject.update({
+      where: { id },
+      data: {
+        name: snapshot.name,
+        type: snapshot.type,
+        data: snapshot.data,
+        dimensions: snapshot.dimensions,
+        thumbnailUrl: snapshot.thumbnailUrl,
+        assetReferences: snapshot.assetReferences,
+      },
+    });
+    // Record the restored state as a new version so the restore itself is reversible.
+    await this.saveVersionSnapshot(org.id, user.id, restored);
+    return restored;
   }
 
   @Put('/projects/:id')
   async updateProject(
     @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
     @Param('id') id: string,
     @Body() body: {
       name?: string;
@@ -320,6 +427,17 @@ export class CreativeStudioController {
     if (body.dimensions !== undefined) updateData.dimensions = body.dimensions;
     if (body.thumbnailUrl !== undefined) updateData.thumbnailUrl = body.thumbnailUrl;
     if (Array.isArray(body.assetReferences)) updateData.assetReferences = body.assetReferences;
+
+    const changed =
+      (body.name !== undefined && body.name.trim() !== existing.name) ||
+      (body.data !== undefined && JSON.stringify(body.data) !== JSON.stringify(existing.data)) ||
+      (body.dimensions !== undefined && JSON.stringify(body.dimensions) !== JSON.stringify(existing.dimensions)) ||
+      (body.thumbnailUrl !== undefined && body.thumbnailUrl !== existing.thumbnailUrl) ||
+      (Array.isArray(body.assetReferences) && JSON.stringify(body.assetReferences) !== JSON.stringify(existing.assetReferences));
+
+    if (changed) {
+      await this.saveVersionSnapshot(org.id, user.id, existing);
+    }
 
     const updated = await (this.prisma as any).creativeProject.update({
       where: { id },
@@ -360,9 +478,10 @@ export class CreativeStudioController {
     });
     if (!project) throw new NotFoundException('Project not found.');
 
-    const format = (
-      body.exportFormat || (project.type === 'video' ? 'mp4' : 'png')
+    const requestedFormat = (
+      body.exportFormat || (project.type === 'video' ? 'webm' : 'png')
     ).toLowerCase();
+    let actualFormat = requestedFormat;
     const storage = UploadFactory.createStorage();
     let uploadedPublicUrl: string;
 
@@ -408,12 +527,12 @@ export class CreativeStudioController {
         }).composite([{ input: svgOverlay, blend: 'over' }]);
 
         const renderedBuffer =
-          format === 'jpeg' || format === 'jpg'
+          requestedFormat === 'jpeg' || requestedFormat === 'jpg'
             ? await sharpInstance.jpeg({ quality: 90 }).toBuffer()
             : await sharpInstance.png().toBuffer();
 
         const mime =
-          format === 'jpeg' || format === 'jpg' ? 'image/jpeg' : 'image/png';
+          requestedFormat === 'jpeg' || requestedFormat === 'jpg' ? 'image/jpeg' : 'image/png';
         sourceDataUrl = `data:${mime};base64,${renderedBuffer.toString('base64')}`;
       }
 
@@ -431,6 +550,30 @@ export class CreativeStudioController {
         (body.dataUrl.startsWith('data:video/') ||
           body.dataUrl.startsWith('data:application/octet-stream'))
       ) {
+        // Validate video magic bytes to prevent spoofed or corrupted arbitrary payloads
+        const base64Part = body.dataUrl.split(',')[1];
+        if (!base64Part) {
+          throw new BadRequestException('Malformed video dataUrl payload.');
+        }
+        const sampleBuffer = Buffer.from(base64Part.slice(0, 64), 'base64');
+        const isWebm =
+          sampleBuffer.length >= 4 &&
+          sampleBuffer[0] === 0x1a &&
+          sampleBuffer[1] === 0x45 &&
+          sampleBuffer[2] === 0xdf &&
+          sampleBuffer[3] === 0xa3;
+        const isMp4 =
+          sampleBuffer.length >= 12 &&
+          sampleBuffer.toString('utf8', 4, 8) === 'ftyp';
+
+        if (!isWebm && !isMp4) {
+          throw new BadRequestException(
+            'Invalid video payload: Header must be a valid WebM (1A 45 DF A3) or MP4 (ftyp) video stream.'
+          );
+        }
+
+        actualFormat = isWebm ? 'webm' : 'mp4';
+
         try {
           uploadedPublicUrl = await storage.uploadSimple(body.dataUrl);
         } catch (err: any) {
@@ -447,14 +590,14 @@ export class CreativeStudioController {
       throw new BadRequestException(`Unsupported project type: ${project.type}`);
     }
 
-    const assetName = `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_export_${Date.now()}.${format}`;
+    const assetName = `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_export_${Date.now()}.${actualFormat}`;
 
     // Register exported asset directly into Organization Media Library with real accessible storage URL
     const media = await this.prisma.media.create({
       data: {
         organizationId: org.id,
         name: assetName,
-        originalName: `${project.name}.${format}`,
+        originalName: `${project.name}.${actualFormat}`,
         path: uploadedPublicUrl,
         type: project.type === 'video' ? 'video' : 'image',
         alt: `Creative Studio export from ${project.name}`,

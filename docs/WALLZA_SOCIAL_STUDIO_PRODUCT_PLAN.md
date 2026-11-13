@@ -104,3 +104,44 @@ One sidebar, one workspace switcher, one account model, consistent page headers,
 ## Current integration boundary
 
 Keep Social Studio as a customized Postiz fork while Meta approval is pending. Use its existing social account connections and organization model; do not create duplicate OAuth or inbox systems. WallzaOS integration remains a separate later step. The current draft PR must stay unmerged until CI, database validation and feature-level end-to-end checks pass.
+
+
+---
+
+## Current status update — 2026-11-13
+
+This section supersedes earlier implementation-status and release-readiness statements above. Earlier sections describe an older branch snapshot.
+
+### Active branch lineage
+
+- Base: `feature/wallzaos-master-social-studio-upgrades` (the Creative Studio, templates, content-efficiency and automation work).
+- Current implementation branch: `feat/social-studio-activity-inbox-parity`.
+- `main` was not modified by this work.
+
+### Added on the current implementation branch
+
+- Publishing Activity Inbox that merges Postiz publishing notifications, post collaboration comments and client review audit events. It is intentionally not a CRM/DM inbox.
+- Authenticated Activity Inbox route and navigation.
+- Tenant-scoped Creative Studio version snapshots, latest-20 retention and reversible restore.
+- Tenant-scoped queue assignment through `Post.queueId`.
+- Timezone-aware queue slot calculation, DST-gap handling, per-integration slot filters, queue-scoped collisions and capacity checks.
+- Queue enqueue endpoint that schedules selected organization-owned drafts through the existing Postiz PostsService workflow path.
+- Updated detailed parity and inbox-boundary audit: `docs/WALLZAOS_SOCIAL_STUDIO_PARITY_AND_INBOX_BOUNDARY_2026-11-13.md`.
+
+### Inbox ownership decision
+
+WallzaOS Unified Inbox remains the customer communication and lead system of record (WhatsApp, DMs where connected, email, website chat, customer conversations, contact identity and lead lifecycle). Social Studio Activity Inbox is for content-operations activity (publishing alerts, post collaboration comments and review events). Do not copy customer conversations into both products.
+
+External network comments/mentions are not claimed as supported by the Activity Inbox until provider-specific read/reply adapters and official platform permissions are implemented and tested.
+
+### Remaining engineering gates
+
+- Apply and validate the two new migrations against a disposable PostgreSQL database:
+  - `20261113174500_creative_project_versions`
+  - `20261113181500_queue_assignment`
+- Run Prisma generation, full frontend/backend/orchestrator build and unit tests.
+- Run browser and end-to-end tests for activity feed access, version restore, queue scheduling, timezones, DST, queue capacity and live publishing.
+- Complete approval enforcement in the actual publishing pipeline; review links and audit history do not by themselves block a post from publishing.
+- Finish per-platform template-to-composer application, queue assignment UI, richer client revision workflows and the video rendering pipeline.
+
+**Do not label this branch production-ready until those gates pass.** This session changed GitHub source only; no production database, Render service or third-party social credentials were changed.

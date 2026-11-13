@@ -252,6 +252,135 @@ export class ReviewsController {
       return { success: true };
     });
   }
+
+  @Post('/internal/submit')
+  async submitForInternalApproval(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Body() body: { postGroup: string; notes?: string }
+  ) {
+    const postGroup = typeof body.postGroup === 'string' ? body.postGroup.trim() : '';
+    if (!postGroup) throw new BadRequestException('postGroup is required.');
+
+    const posts = await this.prisma.post.findMany({
+      where: { group: postGroup, organizationId: org.id, deletedAt: null },
+    });
+    if (!posts.length) throw new NotFoundException('Post group not found.');
+
+    await this.prisma.post.updateMany({
+      where: { group: postGroup, organizationId: org.id },
+      data: {
+        requiresApproval: true,
+        approvalStatus: 'pending',
+      },
+    });
+
+    return {
+      success: true,
+      postGroup,
+      approvalStatus: 'pending',
+      message: 'Post successfully submitted for internal review and approval.',
+    };
+  }
+
+  @Post('/internal/decide')
+  async decideInternalApproval(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Body()
+    body: {
+      postGroup: string;
+      decision: 'approved' | 'rejected' | 'changes_requested';
+      feedback?: string;
+    }
+  ) {
+    const postGroup = typeof body.postGroup === 'string' ? body.postGroup.trim() : '';
+    if (!postGroup) throw new BadRequestException('postGroup is required.');
+    const validDecisions = ['approved', 'rejected', 'changes_requested'];
+    if (!validDecisions.includes(body.decision)) {
+      throw new BadRequestException('decision must be approved, rejected, or changes_requested.');
+    }
+
+    const posts = await this.prisma.post.findMany({
+      where: { group: postGroup, organizationId: org.id, deletedAt: null },
+    });
+    if (!posts.length) throw new NotFoundException('Post group not found.');
+
+    const updateData: any = {
+      approvalStatus: body.decision,
+    };
+    if (body.decision === 'approved') {
+      updateData.approvedById = user.id;
+      updateData.approvedAt = new Date();
+    }
+
+    await this.prisma.post.updateMany({
+      where: { group: postGroup, organizationId: org.id },
+      data: updateData,
+    });
+
+    return {
+      success: true,
+      postGroup,
+      decision: body.decision,
+      approvedById: body.decision === 'approved' ? user.id : null,
+      feedback: body.feedback || null,
+    };
+  }
+
+  @Post('/:id/reopen-revision')
+  async reopenRevision(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Param('id') id: string,
+    @Body() body?: { additionalDays?: number }
+  ) {
+    const days = Math.min(30, Math.max(1, body?.additionalDays || 7));
+    return this.prisma.$transaction(async (tx) => {
+      const review = await tx.contentReview.findFirst({
+        where: { id, organizationId: org.id },
+      });
+      if (!review) throw new NotFoundException('Review not found.');
+
+      const newExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+      await tx.contentReview.update({
+        where: { id },
+        data: {
+          status: 'pending',
+          expiresAt: newExpiresAt,
+          reviewedAt: null,
+        },
+      });
+
+      await tx.post.updateMany({
+        where: { group: review.postGroup, organizationId: org.id },
+        data: {
+          requiresApproval: true,
+          approvalStatus: 'pending',
+          approvedById: null,
+          approvedAt: null,
+        },
+      });
+
+      await tx.contentReviewEvent.create({
+        data: {
+          reviewId: id,
+          organizationId: org.id,
+          action: 'revision_reopened',
+          actorEmail: user.email,
+          actorName: user.name || null,
+          comment: `Review reopened with expiry extended to ${newExpiresAt.toISOString()}`,
+        },
+      });
+
+      return {
+        success: true,
+        reviewId: id,
+        status: 'pending',
+        expiresAt: newExpiresAt,
+      };
+    });
+  }
 }
 
 @ApiTags('Public Reviews')
@@ -355,6 +484,32 @@ export class PublicReviewsController {
       if (updated.count !== 1) {
         throw new GoneException('This review link has expired or has already been submitted.');
       }
+
+      // Propagate client decision to the underlying posts in the group
+      if (decision === 'approved') {
+        await tx.post.updateMany({
+          where: { group: review.postGroup, organizationId: review.organizationId },
+          data: {
+            approvalStatus: 'approved',
+            approvedAt: new Date(),
+          },
+        });
+      } else if (decision === 'changes_requested') {
+        await tx.post.updateMany({
+          where: { group: review.postGroup, organizationId: review.organizationId },
+          data: {
+            approvalStatus: 'changes_requested',
+          },
+        });
+      } else if (decision === 'rejected') {
+        await tx.post.updateMany({
+          where: { group: review.postGroup, organizationId: review.organizationId },
+          data: {
+            approvalStatus: 'rejected',
+          },
+        });
+      }
+
       await tx.contentReviewEvent.create({
         data: {
           reviewId: review.id,

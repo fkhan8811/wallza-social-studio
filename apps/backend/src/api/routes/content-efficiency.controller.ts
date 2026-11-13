@@ -185,6 +185,63 @@ export class ContentEfficiencyController {
     });
   }
 
+  @Post('/templates/from-post/:postId')
+  async createTemplateFromPost(
+    @GetOrgFromRequest() org: Organization,
+    @Param('postId') postId: string,
+    @Body() body: { name?: string; category?: string }
+  ) {
+    const post = await this.prisma.post.findFirst({
+      where: { id: postId, organizationId: org.id, deletedAt: null },
+      include: { integration: { select: { providerIdentifier: true } } },
+    });
+    if (!post) throw new NotFoundException('Post not found in this organization.');
+
+    // Fetch sibling variants in the same post group
+    const siblingPosts = await this.prisma.post.findMany({
+      where: { group: post.group, organizationId: org.id, deletedAt: null },
+      include: { integration: { select: { providerIdentifier: true } } },
+    });
+
+    const platformVersions: Record<string, { content: string }> = {};
+    for (const p of siblingPosts) {
+      if (p.integration?.providerIdentifier) {
+        platformVersions[p.integration.providerIdentifier] = {
+          content: p.content,
+        };
+      }
+    }
+
+    let mediaIds: string[] = [];
+    if (post.image) {
+      try {
+        const parsed = JSON.parse(post.image);
+        if (Array.isArray(parsed)) {
+          mediaIds = parsed.map((m: any) => m.id || m.url).filter(Boolean);
+        }
+      } catch {
+        // ignore JSON parse error
+      }
+    }
+
+    const templateName =
+      (body.name && body.name.trim()) ||
+      post.title ||
+      `Template from ${post.integration?.providerIdentifier || 'Post'} (${new Date().toLocaleDateString()})`;
+
+    return (this.prisma as any).postTemplate.create({
+      data: {
+        organizationId: org.id,
+        name: templateName,
+        category: body.category?.trim() || 'Post Snapshots',
+        content: post.content,
+        platformVersions,
+        mediaIds,
+        tags: [],
+      },
+    });
+  }
+
   // ── 2. DYNAMIC VARIABLES ───────────────────────────────────────────────────
 
   @Get('/variables')
@@ -276,6 +333,14 @@ export class ContentEfficiencyController {
       unresolvedVariables: [...new Set(unresolvedVariables)],
       isPublishSafe: unresolvedVariables.length === 0,
     };
+  }
+
+  @Post('/substitute-variables')
+  async substituteVariables(
+    @GetOrgFromRequest() org: Organization,
+    @Body() body: { text: string; overrides?: Record<string, string> }
+  ) {
+    return this.resolveVariables(org, body);
   }
 
   // ── 3. HASHTAG GROUPS ──────────────────────────────────────────────────────

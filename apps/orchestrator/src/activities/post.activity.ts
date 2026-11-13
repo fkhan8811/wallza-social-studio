@@ -33,6 +33,7 @@ import {
   Disconnect,
   PublishedWithError,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import { ApplicationFailure } from '@temporalio/activity';
 
 // Drops fields the workflow and downstream activities never read — biggest wins are `error` (grows per retry) and `childrenPost` (Prisma side-loads it on every recursive row).
 function slimPost(post: any) {
@@ -169,8 +170,16 @@ export class PostActivity {
       }
     }
     const post = await this._postService.getPostById(postId, orgId);
-    if (post.deletedAt) {
+    if (!post || post.deletedAt) {
       return false;
+    }
+
+    // WallzaOS Approval Gate: Block publishing if post requires approval and is not approved
+    if (post.requiresApproval && post.approvalStatus !== 'approved') {
+      throw ApplicationFailure.nonRetryable(
+        `Publishing blocked by approval gate: Post requires approval before publishing. Current status: ${post.approvalStatus || 'pending'}`,
+        'approval_required_stop'
+      );
     }
 
     return reanchorInterval(post);
@@ -199,6 +208,15 @@ export class PostActivity {
     // only the root drives the pre-publish sleep and the repeat schedule,
     // the rest are comments
     const [root, ...comments] = getPosts.map(slimPost);
+
+    // WallzaOS Approval Gate: Block publishing if post requires approval and is not approved
+    if (root.requiresApproval && root.approvalStatus !== 'approved') {
+      throw ApplicationFailure.nonRetryable(
+        `Publishing blocked by approval gate: Post requires approval before publishing. Current status: ${root.approvalStatus || 'pending'}`,
+        'approval_required_stop'
+      );
+    }
+
     return [reanchorInterval(root), ...comments];
   }
 
@@ -367,6 +385,18 @@ export class PostActivity {
 
       if (!subscription) {
         throw new Error('No active subscription found for this organization.');
+      }
+    }
+
+    // WallzaOS Approval Gate Enforcement: Immediately before platform dispatch
+    if (posts && posts.length > 0) {
+      const rootPost = posts[0];
+      const freshPost = await this._postService.getPostById(rootPost.id, integration.organizationId);
+      if (freshPost?.requiresApproval && freshPost.approvalStatus !== 'approved') {
+        throw ApplicationFailure.nonRetryable(
+          `Publishing blocked by approval gate: Post requires approval before platform dispatch. Current status: ${freshPost.approvalStatus || 'pending'}`,
+          'approval_required_stop'
+        );
       }
     }
 

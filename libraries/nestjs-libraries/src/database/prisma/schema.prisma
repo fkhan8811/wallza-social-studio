@@ -21,6 +21,7 @@ model Organization {
   allowTrial          Boolean              @default(false)
   isTrailing          Boolean              @default(false)
   shortlink           ShortLinkPreference  @default(ASK)
+  requireApprovalForPublish Boolean            @default(false)
   autoPost            AutoPost[]
   Comments            Comments[]
   credits             Credits[]
@@ -33,6 +34,7 @@ model Organization {
   mediaCollections   MediaCollection[]
   buyerOrganization   MessagesGroup[]
   notifications       Notifications[]
+  socialLeadOutbox    SocialLeadOutbox[]
   plugs               Plugs[]
   post                Post[]               @relation("organization")
   submittedPost       Post[]               @relation("submittedForOrg")
@@ -284,6 +286,7 @@ model UserOrganization {
   organizationId String
   disabled       Boolean      @default(false)
   role           Role         @default(USER)
+  lastReadNotifications DateTime?
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   organization   Organization @relation(fields: [organizationId], references: [id])
@@ -637,6 +640,7 @@ model Post {
   publishDate                DateTime
   organizationId             String
   integrationId              String
+  queueId                    String?
   content                    String
   delay                      Int                       @default(0)
   group                      String
@@ -651,6 +655,10 @@ model Post {
   submittedForOrderId        String?
   submittedForOrganizationId String?
   approvedSubmitForOrder     APPROVED_SUBMIT_FOR_ORDER @default(NO)
+  requiresApproval           Boolean                   @default(false)
+  approvalStatus             String?                   @default("none")
+  approvedById               String?
+  approvedAt                 DateTime?
   creationMethod             CreationMethod            @default(UNKNOWN)
   lastMessageId              String?
   intervalInDays             Int?
@@ -662,6 +670,7 @@ model Post {
   errors                     Errors[]
   payoutProblems             PayoutProblems[]
   integration                Integration               @relation(fields: [integrationId], references: [id])
+  queue                      PublishingQueue?          @relation(fields: [queueId, organizationId], references: [id, organizationId], onDelete: Restrict)
   lastMessage                Messages?                 @relation(fields: [lastMessageId], references: [id])
   organization               Organization              @relation("organization", fields: [organizationId], references: [id])
   parentPost                 Post?                     @relation("parentPostId", fields: [parentPostId], references: [id])
@@ -688,6 +697,8 @@ model Post {
   @@index([updatedAt])
   @@index([releaseURL])
   @@index([integrationId])
+  @@index([queueId, organizationId, state, publishDate])
+  @@index([organizationId, requiresApproval, approvalStatus])
 }
 
 model Notifications {
@@ -2035,9 +2046,30 @@ model CreativeProject {
 
   organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   owner           User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  versions        CreativeProjectVersion[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, updatedAt])
   @@index([organizationId, type])
+}
+
+model CreativeProjectVersion {
+  id              String          @id @default(uuid())
+  projectId       String
+  organizationId  String
+  version         Int
+  name            String
+  type            String
+  data            Json
+  dimensions      Json
+  thumbnailUrl    String?
+  assetReferences String[]        @default([])
+  createdById     String
+  createdAt       DateTime        @default(now())
+  project         CreativeProject @relation(fields: [projectId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([projectId, organizationId, version])
+  @@index([organizationId, projectId, createdAt])
 }
 
 model PublishingQueue {
@@ -2055,7 +2087,9 @@ model PublishingQueue {
   updatedAt         DateTime     @updatedAt
 
   organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  posts             Post[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, isActive])
   @@index([organizationId, isDefault])
 }
@@ -2126,4 +2160,30 @@ model HashtagGroup {
 
   @@index([organizationId, category])
   @@index([organizationId, updatedAt])
+}
+
+model SocialLeadOutbox {
+  id                String       @id @default(uuid())
+  organizationId    String
+  idempotencyKey    String       @unique
+  platform          String
+  channel           String
+  postId            String?
+  commentId         String?
+  authorName        String
+  authorHandle      String?
+  content           String
+  permalink         String?
+  leadNotes         String?
+  status            String       @default("pending") // "pending" | "dispatched" | "failed"
+  dispatchedAt      DateTime?
+  dispatchAttempts  Int          @default(0)
+  targetResponse    String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([organizationId, platform, commentId])
 }

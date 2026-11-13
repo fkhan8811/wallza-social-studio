@@ -189,7 +189,7 @@ export const CarouselDesignerComponent: FC<{ project: any; onProjectUpdated: () 
         ctx.fillText(currentSlide.body || '', 540, 640);
         ctx.font = '24px sans-serif';
         ctx.fillStyle = '#9ca3af';
-        ctx.fillText(`Slide ${activeSlideIndex + 1} of ${slides.length}`, 540, 1250);
+        ctx.fillText(`Slide ${currentSlideIndex + 1} of ${slides.length}`, 540, 1250);
       }
       const slideDataUrl = offscreen.toDataURL('image/png');
 
@@ -201,7 +201,7 @@ export const CarouselDesignerComponent: FC<{ project: any; onProjectUpdated: () 
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Export failed');
 
-      alert(`Slide ${activeSlideIndex + 1} exported successfully and registered in Media Library (${data.exportedMedia?.name})!`);
+      alert(`Slide ${currentSlideIndex + 1} exported successfully and registered in Media Library (${data.exportedMedia?.name})!`);
     } catch (err: any) {
       alert(`Export error: ${err.message}`);
     } finally {
