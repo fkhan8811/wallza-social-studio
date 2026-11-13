@@ -50,5 +50,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - name: Run Prisma and Security Tests
+        run: cd libraries/nestjs-libraries && npx vitest run --globals
+
       - name: Build
         run: pnpm run build

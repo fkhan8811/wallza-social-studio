@@ -12,51 +12,8 @@ import { Request } from 'express';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
-import { verifyInternalRequest } from '../auth/internal-hmac.util';
-
-const PRIVATE_IP_REGEX =
-  /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost|::1)/i;
-
-const VALID_MEDIA_EXTENSIONS = new Set([
-  '.jpg',
-  '.jpeg',
-  '.png',
-  '.webp',
-  '.gif',
-  '.mp4',
-  '.mov',
-  '.webm',
-]);
-
-function validateMediaUrl(url: string, isProduction: boolean): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new HttpException(`Invalid media URL format: ${url}`, HttpStatus.BAD_REQUEST);
-  }
-
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new HttpException(`Invalid media URL protocol: ${parsed.protocol}`, HttpStatus.BAD_REQUEST);
-  }
-
-  if (isProduction && PRIVATE_IP_REGEX.test(parsed.hostname)) {
-    throw new HttpException(
-      `Media URL points to private/internal network: ${parsed.hostname}`,
-      HttpStatus.BAD_REQUEST
-    );
-  }
-
-  const pathname = parsed.pathname.toLowerCase();
-  const hasValidExt = Array.from(VALID_MEDIA_EXTENSIONS).some((ext) => pathname.endsWith(ext));
-  // Allow unsigned storage/CDN URLs with queries as long as path or query has recognizable asset format
-  if (!hasValidExt && !pathname.includes('/uploads/') && !pathname.includes('/storage/')) {
-    throw new HttpException(
-      `Unsupported media format for URL: ${pathname}. Allowed: JPG, PNG, WEBP, GIF, MP4, MOV`,
-      HttpStatus.BAD_REQUEST
-    );
-  }
-}
+import { verifyInternalRequestAsync } from '../auth/internal-hmac.util';
+import { validateMediaUrlComprehensive } from '@gitroom/nestjs-libraries/upload/ssrf-media-validator';
 
 function validatePostContent(caption: string, mediaUrls: string[], platforms: string[]): void {
   const trimmed = (caption || '').trim();
@@ -133,7 +90,10 @@ export class WallzaSyncController {
 
   @Get('/wallza-status')
   async getStatus(@Req() req: Request, @Query('organizationId') organizationId: string) {
-    const auth = verifyInternalRequest(req, { expectedAudience: 'social-studio' });
+    const auth = await verifyInternalRequestAsync(req, {
+      expectedAudience: 'social-studio',
+      prisma: this._prisma,
+    });
     if (!auth.valid) {
       throw new HttpException(auth.error || 'Unauthorized internal request', HttpStatus.UNAUTHORIZED);
     }
@@ -203,7 +163,10 @@ export class WallzaSyncController {
       }>;
     }
   ) {
-    const auth = verifyInternalRequest(req, { expectedAudience: 'social-studio' });
+    const auth = await verifyInternalRequestAsync(req, {
+      expectedAudience: 'social-studio',
+      prisma: this._prisma,
+    });
     if (!auth.valid) {
       throw new HttpException(auth.error || 'Unauthorized internal request', HttpStatus.UNAUTHORIZED);
     }
@@ -324,7 +287,10 @@ export class WallzaSyncController {
       wallzaPostId?: string;
     }
   ) {
-    const auth = verifyInternalRequest(req, { expectedAudience: 'social-studio' });
+    const auth = await verifyInternalRequestAsync(req, {
+      expectedAudience: 'social-studio',
+      prisma: this._prisma,
+    });
     if (!auth.valid) {
       throw new HttpException(auth.error || 'Unauthorized internal request', HttpStatus.UNAUTHORIZED);
     }
@@ -344,10 +310,10 @@ export class WallzaSyncController {
       throw new HttpException('Missing organizationId', HttpStatus.BAD_REQUEST);
     }
 
-    // 1. Validation (Requirement 11)
+    // 1. Comprehensive SSRF, media format & content validation (Requirement 6 & 11)
     const isProduction = process.env.NODE_ENV === 'production';
     for (const url of mediaUrls) {
-      validateMediaUrl(url, isProduction);
+      await validateMediaUrlComprehensive(url, { isProduction, checkHead: false });
     }
     validatePostContent(caption, mediaUrls, platforms);
     validateScheduleParameters(type, scheduledAt);
@@ -394,29 +360,92 @@ export class WallzaSyncController {
       }
     }
 
-    // 3. Duplicate Prevention & Idempotency (Requirement 12)
-    const postTrackingId = idempotencyKey || wallzaPostId;
-    if (postTrackingId) {
-      const existingPost = await this._prisma.post.findFirst({
-        where: {
-          organizationId: org.id,
-          releaseId: postTrackingId,
-          deletedAt: null,
-        },
-      });
+    // 3. Atomic Database-Backed Idempotency Reservation (Requirement 5 & 12)
+    const trackingKey = idempotencyKey || wallzaPostId;
+    let idempotencyRecord: any = null;
+    let isReservationOwner = false;
 
-      if (existingPost) {
-        return {
-          success: true,
-          message: 'Post already dispatched/scheduled (idempotent replay)',
-          post: existingPost,
-          channels: targetIntegrations.map((i) => ({
-            id: i.id,
-            name: i.name,
-            platform: i.providerIdentifier,
-          })),
-          idempotent: true,
-        };
+    if (trackingKey) {
+      try {
+        idempotencyRecord = await this._prisma.publishingIdempotency.create({
+          data: {
+            organizationId: org.id,
+            idempotencyKey: trackingKey,
+            status: 'pending',
+          },
+        });
+        isReservationOwner = true;
+      } catch (err: any) {
+        if (err?.code === 'P2002') {
+          // Key already exists! Another concurrent request or retry arrived first.
+          isReservationOwner = false;
+        } else {
+          // If table doesn't exist yet, proceed with soft releaseId check
+          isReservationOwner = true;
+        }
+      }
+
+      if (!isReservationOwner) {
+        // Poll for completion of the first request (up to 4.5 seconds)
+        let attempts = 0;
+        let existingRecord = await this._prisma.publishingIdempotency.findUnique({
+          where: {
+            organizationId_idempotencyKey: {
+              organizationId: org.id,
+              idempotencyKey: trackingKey,
+            },
+          },
+        });
+
+        while (existingRecord && existingRecord.status === 'pending' && attempts < 15) {
+          await new Promise((r) => setTimeout(r, 300));
+          existingRecord = await this._prisma.publishingIdempotency.findUnique({
+            where: {
+              organizationId_idempotencyKey: {
+                organizationId: org.id,
+                idempotencyKey: trackingKey,
+              },
+            },
+          });
+          attempts++;
+        }
+
+        if (existingRecord?.postId) {
+          const existingPost = await this._prisma.post.findUnique({
+            where: { id: existingRecord.postId },
+          });
+          if (existingPost) {
+            return {
+              success: true,
+              message: 'Post already dispatched/scheduled (atomic idempotent replay)',
+              post: existingPost,
+              channels: targetIntegrations.map((i) => ({
+                id: i.id,
+                name: i.name,
+                platform: i.providerIdentifier,
+              })),
+              idempotent: true,
+            };
+          }
+        }
+
+        // Check fallback post by releaseId
+        const existingPost = await this._prisma.post.findFirst({
+          where: { organizationId: org.id, releaseId: trackingKey, deletedAt: null },
+        });
+        if (existingPost) {
+          return {
+            success: true,
+            message: 'Post already dispatched/scheduled (atomic idempotent replay)',
+            post: existingPost,
+            channels: targetIntegrations.map((i) => ({
+              id: i.id,
+              name: i.name,
+              platform: i.providerIdentifier,
+            })),
+            idempotent: true,
+          };
+        }
       }
     }
 
@@ -439,14 +468,26 @@ export class WallzaSyncController {
     try {
       const mapped = await this._postsService.mapTypeToPost(postPayload as any, org.id);
       const created = await this._postsService.createPost(org.id, mapped, 'API');
+      const createdId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
 
-      // Tag with releaseId for idempotency during retries
-      if (postTrackingId && created) {
-        const createdId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
-        if (createdId) {
-          await this._prisma.post.update({
-            where: { id: createdId },
-            data: { releaseId: postTrackingId },
+      if (createdId) {
+        await this._prisma.post.update({
+          where: { id: createdId },
+          data: { releaseId: trackingKey },
+        }).catch(() => {});
+
+        if (trackingKey && isReservationOwner) {
+          await this._prisma.publishingIdempotency.update({
+            where: {
+              organizationId_idempotencyKey: {
+                organizationId: org.id,
+                idempotencyKey: trackingKey,
+              },
+            },
+            data: {
+              postId: createdId,
+              status: 'completed',
+            },
           }).catch(() => {});
         }
       }
@@ -463,6 +504,20 @@ export class WallzaSyncController {
         idempotent: false,
       };
     } catch (err: any) {
+      if (trackingKey && isReservationOwner) {
+        await this._prisma.publishingIdempotency.update({
+          where: {
+            organizationId_idempotencyKey: {
+              organizationId: org.id,
+              idempotencyKey: trackingKey,
+            },
+          },
+          data: {
+            status: 'failed',
+            response: err.message,
+          },
+        }).catch(() => {});
+      }
       throw new HttpException(
         err.message || 'Failed to dispatch post through publishing service',
         HttpStatus.INTERNAL_SERVER_ERROR

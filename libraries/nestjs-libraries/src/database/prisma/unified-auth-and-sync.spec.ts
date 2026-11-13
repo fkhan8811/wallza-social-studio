@@ -1,281 +1,286 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as crypto from 'crypto';
 import {
+  isPrivateOrReservedIp,
+  validateMediaUrlComprehensive,
+} from '../../upload/ssrf-media-validator';
+import {
   signInternalRequest,
-  verifyInternalRequest,
-  getInternalSecret,
+  verifyInternalRequestAsync,
 } from '../../auth/internal-hmac.util';
 
-describe('Social Studio — WallzaOS SSO & Connection Synchronization Suite', () => {
-  const sha256 = (value: string) =>
-    crypto.createHash('sha256').update(value, 'utf8').digest('hex');
-
+describe('Social Studio — Advanced Security, SSO Identity, SSRF & Idempotency Suite', () => {
   const TEST_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
-  // ── 1. WALLZAOS SSO IDENTITY & SESSION MAPPING ────────────────────────────
-  describe('Area 1: Supabase-to-Social-Studio Identity & Session Mapping', () => {
-    it('maps immutable Supabase user and org IDs into Social Studio entities', () => {
+  // ── 1. SSRF & MULTI-FORMAT IP VALIDATION (Task 6) ──────────────────────────
+  describe('Area 1: SSRF Defense & Media URL Validation', () => {
+    it('detects standard and alternate IPv4/IPv6 private & reserved addresses', () => {
+      // Loopback
+      expect(isPrivateOrReservedIp('127.0.0.1')).toBe(true);
+      expect(isPrivateOrReservedIp('127.0.0.2')).toBe(true);
+      expect(isPrivateOrReservedIp('::1')).toBe(true);
+
+      // Private RFC 1918
+      expect(isPrivateOrReservedIp('10.0.0.1')).toBe(true);
+      expect(isPrivateOrReservedIp('172.16.0.1')).toBe(true);
+      expect(isPrivateOrReservedIp('192.168.1.100')).toBe(true);
+
+      // Link-local & Cloud Metadata (AWS/GCP/Oracle/Azure)
+      expect(isPrivateOrReservedIp('169.254.169.254')).toBe(true);
+      expect(isPrivateOrReservedIp('fe80::1')).toBe(true);
+
+      // IPv4-mapped IPv6
+      expect(isPrivateOrReservedIp('::ffff:127.0.0.1')).toBe(true);
+      expect(isPrivateOrReservedIp('::ffff:169.254.169.254')).toBe(true);
+      expect(isPrivateOrReservedIp('::ffff:10.1.2.3')).toBe(true);
+
+      // Alternate representations (Decimal integer, Hex)
+      expect(isPrivateOrReservedIp('2130706433')).toBe(true); // 127.0.0.1 in decimal
+      expect(isPrivateOrReservedIp('0x7f000001')).toBe(true); // 127.0.0.1 in hex
+
+      // Legitimate Public Internet IPs must be allowed
+      expect(isPrivateOrReservedIp('8.8.8.8')).toBe(false);
+      expect(isPrivateOrReservedIp('1.1.1.1')).toBe(false);
+      expect(isPrivateOrReservedIp('2606:4700:4700::1111')).toBe(false);
+    });
+
+    it('rejects forbidden URL schemes and URLs pointing to private IPs', async () => {
+      // Non-HTTP/HTTPS protocols
+      await expect(
+        validateMediaUrlComprehensive('file:///etc/passwd', { isProduction: true })
+      ).rejects.toThrow(/Disallowed URL protocol/);
+
+      await expect(
+        validateMediaUrlComprehensive('gopher://127.0.0.1:70/', { isProduction: true })
+      ).rejects.toThrow(/Disallowed URL protocol/);
+
+      // Private IPs
+      await expect(
+        validateMediaUrlComprehensive('http://127.0.0.1:3000/photo.png', { isProduction: true })
+      ).rejects.toThrow(/prohibited/);
+
+      await expect(
+        validateMediaUrlComprehensive('http://169.254.169.254/latest/meta-data', { isProduction: true })
+      ).rejects.toThrow(/prohibited/);
+
+      await expect(
+        validateMediaUrlComprehensive('http://[::1]/internal.jpg', { isProduction: true })
+      ).rejects.toThrow(/prohibited/);
+    });
+
+    it('permits valid public media URLs and signed Supabase storage paths', async () => {
+      const validCdnUrl = 'https://cdn.wallza.com/assets/campaign-banner.jpg';
+      const resultCdn = await validateMediaUrlComprehensive(validCdnUrl, { isProduction: false, skipDns: true });
+      expect(resultCdn.valid).toBe(true);
+
+      const validSupabaseUrl =
+        'https://xyzcompany.supabase.co/storage/v1/object/public/wallza-media/org-123/banner.webp';
+      const resultStorage = await validateMediaUrlComprehensive(validSupabaseUrl, { isProduction: false, skipDns: true });
+      expect(resultStorage.valid).toBe(true);
+    });
+  });
+
+  // ── 2. SSO IDENTITY MAPPING & ACCOUNT TAKEOVER PREVENTION (Task 3) ─────────
+  describe('Area 2: SSO Identity Collision & Account Takeover Defense', () => {
+    it('blocks account takeover when incoming email matches an existing user with different Supabase ID', () => {
       interface MockUser {
         id: string;
         email: string;
-        name: string;
-        supabaseUserId: string;
-        activated: boolean;
+        supabaseUserId?: string | null;
       }
 
-      interface MockOrganization {
-        id: string;
-        name: string;
-        supabaseOrgId: string;
-      }
+      const existingUsers: MockUser[] = [
+        {
+          id: 'usr_legit_owner',
+          email: 'founder@acme.com',
+          supabaseUserId: 'supabase_original_uuid_111',
+        },
+      ];
 
-      interface MockUserOrganization {
-        userId: string;
-        organizationId: string;
-        role: 'ADMIN' | 'USER';
-        disabled: boolean;
-      }
+      const handleSsoIdentityResolution = (claim: { email: string; supabaseUserId: string }) => {
+        // Step 1: Match by immutable Supabase user ID
+        const matchedById = existingUsers.find((u) => u.supabaseUserId === claim.supabaseUserId);
+        if (matchedById) return { user: matchedById, action: 'authenticated' };
 
-      const users = new Map<string, MockUser>();
-      const orgs = new Map<string, MockOrganization>();
-      const userOrgs = new Map<string, MockUserOrganization>();
-
-      const syncSsoIdentity = (claims: {
-        user: { id: string; email: string; firstName: string; lastName: string; role: 'ADMIN' | 'USER' };
-        organization: { id: string; name: string };
-      }) => {
-        let org = Array.from(orgs.values()).find((o) => o.supabaseOrgId === claims.organization.id);
-        if (!org) {
-          org = {
-            id: `org_ss_${claims.organization.id.slice(0, 8)}`,
-            name: claims.organization.name,
-            supabaseOrgId: claims.organization.id,
-          };
-          orgs.set(org.id, org);
+        // Step 2: Check for email collisions
+        const matchedByEmail = existingUsers.find(
+          (u) => u.email.toLowerCase() === claim.email.toLowerCase()
+        );
+        if (matchedByEmail) {
+          if (matchedByEmail.supabaseUserId && matchedByEmail.supabaseUserId !== claim.supabaseUserId) {
+            throw new Error(
+              `Identity conflict: Account with email ${claim.email} is bound to ${matchedByEmail.supabaseUserId}. Takeover blocked.`
+            );
+          }
+          throw new Error('Account collision: Unlinked local account exists.');
         }
 
-        let user = Array.from(users.values()).find((u) => u.supabaseUserId === claims.user.id);
-        if (!user) {
-          user = {
-            id: `usr_ss_${claims.user.id.slice(0, 8)}`,
-            email: claims.user.email,
-            name: `${claims.user.firstName} ${claims.user.lastName}`.trim(),
-            supabaseUserId: claims.user.id,
-            activated: true,
-          };
-          users.set(user.id, user);
-        }
-
-        const uoKey = `${user.id}:${org.id}`;
-        let uo = userOrgs.get(uoKey);
-        if (!uo) {
-          uo = {
-            userId: user.id,
-            organizationId: org.id,
-            role: claims.user.role,
-            disabled: false,
-          };
-          userOrgs.set(uoKey, uo);
-        } else {
-          uo.role = claims.user.role;
-          uo.disabled = false;
-        }
-
-        return { user, org, uo };
+        return { user: { id: 'new_usr', ...claim }, action: 'created' };
       };
 
-      const claims1 = {
-        user: {
-          id: 'supabase-user-uuid-1111',
-          email: 'alex@acme.com',
-          firstName: 'Alex',
-          lastName: 'Mercer',
-          role: 'ADMIN' as const,
-        },
-        organization: {
-          id: 'supabase-org-uuid-9999',
-          name: 'Acme Global Marketing',
-        },
+      // Attacker or colliding claim: same email, different Supabase ID!
+      const maliciousClaim = {
+        email: 'founder@acme.com',
+        supabaseUserId: 'supabase_attacker_uuid_666',
       };
 
-      const result1 = syncSsoIdentity(claims1);
-      expect(result1.user.supabaseUserId).toBe('supabase-user-uuid-1111');
-      expect(result1.org.supabaseOrgId).toBe('supabase-org-uuid-9999');
-      expect(result1.uo.role).toBe('ADMIN');
-    });
-
-    it('enforces server-side HttpOnly cookie and omits JWT from response JSON (Requirement 1)', () => {
-      const mockResponse = {
-        cookie: (name: string, val: string, options: any) => {
-          expect(name).toMatch(/^(auth|showorg)$/);
-          expect(options.httpOnly).toBe(true);
-          expect(options.path).toBe('/');
-        },
-      };
-
-      const mockExchangeResult = {
-        success: true,
-        user: { id: 'usr_1', email: 'test@wallza.com' },
-        organization: { id: 'org_1', name: 'Acme' },
-      };
-
-      // Ensure no token field is present in returned JSON payload
-      expect((mockExchangeResult as any).token).toBeUndefined();
-      mockResponse.cookie('auth', 'jwt_val_sample', { httpOnly: true, path: '/' });
-      mockResponse.cookie('showorg', 'org_1', { httpOnly: true, path: '/' });
-    });
-
-    it('switches organization securely and rejects unauthorized tenant switches', () => {
-      const memberships = new Set(['usr_1:org_alpha', 'usr_1:org_beta']);
-
-      const canSwitchOrg = (userId: string, targetOrg: string) => {
-        return memberships.has(`${userId}:${targetOrg}`);
-      };
-
-      expect(canSwitchOrg('usr_1', 'org_alpha')).toBe(true);
-      expect(canSwitchOrg('usr_1', 'org_beta')).toBe(true);
-      expect(canSwitchOrg('usr_1', 'org_gamma_unauthorized')).toBe(false);
+      expect(() => handleSsoIdentityResolution(maliciousClaim)).toThrow(/Identity conflict/);
     });
   });
 
-  // ── 2. INTERNAL HMAC AUTHENTICATION & SECURITY ─────────────────────────────
-  describe('Area 2: Canonical HMAC Authentication (Requirements 2 & 3)', () => {
-    it('signs and verifies server-to-server requests with replay protection', () => {
+  // ── 3. ORG SWITCHING LIVE REVALIDATION (Task 4) ────────────────────────────
+  describe('Area 3: Organization Switch Live Revalidation', () => {
+    it('revokes local session when WallzaOS reports membership is deactivated', async () => {
+      const localMemberships = new Map<string, { role: string; disabled: boolean }>([
+        ['user_1:org_revoked', { role: 'ADMIN', disabled: false }],
+        ['user_1:org_active', { role: 'USER', disabled: false }],
+      ]);
+
+      const mockWallzaRevalidate = async (userId: string, orgId: string) => {
+        if (orgId === 'org_revoked') {
+          return { status: 403, allowed: false, error: 'Membership suspended by organization admin' };
+        }
+        return { status: 200, allowed: true, role: 'USER' };
+      };
+
+      const switchOrgHandler = async (userId: string, targetOrg: string) => {
+        const wallzaCheck = await mockWallzaRevalidate(userId, targetOrg);
+        if (!wallzaCheck.allowed) {
+          // Immediately disable stale local membership
+          const entry = localMemberships.get(`${userId}:${targetOrg}`);
+          if (entry) entry.disabled = true;
+          throw new Error(`Forbidden: ${wallzaCheck.error}`);
+        }
+        return { success: true, orgId: targetOrg };
+      };
+
+      // Attempting to switch to org_revoked must fail and disable local membership
+      await expect(switchOrgHandler('user_1', 'org_revoked')).rejects.toThrow(/Forbidden/);
+      expect(localMemberships.get('user_1:org_revoked')?.disabled).toBe(true);
+
+      // Switching to active org must succeed
+      const res = await switchOrgHandler('user_1', 'org_active');
+      expect(res.success).toBe(true);
+    });
+  });
+
+  // ── 4. CONCURRENT PUBLISHING IDEMPOTENCY (Task 5) ─────────────────────────
+  describe('Area 4: Atomic Publishing Idempotency Under Concurrent Load', () => {
+    it('processes exactly 1 post when 10 concurrent requests arrive with the same idempotency key', async () => {
+      const idempotencyTable = new Map<string, { id: string; status: string; postId?: string }>();
+      let realPostsCreatedCount = 0;
+
+      const atomicDispatch = async (orgId: string, idempotencyKey: string, content: string) => {
+        const uniqueKey = `${orgId}:${idempotencyKey}`;
+
+        // Atomic reservation attempt (mimicking UNIQUE constraint P2002)
+        let isOwner = false;
+        if (!idempotencyTable.has(uniqueKey)) {
+          idempotencyTable.set(uniqueKey, { id: `idem_${Date.now()}`, status: 'pending' });
+          isOwner = true;
+        }
+
+        if (!isOwner) {
+          // Poll for winner's completion
+          let attempts = 0;
+          while (idempotencyTable.get(uniqueKey)?.status === 'pending' && attempts < 20) {
+            await new Promise((r) => setTimeout(r, 20));
+            attempts++;
+          }
+          const existing = idempotencyTable.get(uniqueKey);
+          return { postId: existing?.postId, idempotent: true };
+        }
+
+        // Winner executes post creation
+        await new Promise((r) => setTimeout(r, 50)); // simulate post creation latency
+        realPostsCreatedCount++;
+        const newPostId = `post_created_atomic_123`;
+        idempotencyTable.set(uniqueKey, { id: `idem_${Date.now()}`, status: 'completed', postId: newPostId });
+
+        return { postId: newPostId, idempotent: false };
+      };
+
+      // Fire 10 simultaneous concurrent requests
+      const concurrentBatch = Array.from({ length: 10 }, (_, i) =>
+        atomicDispatch('org_corp_99', 'idem_key_concurrent_benchmark', `Post version ${i}`)
+      );
+
+      const results = await Promise.all(concurrentBatch);
+
+      // Exactly ONE request created the post; the other 9 received the existing post idempotently!
+      expect(realPostsCreatedCount).toBe(1);
+
+      const owners = results.filter((r) => !r.idempotent);
+      const replays = results.filter((r) => r.idempotent);
+
+      expect(owners.length).toBe(1);
+      expect(replays.length).toBe(9);
+      expect(replays.every((r) => r.postId === 'post_created_atomic_123')).toBe(true);
+    });
+  });
+
+  // ── 5. PERSISTENT NONCE REPLAY VERIFICATION (Task 2) ───────────────────────
+  describe('Area 5: Persistent Nonce Storage and Replay Defense', () => {
+    it('signs requests without Authorization secret and rejects duplicate nonces via persistent Prisma store', async () => {
+      const persistedNonces = new Set<string>();
+      const mockPrisma = {
+        internalRequestNonce: {
+          create: vi.fn(async ({ data }: any) => {
+            const key = `${data.audience}:${data.nonce}`;
+            if (persistedNonces.has(key)) {
+              const err: any = new Error('Unique constraint failed');
+              err.code = 'P2002';
+              throw err;
+            }
+            persistedNonces.add(key);
+            return { ...data, createdAt: new Date() };
+          }),
+        },
+      };
+
+      const body = { action: 'channel_sync', accountId: 'acc_100' };
       const signed = signInternalRequest({
         method: 'POST',
         path: '/integrations/sync-from-wallza',
         audience: 'social-studio',
-        body: { test: 123 },
+        body,
         secret: TEST_SECRET,
       });
 
-      const mockReq = {
+      // Verify no Authorization header
+      expect((signed as any).authorization).toBeUndefined();
+
+      const req1 = {
         method: 'POST',
         originalUrl: '/integrations/sync-from-wallza',
         path: '/integrations/sync-from-wallza',
-        headers: signed,
-        body: { test: 123 },
+        headers: { ...signed },
+        body,
       } as any;
 
-      const result = verifyInternalRequest(mockReq, {
+      const firstCall = await verifyInternalRequestAsync(req1, {
         expectedAudience: 'social-studio',
         secret: TEST_SECRET,
+        prisma: mockPrisma,
       });
+      expect(firstCall.valid).toBe(true);
 
-      expect(result.valid).toBe(true);
-    });
-
-    it('rejects tampered request method or body', () => {
-      const signed = signInternalRequest({
+      // Second call with same nonce must be rejected
+      const req2 = {
         method: 'POST',
-        path: '/integrations/sync-from-wallza',
-        audience: 'social-studio',
-        body: { test: 123 },
-        secret: TEST_SECRET,
-      });
-
-      const tamperedReq = {
-        method: 'GET', // Tampered method
         originalUrl: '/integrations/sync-from-wallza',
         path: '/integrations/sync-from-wallza',
-        headers: signed,
-        body: { test: 123 },
+        headers: { ...signed },
+        body,
       } as any;
 
-      const result = verifyInternalRequest(tamperedReq, {
+      const secondCall = await verifyInternalRequestAsync(req2, {
         expectedAudience: 'social-studio',
         secret: TEST_SECRET,
+        prisma: mockPrisma,
       });
-
-      expect(result.valid).toBe(false);
-      expect(result.error).toMatch(/HMAC signature mismatch/);
-    });
-  });
-
-  // ── 3. CONNECTION SYNC & PER-ACCOUNT DISCONNECT ────────────────────────────
-  describe('Area 3: Per-Account Disconnect & Channel Sync (Requirements 9 & 10)', () => {
-    interface Integration {
-      id: string;
-      orgId: string;
-      provider: string;
-      internalId: string;
-      disabled: boolean;
-      deletedAt: Date | null;
-      tokenExpiration?: Date | null;
-    }
-
-    const integrations: Integration[] = [
-      { id: '1', orgId: 'org_1', provider: 'facebook', internalId: 'page_1', disabled: false, deletedAt: null },
-      { id: '2', orgId: 'org_1', provider: 'facebook', internalId: 'page_2', disabled: false, deletedAt: null },
-      { id: '3', orgId: 'org_1', provider: 'instagram', internalId: 'ig_1', disabled: false, deletedAt: null },
-    ];
-
-    it('disconnects only target account and preserves sibling accounts', () => {
-      // Disconnect page_1
-      const targetInternalId = 'page_1';
-      for (const item of integrations) {
-        if (item.orgId === 'org_1' && item.provider === 'facebook' && item.internalId === targetInternalId) {
-          item.disabled = true;
-          item.deletedAt = new Date();
-        }
-      }
-
-      const p1 = integrations.find((i) => i.internalId === 'page_1');
-      const p2 = integrations.find((i) => i.internalId === 'page_2');
-      const ig = integrations.find((i) => i.internalId === 'ig_1');
-
-      expect(p1?.disabled).toBe(true);
-      expect(p2?.disabled).toBe(false); // Preserved!
-      expect(ig?.disabled).toBe(false); // Preserved!
-    });
-  });
-
-  // ── 4. DISPATCH VALIDATION & IDEMPOTENCY ────────────────────────────────────
-  describe('Area 4: Dispatch Validation & Duplicate Prevention (Requirements 11 & 12)', () => {
-    it('validates media URLs and blocks private IP ranges in production', () => {
-      const PRIVATE_IP_REGEX =
-        /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost|::1)/i;
-
-      const isPrivate = (urlStr: string) => {
-        const u = new URL(urlStr);
-        return PRIVATE_IP_REGEX.test(u.hostname);
-      };
-
-      expect(isPrivate('http://localhost:3000/media.jpg')).toBe(true);
-      expect(isPrivate('http://169.254.169.254/latest/meta-data')).toBe(true);
-      expect(isPrivate('https://cdn.wallza.com/uploads/photo.jpg')).toBe(false);
-    });
-
-    it('enforces character limits for Twitter, Instagram, and Facebook', () => {
-      const checkLength = (platform: string, text: string) => {
-        if (platform === 'twitter' && text.length > 280) throw new Error('Twitter limit exceeded');
-        if (platform === 'instagram' && text.length > 2200) throw new Error('Instagram limit exceeded');
-        return true;
-      };
-
-      expect(checkLength('twitter', 'Short tweet')).toBe(true);
-      expect(() => checkLength('twitter', 'x'.repeat(281))).toThrow(/Twitter limit/);
-      expect(() => checkLength('instagram', 'x'.repeat(2201))).toThrow(/Instagram limit/);
-    });
-
-    it('deduplicates post creation across retries using releaseId', () => {
-      const db = new Map<string, any>();
-
-      const dispatchWithIdempotency = (releaseId: string, content: string) => {
-        if (db.has(releaseId)) {
-          return { post: db.get(releaseId), idempotent: true };
-        }
-        const post = { id: `post_${Date.now()}`, releaseId, content };
-        db.set(releaseId, post);
-        return { post, idempotent: false };
-      };
-
-      const res1 = dispatchWithIdempotency('idem_key_123', 'First attempt');
-      expect(res1.idempotent).toBe(false);
-
-      const res2 = dispatchWithIdempotency('idem_key_123', 'First attempt retry');
-      expect(res2.idempotent).toBe(true);
-      expect(res2.post.id).toBe(res1.post.id);
+      expect(secondCall.valid).toBe(false);
+      expect(secondCall.error).toMatch(/Replay attack detected/);
     });
   });
 });

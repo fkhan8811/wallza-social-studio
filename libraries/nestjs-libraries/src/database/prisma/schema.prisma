@@ -59,6 +59,7 @@ model Organization {
   postTemplates      PostTemplate[]
   dynamicVariables   DynamicVariable[]
   hashtagGroups      HashtagGroup[]
+  publishingIdempotency PublishingIdempotency[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -2189,3 +2190,30 @@ model SocialLeadOutbox {
   @@index([organizationId, status])
   @@index([organizationId, platform, commentId])
 }
+
+model InternalRequestNonce {
+  audience   String
+  nonce      String
+  timestamp  BigInt
+  createdAt  DateTime @default(now())
+
+  @@id([audience, nonce])
+  @@index([createdAt])
+}
+
+model PublishingIdempotency {
+  id              String       @id @default(cuid())
+  organizationId  String
+  idempotencyKey  String
+  postId          String?
+  status          String       @default("pending") // "pending" | "completed" | "failed"
+  response        String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, status])
+}
+
