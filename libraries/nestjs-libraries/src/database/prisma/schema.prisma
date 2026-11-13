@@ -2207,6 +2207,7 @@ model PublishingIdempotency {
   idempotencyKey  String
   postId          String?
   status          String       @default("pending") // "pending" | "completed" | "failed"
+  fencingToken    String?
   response        String?
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt

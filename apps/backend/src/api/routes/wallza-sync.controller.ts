@@ -9,6 +9,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { Request } from 'express';
+import * as crypto from 'crypto';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
@@ -312,14 +313,17 @@ export class WallzaSyncController {
 
     // 1. Comprehensive SSRF, media format & content validation with real redirect checking
     const isProduction = process.env.NODE_ENV === 'production';
+    const validatedMediaUrls: string[] = [];
     for (const url of mediaUrls) {
-      await validateMediaUrlComprehensive(url, {
+      const validated = await validateMediaUrlComprehensive(url, {
         isProduction,
         checkHead: true,
         timeoutMs: 5000,
       });
+      // Capture the validated destination URL!
+      validatedMediaUrls.push(validated.finalUrl);
     }
-    validatePostContent(caption, mediaUrls, platforms);
+    validatePostContent(caption, validatedMediaUrls, platforms);
     validateScheduleParameters(type, scheduledAt);
 
     // 2. Organization and Integration Verification (Requirement 11)
@@ -364,7 +368,7 @@ export class WallzaSyncController {
       }
     }
 
-    // 3. Atomic Database-Backed Idempotency Reservation (Fail-Closed)
+    // 3. Atomic Database-Backed Idempotency Reservation with Fencing Token (Fail-Closed)
     const trackingKey = (idempotencyKey || wallzaPostId || '').trim();
     if (!trackingKey) {
       throw new HttpException(
@@ -373,12 +377,15 @@ export class WallzaSyncController {
       );
     }
 
+    let fencingToken = crypto.randomUUID();
     let isReservationOwner = false;
+
     try {
       await this._prisma.publishingIdempotency.create({
         data: {
           organizationId: org.id,
           idempotencyKey: trackingKey,
+          fencingToken,
           status: 'pending',
         },
       });
@@ -398,10 +405,10 @@ export class WallzaSyncController {
 
     if (!isReservationOwner) {
       // Lease and recovery mechanism:
-      // If reservation is 'failed' OR abandoned 'pending' with updatedAt older than 45 seconds,
-      // allow this retry to take over the lease atomically.
+      // Allow recovery ONLY after confirmed lease expiration (45 seconds) or explicit failure
       const LEASE_ABANDON_MS = 45_000;
       const expiredBefore = new Date(Date.now() - LEASE_ABANDON_MS);
+      const newFencingToken = crypto.randomUUID();
 
       const takeover = await this._prisma.publishingIdempotency.updateMany({
         where: {
@@ -414,13 +421,15 @@ export class WallzaSyncController {
         },
         data: {
           status: 'pending',
+          fencingToken: newFencingToken,
           updatedAt: new Date(),
         },
       });
 
       if (takeover.count > 0) {
-        // Ownership recovered safely!
+        // Ownership recovered safely with new fencing token!
         isReservationOwner = true;
+        fencingToken = newFencingToken;
       } else {
         // Another request actively owns the reservation. Poll for completion up to 5 seconds (10 * 500ms).
         let attempts = 0;
@@ -509,23 +518,42 @@ export class WallzaSyncController {
       }
     }
 
-    // 4. Dispatch via Postiz native PostsService
-    const postPayload = {
-      type: type === 'now' ? 'now' : 'schedule',
-      date: scheduledAt || new Date().toISOString(),
-      posts: targetIntegrations.map((integration) => ({
-        integration: { id: integration.id },
-        value: [
-          {
-            content: caption || '',
-            image: mediaUrls.map((url) => ({ url, path: url })),
-          },
-        ],
-        settings: {},
-      })),
-    };
+    // 4. Dispatch via Postiz native PostsService with Heartbeat Lease Renewal
+    let heartbeat: NodeJS.Timeout | null = null;
+    if (isReservationOwner) {
+      heartbeat = setInterval(async () => {
+        try {
+          await this._prisma.publishingIdempotency.updateMany({
+            where: {
+              organizationId: org.id,
+              idempotencyKey: trackingKey,
+              fencingToken,
+              status: 'pending',
+            },
+            data: {
+              updatedAt: new Date(),
+            },
+          });
+        } catch {}
+      }, 10_000);
+    }
 
     try {
+      const postPayload = {
+        type: type === 'now' ? 'now' : 'schedule',
+        date: scheduledAt || new Date().toISOString(),
+        posts: targetIntegrations.map((integration) => ({
+          integration: { id: integration.id },
+          value: [
+            {
+              content: caption || '',
+              image: validatedMediaUrls.map((url) => ({ url, path: url })),
+            },
+          ],
+          settings: {},
+        })),
+      };
+
       const mapped = await this._postsService.mapTypeToPost(postPayload as any, org.id);
       const created = await this._postsService.createPost(org.id, mapped, 'API');
       const createdId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
@@ -540,19 +568,26 @@ export class WallzaSyncController {
           console.error('[WallzaSync] Error tagging post releaseId:', updateErr);
         }
 
+        // Fencing check: only finalize if this exact fencing token is still active!
         try {
-          await this._prisma.publishingIdempotency.update({
+          const completionResult = await this._prisma.publishingIdempotency.updateMany({
             where: {
-              organizationId_idempotencyKey: {
-                organizationId: org.id,
-                idempotencyKey: trackingKey,
-              },
+              organizationId: org.id,
+              idempotencyKey: trackingKey,
+              fencingToken,
+              status: 'pending',
             },
             data: {
               postId: createdId,
               status: 'completed',
             },
           });
+
+          if (completionResult.count === 0) {
+            console.warn(
+              `[WallzaSync] Fencing token expired or superseded for key ${trackingKey}. Stale finalize skipped.`
+            );
+          }
         } catch (idempErr: any) {
           console.error('[WallzaSync] CRITICAL: Failed to update publishing idempotency status:', idempErr);
           throw new HttpException(
@@ -576,12 +611,12 @@ export class WallzaSyncController {
     } catch (err: any) {
       if (trackingKey && isReservationOwner) {
         try {
-          await this._prisma.publishingIdempotency.update({
+          await this._prisma.publishingIdempotency.updateMany({
             where: {
-              organizationId_idempotencyKey: {
-                organizationId: org.id,
-                idempotencyKey: trackingKey,
-              },
+              organizationId: org.id,
+              idempotencyKey: trackingKey,
+              fencingToken,
+              status: 'pending',
             },
             data: {
               status: 'failed',
@@ -596,6 +631,10 @@ export class WallzaSyncController {
         err.message || 'Failed to dispatch post through publishing service',
         HttpStatus.INTERNAL_SERVER_ERROR
       );
+    } finally {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
     }
   }
 }

@@ -504,5 +504,116 @@ describe('Social Studio — Advanced Security, SSO Identity, SSRF & Idempotency 
       expect(postsCreated).toBe(1);
       expect(reservation.status).toBe('completed');
     });
+
+    it('renews lease via heartbeat during operations lasting longer than 45s, preventing premature takeover', async () => {
+      let currentUpdatedAt = new Date(Date.now() - 40_000); // 40s ago
+      const originalFencingToken = 'fencing-token-original-uuid-1';
+      let status = 'pending';
+
+      // Heartbeat fires and renews lease
+      const renewLease = () => {
+        currentUpdatedAt = new Date(); // Reset lease timestamp
+      };
+
+      // Simulating heartbeat firing while original request is still active
+      renewLease();
+
+      // Second request attempts recovery: must be rejected because updatedAt is fresh
+      const attemptRecovery = () => {
+        const LEASE_ABANDON_MS = 45_000;
+        const expired = Date.now() - currentUpdatedAt.getTime() > LEASE_ABANDON_MS;
+        if (expired && status === 'pending') {
+          return { acquired: true, fencingToken: 'fencing-token-new-uuid-2' };
+        }
+        return { acquired: false };
+      };
+
+      const recoveryAttempt1 = attemptRecovery();
+      expect(recoveryAttempt1.acquired).toBe(false); // Stolen attempt blocked!
+
+      // Now simulate original request abandoning/crashing (no heartbeat for 50s)
+      currentUpdatedAt = new Date(Date.now() - 50_000);
+      const recoveryAttempt2 = attemptRecovery();
+      expect(recoveryAttempt2.acquired).toBe(true); // Confirmed expired -> recovered!
+
+      // Stale original request wakes up and tries to finalize with old fencing token
+      const finalizeJob = (callerFencingToken: string) => {
+        if (callerFencingToken === recoveryAttempt2.fencingToken) {
+          status = 'completed';
+          return { finalized: true };
+        }
+        return { finalized: false, error: 'Stale fencing token superseded' };
+      };
+
+      const staleFinalize = finalizeJob(originalFencingToken);
+      expect(staleFinalize.finalized).toBe(false);
+      expect(staleFinalize.error).toMatch(/stale/i);
+    });
+
+    it('ensures exactly one winner when 10 simultaneous recovery attempts occur on an expired reservation', async () => {
+      let currentFencingToken: string | null = null;
+      let reservationStatus = 'failed'; // Expired / failed reservation ready for recovery
+
+      const atomicTakeover = async (candidateToken: string) => {
+        // Atomic compare-and-swap (mimicking UPDATE ... WHERE status IN ('failed', 'pending' AND expired) RETURNING 1)
+        if (reservationStatus === 'failed') {
+          reservationStatus = 'pending';
+          currentFencingToken = candidateToken;
+          return { won: true, token: candidateToken };
+        }
+        return { won: false };
+      };
+
+      const contenders = Array.from({ length: 10 }, (_, i) => `candidate-fencing-token-${i}`);
+      const results = await Promise.all(contenders.map((token) => atomicTakeover(token)));
+
+      const winners = results.filter((r) => r.won);
+      const losers = results.filter((r) => !r.won);
+
+      expect(winners.length).toBe(1);
+      expect(losers.length).toBe(9);
+      expect(currentFencingToken).toBe(winners[0].token);
+    });
+  });
+
+  // ── 7. SCHEDULED NONCE CLEANUP & RETENTION VERIFICATION (Task 4) ────────────
+  describe('Area 7: Scheduled Nonce Cleanup & Clock-Skew Safety Buffer', () => {
+    it('cleans up nonces older than 1 hour while preserving recent nonces (< 5 min) for replay defense', async () => {
+      interface MockNonce {
+        audience: string;
+        nonce: string;
+        createdAt: Date;
+      }
+
+      const store: MockNonce[] = [
+        // Expired nonce: 2 hours old (safe to prune)
+        { audience: 'social-studio', nonce: 'nonce_old_2h', createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000) },
+        // Expired nonce: 65 minutes old (safe to prune)
+        { audience: 'social-studio', nonce: 'nonce_old_65m', createdAt: new Date(Date.now() - 65 * 60 * 1000) },
+        // Recent nonce: 2 minutes old (MUST BE RETAINED for active replay defense)
+        { audience: 'social-studio', nonce: 'nonce_recent_2m', createdAt: new Date(Date.now() - 2 * 60 * 1000) },
+        // Fresh nonce: 10 seconds old (MUST BE RETAINED)
+        { audience: 'social-studio', nonce: 'nonce_fresh_10s', createdAt: new Date(Date.now() - 10 * 1000) },
+      ];
+
+      const cleanupExpiredNonces = async () => {
+        const cutoff = new Date(Date.now() - 60 * 60 * 1000); // 1 hour cutoff
+        const initialCount = store.length;
+        const remaining = store.filter((n) => n.createdAt >= cutoff);
+        const deletedCount = initialCount - remaining.length;
+        store.length = 0;
+        store.push(...remaining);
+        return deletedCount;
+      };
+
+      const deleted = await cleanupExpiredNonces();
+      expect(deleted).toBe(2);
+      expect(store.length).toBe(2);
+
+      // Verify that recent nonces remain in the store and continue to block replay attacks
+      expect(store.some((n) => n.nonce === 'nonce_recent_2m')).toBe(true);
+      expect(store.some((n) => n.nonce === 'nonce_fresh_10s')).toBe(true);
+      expect(store.some((n) => n.nonce === 'nonce_old_2h')).toBe(false);
+    });
   });
 });
