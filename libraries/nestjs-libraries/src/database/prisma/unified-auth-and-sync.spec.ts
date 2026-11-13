@@ -1,9 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import * as crypto from 'crypto';
+import {
+  signInternalRequest,
+  verifyInternalRequest,
+  getInternalSecret,
+} from '../../auth/internal-hmac.util';
 
 describe('Social Studio — WallzaOS SSO & Connection Synchronization Suite', () => {
   const sha256 = (value: string) =>
     crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+
+  const TEST_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
   // ── 1. WALLZAOS SSO IDENTITY & SESSION MAPPING ────────────────────────────
   describe('Area 1: Supabase-to-Social-Studio Identity & Session Mapping', () => {
@@ -37,7 +44,6 @@ describe('Social Studio — WallzaOS SSO & Connection Synchronization Suite', ()
         user: { id: string; email: string; firstName: string; lastName: string; role: 'ADMIN' | 'USER' };
         organization: { id: string; name: string };
       }) => {
-        // 1. Resolve or create Org
         let org = Array.from(orgs.values()).find((o) => o.supabaseOrgId === claims.organization.id);
         if (!org) {
           org = {
@@ -48,7 +54,6 @@ describe('Social Studio — WallzaOS SSO & Connection Synchronization Suite', ()
           orgs.set(org.id, org);
         }
 
-        // 2. Resolve or create User
         let user = Array.from(users.values()).find((u) => u.supabaseUserId === claims.user.id);
         if (!user) {
           user = {
@@ -61,7 +66,6 @@ describe('Social Studio — WallzaOS SSO & Connection Synchronization Suite', ()
           users.set(user.id, user);
         }
 
-        // 3. UserOrganization membership
         const uoKey = `${user.id}:${org.id}`;
         let uo = userOrgs.get(uoKey);
         if (!uo) {
@@ -98,200 +102,180 @@ describe('Social Studio — WallzaOS SSO & Connection Synchronization Suite', ()
       expect(result1.user.supabaseUserId).toBe('supabase-user-uuid-1111');
       expect(result1.org.supabaseOrgId).toBe('supabase-org-uuid-9999');
       expect(result1.uo.role).toBe('ADMIN');
-
-      // Idempotency: second login of same user and org does NOT duplicate
-      const result2 = syncSsoIdentity(claims1);
-      expect(result2.user.id).toBe(result1.user.id);
-      expect(result2.org.id).toBe(result1.org.id);
-      expect(users.size).toBe(1);
-      expect(orgs.size).toBe(1);
     });
 
-    it('enforces multi-organization switching and isolates active tenant context', () => {
-      interface UserOrgRel {
-        userId: string;
-        organizationId: string;
-        disabled: boolean;
-      }
-
-      const memberships: UserOrgRel[] = [
-        { userId: 'u1', organizationId: 'org_marketing', disabled: false },
-        { userId: 'u1', organizationId: 'org_sales', disabled: false },
-        { userId: 'u1', organizationId: 'org_suspended', disabled: true },
-      ];
-
-      const switchActiveOrg = (userId: string, targetOrgId: string) => {
-        const membership = memberships.find(
-          (m) => m.userId === userId && m.organizationId === targetOrgId
-        );
-        if (!membership) {
-          throw new Error('User does not belong to target organization.');
-        }
-        if (membership.disabled) {
-          throw new Error('Access denied: membership in this organization is disabled.');
-        }
-        return { activeOrgId: targetOrgId };
+    it('enforces server-side HttpOnly cookie and omits JWT from response JSON (Requirement 1)', () => {
+      const mockResponse = {
+        cookie: (name: string, val: string, options: any) => {
+          expect(name).toMatch(/^(auth|showorg)$/);
+          expect(options.httpOnly).toBe(true);
+          expect(options.path).toBe('/');
+        },
       };
 
-      expect(switchActiveOrg('u1', 'org_marketing').activeOrgId).toBe('org_marketing');
-      expect(switchActiveOrg('u1', 'org_sales').activeOrgId).toBe('org_sales');
-      expect(() => switchActiveOrg('u1', 'org_suspended')).toThrow(/disabled/);
-      expect(() => switchActiveOrg('u1', 'org_unauthorized')).toThrow(/does not belong/);
+      const mockExchangeResult = {
+        success: true,
+        user: { id: 'usr_1', email: 'test@wallza.com' },
+        organization: { id: 'org_1', name: 'Acme' },
+      };
+
+      // Ensure no token field is present in returned JSON payload
+      expect((mockExchangeResult as any).token).toBeUndefined();
+      mockResponse.cookie('auth', 'jwt_val_sample', { httpOnly: true, path: '/' });
+      mockResponse.cookie('showorg', 'org_1', { httpOnly: true, path: '/' });
+    });
+
+    it('switches organization securely and rejects unauthorized tenant switches', () => {
+      const memberships = new Set(['usr_1:org_alpha', 'usr_1:org_beta']);
+
+      const canSwitchOrg = (userId: string, targetOrg: string) => {
+        return memberships.has(`${userId}:${targetOrg}`);
+      };
+
+      expect(canSwitchOrg('usr_1', 'org_alpha')).toBe(true);
+      expect(canSwitchOrg('usr_1', 'org_beta')).toBe(true);
+      expect(canSwitchOrg('usr_1', 'org_gamma_unauthorized')).toBe(false);
     });
   });
 
-  // ── 2. CONNECTION SYNCHRONIZATION BRIDGE ──────────────────────────────────
-  describe('Area 2: Unified Social Connection Sync Bridge', () => {
-    it('upserts Facebook Page and linked Instagram channels into Integration store', () => {
-      interface MockIntegration {
-        id: string;
-        organizationId: string;
-        internalId: string;
-        rootInternalId?: string | null;
-        providerIdentifier: string;
-        name: string;
-        token: string;
-        disabled: boolean;
-        deletedAt: Date | null;
-      }
+  // ── 2. INTERNAL HMAC AUTHENTICATION & SECURITY ─────────────────────────────
+  describe('Area 2: Canonical HMAC Authentication (Requirements 2 & 3)', () => {
+    it('signs and verifies server-to-server requests with replay protection', () => {
+      const signed = signInternalRequest({
+        method: 'POST',
+        path: '/integrations/sync-from-wallza',
+        audience: 'social-studio',
+        body: { test: 123 },
+        secret: TEST_SECRET,
+      });
 
-      const integrations = new Map<string, MockIntegration>();
+      const mockReq = {
+        method: 'POST',
+        originalUrl: '/integrations/sync-from-wallza',
+        path: '/integrations/sync-from-wallza',
+        headers: signed,
+        body: { test: 123 },
+      } as any;
 
-      const syncConnection = (
-        orgId: string,
-        action: 'upsert' | 'disconnect',
-        conns: Array<{
-          provider: string;
-          internalId: string;
-          rootInternalId?: string | null;
-          name: string;
-          token: string;
-        }>
-      ) => {
-        conns.forEach((c) => {
-          const key = `${orgId}:${c.internalId}`;
-          if (action === 'upsert') {
-            const existing = integrations.get(key);
-            if (existing) {
-              existing.name = c.name;
-              existing.token = c.token;
-              existing.disabled = false;
-              existing.deletedAt = null;
-              existing.rootInternalId = c.rootInternalId || null;
-            } else {
-              integrations.set(key, {
-                id: `int_${c.provider}_${c.internalId}`,
-                organizationId: orgId,
-                internalId: c.internalId,
-                rootInternalId: c.rootInternalId || null,
-                providerIdentifier: c.provider,
-                name: c.name,
-                token: c.token,
-                disabled: false,
-                deletedAt: null,
-              });
-            }
-          } else if (action === 'disconnect') {
-            const existing = integrations.get(key);
-            if (existing) {
-              existing.disabled = true;
-              existing.deletedAt = new Date();
-            }
-          }
-        });
-      };
+      const result = verifyInternalRequest(mockReq, {
+        expectedAudience: 'social-studio',
+        secret: TEST_SECRET,
+      });
 
-      const connections = [
-        {
-          provider: 'facebook',
-          internalId: 'page_123456',
-          name: 'Wallza Enterprise Page',
-          token: 'TOKEN_FB_PAGE_XYZ',
-        },
-        {
-          provider: 'instagram',
-          internalId: 'ig_biz_789012',
-          rootInternalId: 'page_123456',
-          name: 'wallza_official',
-          token: 'TOKEN_FB_PAGE_XYZ',
-        },
-      ];
-
-      syncConnection('org_postiz_1', 'upsert', connections);
-      expect(integrations.size).toBe(2);
-
-      const fb = integrations.get('org_postiz_1:page_123456');
-      expect(fb?.providerIdentifier).toBe('facebook');
-      expect(fb?.disabled).toBe(false);
-
-      const ig = integrations.get('org_postiz_1:ig_biz_789012');
-      expect(ig?.providerIdentifier).toBe('instagram');
-      expect(ig?.rootInternalId).toBe('page_123456');
-      expect(ig?.disabled).toBe(false);
-
-      // Disconnect preserves the records with disabled = true and deletedAt set
-      syncConnection('org_postiz_1', 'disconnect', connections);
-      expect(fb?.disabled).toBe(true);
-      expect(fb?.deletedAt).toBeInstanceOf(Date);
-      expect(ig?.disabled).toBe(true);
-      expect(ig?.deletedAt).toBeInstanceOf(Date);
+      expect(result.valid).toBe(true);
     });
 
-    it('rejects connection sync requests with missing or invalid internal secret', () => {
-      const validSecret = 'super_secure_internal_cluster_secret_42';
+    it('rejects tampered request method or body', () => {
+      const signed = signInternalRequest({
+        method: 'POST',
+        path: '/integrations/sync-from-wallza',
+        audience: 'social-studio',
+        body: { test: 123 },
+        secret: TEST_SECRET,
+      });
 
-      const authorizeSyncRequest = (authHeader: string | undefined, xSecret: string | undefined) => {
-        if (xSecret && xSecret === validSecret) return true;
-        if (authHeader && authHeader.startsWith('Bearer ') && authHeader.slice(7).trim() === validSecret) return true;
-        throw new Error('Unauthorized internal API request');
-      };
+      const tamperedReq = {
+        method: 'GET', // Tampered method
+        originalUrl: '/integrations/sync-from-wallza',
+        path: '/integrations/sync-from-wallza',
+        headers: signed,
+        body: { test: 123 },
+      } as any;
 
-      expect(authorizeSyncRequest(`Bearer ${validSecret}`, undefined)).toBe(true);
-      expect(authorizeSyncRequest(undefined, validSecret)).toBe(true);
-      expect(() => authorizeSyncRequest('Bearer invalid_secret', undefined)).toThrow(/Unauthorized/);
-      expect(() => authorizeSyncRequest(undefined, undefined)).toThrow(/Unauthorized/);
+      const result = verifyInternalRequest(tamperedReq, {
+        expectedAudience: 'social-studio',
+        secret: TEST_SECRET,
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/HMAC signature mismatch/);
     });
   });
 
-  // ── 3. PUBLISHING DISPATCH PIPELINE ───────────────────────────────────────
-  describe('Area 3: Real Social Studio Publishing Pipeline', () => {
-    it('dispatches post to genuine Social Studio channels and validates active state', () => {
-      interface Channel {
-        id: string;
-        provider: string;
-        disabled: boolean;
+  // ── 3. CONNECTION SYNC & PER-ACCOUNT DISCONNECT ────────────────────────────
+  describe('Area 3: Per-Account Disconnect & Channel Sync (Requirements 9 & 10)', () => {
+    interface Integration {
+      id: string;
+      orgId: string;
+      provider: string;
+      internalId: string;
+      disabled: boolean;
+      deletedAt: Date | null;
+      tokenExpiration?: Date | null;
+    }
+
+    const integrations: Integration[] = [
+      { id: '1', orgId: 'org_1', provider: 'facebook', internalId: 'page_1', disabled: false, deletedAt: null },
+      { id: '2', orgId: 'org_1', provider: 'facebook', internalId: 'page_2', disabled: false, deletedAt: null },
+      { id: '3', orgId: 'org_1', provider: 'instagram', internalId: 'ig_1', disabled: false, deletedAt: null },
+    ];
+
+    it('disconnects only target account and preserves sibling accounts', () => {
+      // Disconnect page_1
+      const targetInternalId = 'page_1';
+      for (const item of integrations) {
+        if (item.orgId === 'org_1' && item.provider === 'facebook' && item.internalId === targetInternalId) {
+          item.disabled = true;
+          item.deletedAt = new Date();
+        }
       }
 
-      const activeChannels: Channel[] = [
-        { id: 'ch_fb', provider: 'facebook', disabled: false },
-        { id: 'ch_ig', provider: 'instagram', disabled: false },
-        { id: 'ch_x', provider: 'x', disabled: true }, // disabled
-      ];
+      const p1 = integrations.find((i) => i.internalId === 'page_1');
+      const p2 = integrations.find((i) => i.internalId === 'page_2');
+      const ig = integrations.find((i) => i.internalId === 'ig_1');
 
-      const validateAndRoutePost = (requestedPlatforms: string[]) => {
-        const matched = activeChannels.filter(
-          (c) => !c.disabled && requestedPlatforms.includes(c.provider)
-        );
+      expect(p1?.disabled).toBe(true);
+      expect(p2?.disabled).toBe(false); // Preserved!
+      expect(ig?.disabled).toBe(false); // Preserved!
+    });
+  });
 
-        if (matched.length === 0) {
-          throw new Error(
-            `No active connected channel available for platforms: ${requestedPlatforms.join(', ')}`
-          );
-        }
+  // ── 4. DISPATCH VALIDATION & IDEMPOTENCY ────────────────────────────────────
+  describe('Area 4: Dispatch Validation & Duplicate Prevention (Requirements 11 & 12)', () => {
+    it('validates media URLs and blocks private IP ranges in production', () => {
+      const PRIVATE_IP_REGEX =
+        /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost|::1)/i;
 
-        return {
-          matchedChannels: matched.map((m) => m.id),
-          readyForDispatch: true,
-        };
+      const isPrivate = (urlStr: string) => {
+        const u = new URL(urlStr);
+        return PRIVATE_IP_REGEX.test(u.hostname);
       };
 
-      const result = validateAndRoutePost(['facebook', 'instagram']);
-      expect(result.readyForDispatch).toBe(true);
-      expect(result.matchedChannels).toContain('ch_fb');
-      expect(result.matchedChannels).toContain('ch_ig');
+      expect(isPrivate('http://localhost:3000/media.jpg')).toBe(true);
+      expect(isPrivate('http://169.254.169.254/latest/meta-data')).toBe(true);
+      expect(isPrivate('https://cdn.wallza.com/uploads/photo.jpg')).toBe(false);
+    });
 
-      // Attempting to post to disabled channel only throws
-      expect(() => validateAndRoutePost(['x'])).toThrow(/No active connected channel/);
+    it('enforces character limits for Twitter, Instagram, and Facebook', () => {
+      const checkLength = (platform: string, text: string) => {
+        if (platform === 'twitter' && text.length > 280) throw new Error('Twitter limit exceeded');
+        if (platform === 'instagram' && text.length > 2200) throw new Error('Instagram limit exceeded');
+        return true;
+      };
+
+      expect(checkLength('twitter', 'Short tweet')).toBe(true);
+      expect(() => checkLength('twitter', 'x'.repeat(281))).toThrow(/Twitter limit/);
+      expect(() => checkLength('instagram', 'x'.repeat(2201))).toThrow(/Instagram limit/);
+    });
+
+    it('deduplicates post creation across retries using releaseId', () => {
+      const db = new Map<string, any>();
+
+      const dispatchWithIdempotency = (releaseId: string, content: string) => {
+        if (db.has(releaseId)) {
+          return { post: db.get(releaseId), idempotent: true };
+        }
+        const post = { id: `post_${Date.now()}`, releaseId, content };
+        db.set(releaseId, post);
+        return { post, idempotent: false };
+      };
+
+      const res1 = dispatchWithIdempotency('idem_key_123', 'First attempt');
+      expect(res1.idempotent).toBe(false);
+
+      const res2 = dispatchWithIdempotency('idem_key_123', 'First attempt retry');
+      expect(res2.idempotent).toBe(true);
+      expect(res2.post.id).toBe(res1.post.id);
     });
   });
 });

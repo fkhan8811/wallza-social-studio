@@ -51,13 +51,8 @@ export function WallzaSso() {
         setOrgName(data.organization?.name || 'Workspace');
         setMessage(`Signed in successfully to ${data.organization?.name || 'Workspace'}! Redirecting…`);
 
-        // If NOT_SECURED is active and token is in response, set client cookies
-        if (data.token) {
-          document.cookie = `auth=${data.token}; path=/; max-age=2592000`;
-        }
-        if (data.organization?.id) {
-          document.cookie = `showorg=${data.organization.id}; path=/; max-age=2592000`;
-        }
+        // Note: Tokens are set server-side via HttpOnly cookies.
+        // No client-side JWT cookie writing is performed to prevent token exposure.
 
         setTimeout(() => {
           window.location.href = returnUrl;
@@ -98,37 +93,34 @@ export function WallzaSso() {
 
         {status === 'success' && (
           <div className="flex flex-col items-center py-6">
-            <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 mb-4">
+            <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center mb-4 text-emerald-400">
               <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
             </div>
-            <p className="text-sm font-semibold text-emerald-400">{message}</p>
+            <p className="text-sm text-foreground font-semibold">{message}</p>
+            <p className="text-xs text-muted-foreground mt-1">Opening your dashboard…</p>
           </div>
         )}
 
         {status === 'error' && (
           <div className="flex flex-col items-center py-6">
-            <div className="w-12 h-12 rounded-full bg-rose-500/10 border border-rose-500/30 flex items-center justify-center text-rose-400 mb-4">
+            <div className="w-12 h-12 rounded-full bg-rose-500/10 border border-rose-500/30 flex items-center justify-center mb-4 text-rose-400">
               <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               </svg>
             </div>
-            <h3 className="text-sm font-bold text-rose-400 mb-2">Authentication Failed</h3>
-            <p className="text-xs text-muted-foreground mb-6 leading-relaxed">{message}</p>
-            <button
-              onClick={() => {
-                const mainUrl = process.env.NEXT_PUBLIC_MAIN_URL || 'http://localhost:5001';
-                window.location.href = `${mainUrl}/social-publisher`;
-              }}
-              className="px-4 py-2 text-xs font-semibold rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition-all shadow-md shadow-purple-600/30"
+            <p className="text-sm text-rose-300 font-semibold">Authentication Failed</p>
+            <p className="text-xs text-muted-foreground mt-2 max-w-xs">{message}</p>
+            <a
+              href="/"
+              className="mt-6 inline-flex items-center justify-center px-4 py-2 rounded-lg bg-secondary text-secondary-foreground text-xs font-medium hover:bg-secondary/80 transition-colors"
             >
-              Return to WallzaOS
-            </button>
+              Return to Login
+            </a>
           </div>
         )}
       </div>
     </div>
   );
 }
-
