@@ -196,7 +196,7 @@ export class PublishingAutomationController {
           slot.dayOfWeek <= 6 &&
           slot.dayOfWeek === dayOfWeek &&
           typeof slot.time === 'string' &&
-          /^(?:[01]\\d|2[0-3]):[0-5]\\d$/.test(slot.time) &&
+          /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(slot.time) &&
           (!integrationId || !Array.isArray(slot.integrations) || !slot.integrations.length || slot.integrations.includes(integrationId))
         )
         .sort((a, b) => a.time.localeCompare(b.time));
