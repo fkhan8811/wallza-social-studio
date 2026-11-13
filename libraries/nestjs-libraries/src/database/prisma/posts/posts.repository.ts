@@ -33,6 +33,10 @@ export class PostsRepository {
     private _errors: PrismaRepository<'errors'>
   ) {}
 
+  get model(): any {
+    return this._post.model;
+  }
+
   searchForMissingThreeHoursPosts() {
     return this._post.model.post.findMany({
       where: {
@@ -641,8 +645,11 @@ export class PostsRepository {
     keepGroup = false,
     // Shared by the posts saved together for several channels, so opening one
     // of them in the editor brings the others.
-    batchId?: string
+    batchId?: string,
+    idempotencyKey?: string,
+    txClient?: any
   ) {
+    const client = txClient || this._post.model;
     const posts: Post[] = [];
     const uuid = uuidv4();
     const group = keepGroup && body.group ? body.group : uuid;
@@ -653,7 +660,7 @@ export class PostsRepository {
     const existingBatchId =
       body.group || ids.length
         ? (
-            await this._post.model.post.findFirst({
+            await client.post.findFirst({
               where: {
                 organizationId: orgId,
                 deletedAt: null,
@@ -703,6 +710,7 @@ export class PostsRepository {
         intervalInDays: inter ? +inter : null,
         approvedSubmitForOrder: APPROVED_SUBMIT_FOR_ORDER.NO,
         ...(type === 'create' ? { creationMethod } : {}),
+        ...(type === 'create' && idempotencyKey ? { idempotencyKey, releaseId: idempotencyKey } : {}),
         ...(state === 'update'
           ? {}
           : {
@@ -719,7 +727,7 @@ export class PostsRepository {
       });
 
       posts.push(
-        await this._post.model.post.upsert({
+        await client.post.upsert({
           where: {
             id: value.id || uuidv4(),
           },
@@ -737,7 +745,8 @@ export class PostsRepository {
       );
 
       if (posts.length === 1) {
-        await this._tagsPosts.model.tagsPosts.deleteMany({
+        const tagsPostsClient = txClient ? txClient.tagsPosts : this._tagsPosts.model.tagsPosts;
+        await tagsPostsClient.deleteMany({
           where: {
             post: {
               id: posts[0].id,
@@ -757,7 +766,7 @@ export class PostsRepository {
           });
 
           if (tagsList.length) {
-            await this._post.model.post.update({
+            await client.post.update({
               where: {
                 id: posts[posts.length - 1].id,
               },

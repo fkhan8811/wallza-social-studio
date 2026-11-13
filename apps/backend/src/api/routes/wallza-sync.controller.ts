@@ -350,7 +350,7 @@ export class WallzaSyncController {
     }
 
     // Match integrations for requested platforms
-    const targetIntegrations = org.Integration.filter((i) =>
+    let targetIntegrations = org.Integration.filter((i) =>
       platforms.some(
         (p) =>
           p.toLowerCase() === i.providerIdentifier.toLowerCase() ||
@@ -386,8 +386,8 @@ export class WallzaSyncController {
       );
     }
 
-    // Check if an existing post was already created in Postiz with this durable idempotencyKey or releaseId
-    const existingDurablePost = await this._prisma.post.findFirst({
+    // Check if posts were already created in Postiz with this durable idempotencyKey
+    const existingDurablePosts = await this._prisma.post.findMany({
       where: {
         organizationId: org.id,
         OR: [
@@ -398,30 +398,41 @@ export class WallzaSyncController {
       },
     });
 
-    if (existingDurablePost) {
-      // Post was already created! Ensure reservation is recorded as completed
-      await this._prisma.publishingIdempotency.updateMany({
-        where: {
-          organizationId: org.id,
-          idempotencyKey: trackingKey,
-        },
-        data: {
-          postId: existingDurablePost.id,
-          status: 'completed',
-        },
-      });
+    if (existingDurablePosts.length > 0) {
+      const existingIntegrationIds = new Set(existingDurablePosts.map((p) => p.integrationId));
+      const missingIntegrations = targetIntegrations.filter(
+        (ti) => !existingIntegrationIds.has(ti.id)
+      );
 
-      return {
-        success: true,
-        message: 'Post already created in publishing engine (durable idempotency replay)',
-        post: existingDurablePost,
-        channels: targetIntegrations.map((i) => ({
-          id: i.id,
-          name: i.name,
-          platform: i.providerIdentifier,
-        })),
-        idempotent: true,
-      };
+      // If all requested channels already have posts created, return immediately!
+      if (missingIntegrations.length === 0) {
+        await this._prisma.publishingIdempotency.updateMany({
+          where: {
+            organizationId: org.id,
+            idempotencyKey: trackingKey,
+          },
+          data: {
+            postId: existingDurablePosts.map((p) => p.id).join(','),
+            status: 'completed',
+          },
+        });
+
+        return {
+          success: true,
+          message: 'Post already created in publishing engine (durable idempotency replay)',
+          post: existingDurablePosts[0],
+          posts: existingDurablePosts,
+          channels: targetIntegrations.map((i) => ({
+            id: i.id,
+            name: i.name,
+            platform: i.providerIdentifier,
+          })),
+          idempotent: true,
+        };
+      }
+
+      // Partial multi-platform failure recovery: only dispatch missing integrations!
+      targetIntegrations = missingIntegrations;
     }
 
     let fencingToken = crypto.randomUUID();
@@ -503,14 +514,16 @@ export class WallzaSyncController {
         }
 
         if (existingRecord?.status === 'completed' && existingRecord?.postId) {
-          const existingPost = await this._prisma.post.findUnique({
-            where: { id: existingRecord.postId },
+          const completedIds = existingRecord.postId.split(',').filter(Boolean);
+          const existingCompletedPosts = await this._prisma.post.findMany({
+            where: { id: { in: completedIds } },
           });
-          if (existingPost) {
+          if (existingCompletedPosts.length > 0) {
             return {
               success: true,
               message: 'Post already dispatched/scheduled (atomic idempotent replay)',
-              post: existingPost,
+              post: existingCompletedPosts[0],
+              posts: existingCompletedPosts,
               channels: targetIntegrations.map((i) => ({
                 id: i.id,
                 name: i.name,
@@ -521,7 +534,7 @@ export class WallzaSyncController {
           }
         }
 
-        const fallbackPost = await this._prisma.post.findFirst({
+        const fallbackPosts = await this._prisma.post.findMany({
           where: {
             organizationId: org.id,
             OR: [
@@ -531,11 +544,12 @@ export class WallzaSyncController {
             deletedAt: null,
           },
         });
-        if (fallbackPost) {
+        if (fallbackPosts.length > 0) {
           return {
             success: true,
             message: 'Post already dispatched/scheduled (atomic idempotent replay)',
-            post: fallbackPost,
+            post: fallbackPosts[0],
+            posts: fallbackPosts,
             channels: targetIntegrations.map((i) => ({
               id: i.id,
               name: i.name,
@@ -627,31 +641,6 @@ export class WallzaSyncController {
         );
       }
 
-      // Check again if another thread completed the post while we acquired reservation
-      const concurrentPost = await this._prisma.post.findFirst({
-        where: {
-          organizationId: org.id,
-          OR: [
-            { idempotencyKey: trackingKey },
-            { releaseId: trackingKey },
-          ],
-          deletedAt: null,
-        },
-      });
-      if (concurrentPost) {
-        return {
-          success: true,
-          message: 'Post already dispatched/scheduled (atomic idempotent replay)',
-          post: concurrentPost,
-          channels: targetIntegrations.map((i) => ({
-            id: i.id,
-            name: i.name,
-            platform: i.providerIdentifier,
-          })),
-          idempotent: true,
-        };
-      }
-
       const postPayload = {
         type: type === 'now' ? 'now' : 'schedule',
         date: scheduledAt || new Date().toISOString(),
@@ -677,52 +666,28 @@ export class WallzaSyncController {
         );
       }
 
-      const created = await this._postsService.createPost(org.id, mapped, 'API');
-      const createdId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
-
-      if (createdId) {
-        // Tag Post with durable idempotencyKey and releaseId immediately
-        try {
-          await this._prisma.post.update({
-            where: { id: createdId },
-            data: {
-              idempotencyKey: trackingKey,
-              releaseId: trackingKey,
-            },
-          });
-        } catch (tagErr: any) {
-          console.error('[WallzaSync] Error tagging post idempotencyKey:', tagErr);
+      // Execute createPost with in-transaction fencing and initial idempotency key persistence
+      const created = await this._postsService.createPost(
+        org.id,
+        mapped,
+        'API',
+        false,
+        {
+          fencingToken,
+          idempotencyKey: trackingKey,
         }
+      );
 
-        // Fencing check: only finalize if this exact fencing token is still active!
-        try {
-          const completionResult = await this._prisma.publishingIdempotency.updateMany({
-            where: {
-              organizationId: org.id,
-              idempotencyKey: trackingKey,
-              fencingToken,
-              status: 'pending',
-            },
-            data: {
-              postId: createdId,
-              status: 'completed',
-            },
-          });
-
-          if (completionResult.count === 0) {
-            console.warn(
-              `[WallzaSync] Fencing token expired or superseded for key ${trackingKey}. Stale finalize skipped.`
-            );
-          }
-        } catch (idempErr: any) {
-          console.error('[WallzaSync] Non-fatal error updating idempotency completion:', idempErr);
-        }
-      }
+      const postIds = (created || []).map((c: any) => c.postId).filter(Boolean);
+      const createdPosts = await this._prisma.post.findMany({
+        where: { id: { in: postIds } },
+      });
 
       return {
         success: true,
         message: type === 'now' ? 'Post dispatched to provider pipeline' : 'Post scheduled',
-        post: created,
+        post: createdPosts[0] || null,
+        posts: createdPosts,
         channels: targetIntegrations.map((i) => ({
           id: i.id,
           name: i.name,

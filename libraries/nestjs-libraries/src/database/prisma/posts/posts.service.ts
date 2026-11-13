@@ -3,6 +3,8 @@ import {
   Injectable,
   NotFoundException,
   ValidationPipe,
+  HttpException,
+  HttpStatus,
 } from '@nestjs/common';
 import { PostsRepository } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
 import { CreatePostDto } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
@@ -1153,77 +1155,181 @@ export class PostsService {
     orgId: string,
     body: CreatePostDto,
     creationMethod: CreationMethod,
-    keepGroup = false
-  ): Promise<any[]> {
-    const postList = [];
-    const batchId = uuidv4();
-    for (const post of body.posts) {
-      if (
-        (body.type === 'schedule' || body.type === 'now') &&
-        !body.republish &&
-        post.value?.[0]?.id
-      ) {
-        this.guardAgainstRepublish(
-          await this._postRepository.getPostById(post.value[0].id, orgId),
-          'createPost'
+    keepGroup = false,
+    fencingContext?: {
+      fencingToken: string;
+      idempotencyKey: string;
+    }
+  ): Promise<{ postId: string; integration: string }[]> {
+    const prisma = (this._postRepository as any)?._post?.model;
+    const postsToWorkflow: { provider: string; id: string; state: any }[] = [];
+
+    const executeInTransaction = async (tx: any) => {
+      // 1. In-Transaction Fencing Verification
+      if (fencingContext) {
+        const lease = await tx.publishingIdempotency.findFirst({
+          where: {
+            organizationId: orgId,
+            idempotencyKey: fencingContext.idempotencyKey,
+            fencingToken: fencingContext.fencingToken,
+            status: 'pending',
+          },
+        });
+        if (!lease) {
+          throw new HttpException(
+            'Fencing token check failed in publishing transaction: lease was superseded, expired, or revoked.',
+            HttpStatus.CONFLICT
+          );
+        }
+      }
+
+      const postList: { postId: string; integration: string }[] = [];
+      const batchId = uuidv4();
+
+      for (const post of body.posts) {
+        if (
+          (body.type === 'schedule' || body.type === 'now') &&
+          !body.republish &&
+          post.value?.[0]?.id
+        ) {
+          this.guardAgainstRepublish(
+            await this._postRepository.getPostById(post.value[0].id, orgId),
+            'createPost'
+          );
+        }
+        const provider = this._integrationManager.getSocialIntegration(
+          (post.settings as any)?.__type
         );
+        const removeLinks = !!provider?.stripLinks?.();
+
+        const messages = (post.value || []).map((p) => p.content);
+        // No point shortlinking links on platforms that strip them out anyway
+        const updateContent =
+          !body.shortLink || removeLinks
+            ? messages
+            : await this._shortLinkService.convertTextToShortLinks(
+                orgId,
+                messages
+              );
+
+        post.value = (post.value || []).map((p, i) => ({
+          ...p,
+          content: removeLinks ? stripLinks(updateContent[i]) : updateContent[i],
+        }));
+
+        // Deduplicate: Check if a Post already exists for this (orgId, idempotencyKey, integrationId)
+        let existingPostForIntegration: any = null;
+        if (fencingContext?.idempotencyKey) {
+          existingPostForIntegration = await tx.post.findFirst({
+            where: {
+              organizationId: orgId,
+              idempotencyKey: fencingContext.idempotencyKey,
+              integrationId: post.integration.id,
+              deletedAt: null,
+            },
+          });
+        }
+
+        let createdPostId: string;
+        let createdPostState: any;
+
+        if (existingPostForIntegration) {
+          // Already created in a prior partial dispatch! Reuse existing post without creating duplicate
+          createdPostId = existingPostForIntegration.id;
+          createdPostState = existingPostForIntegration.state;
+        } else {
+          // Create the post in the transaction with the idempotencyKey in the initial insert!
+          const { posts } = await this._postRepository.createOrUpdatePost(
+            body.type,
+            orgId,
+            body.type === 'now'
+              ? dayjs().format('YYYY-MM-DDTHH:mm:00')
+              : post.date || body.date,
+            post,
+            body.tags,
+            creationMethod,
+            body.inter,
+            keepGroup,
+            batchId,
+            fencingContext?.idempotencyKey,
+            tx
+          );
+
+          if (!posts?.length) {
+            continue;
+          }
+
+          createdPostId = posts[0].id;
+          createdPostState = posts[0].state;
+
+          const existingIds = (post.value || []).map((p) => p.id).filter(Boolean);
+          await this.detachStaleAnchors(
+            posts.filter((p) => existingIds.includes(p.id))
+          );
+
+          // Queue workflow to be started ONLY after the database transaction commits!
+          if (body.type !== 'update') {
+            postsToWorkflow.push({
+              provider: post.settings.__type.split('-')[0].toLowerCase(),
+              id: createdPostId,
+              state: createdPostState,
+            });
+          }
+        }
+
+        Sentry.metrics.count('post_created', 1);
+        postList.push({
+          postId: createdPostId,
+          integration: post.integration.id,
+        });
       }
-      const provider = this._integrationManager.getSocialIntegration(
-        (post.settings as any)?.__type
-      );
-      const removeLinks = !!provider?.stripLinks?.();
 
-      const messages = (post.value || []).map((p) => p.content);
-      // No point shortlinking links on platforms that strip them out anyway
-      const updateContent =
-        !body.shortLink || removeLinks
-          ? messages
-          : await this._shortLinkService.convertTextToShortLinks(
-              orgId,
-              messages
-            );
+      // Complete the reservation in the same transaction
+      if (fencingContext && postList.length > 0) {
+        const allPostIds = postList.map((p) => p.postId);
+        const updateRes = await tx.publishingIdempotency.updateMany({
+          where: {
+            organizationId: orgId,
+            idempotencyKey: fencingContext.idempotencyKey,
+            fencingToken: fencingContext.fencingToken,
+            status: 'pending',
+          },
+          data: {
+            postId: allPostIds.join(','),
+            status: 'completed',
+            updatedAt: new Date(),
+          },
+        });
 
-      post.value = (post.value || []).map((p, i) => ({
-        ...p,
-        content: removeLinks ? stripLinks(updateContent[i]) : updateContent[i],
-      }));
+        if (updateRes.count === 0) {
+          throw new HttpException(
+            'Fencing lease was lost or superseded before completing reservation. Rolling back post creation.',
+            HttpStatus.CONFLICT
+          );
+        }
+      }
 
-      const { posts } = await this._postRepository.createOrUpdatePost(
-        body.type,
+      return postList;
+    };
+
+    let postList: { postId: string; integration: string }[];
+    if (prisma?.$transaction) {
+      postList = await prisma.$transaction(async (tx: any) => {
+        return executeInTransaction(tx);
+      });
+    } else {
+      postList = await executeInTransaction(this._postRepository.model);
+    }
+
+    // START WORKFLOWS ONLY AFTER TRANSACTION COMMITS!
+    for (const item of postsToWorkflow) {
+      this.startWorkflow(
+        item.provider,
+        item.id,
         orgId,
-        body.type === 'now'
-          ? dayjs().format('YYYY-MM-DDTHH:mm:00')
-          : post.date || body.date,
-        post,
-        body.tags,
-        creationMethod,
-        body.inter,
-        keepGroup,
-        batchId
-      );
-
-      if (!posts?.length) {
-        return [] as any[];
-      }
-
-      const existingIds = (post.value || []).map((p) => p.id).filter(Boolean);
-      await this.detachStaleAnchors(
-        posts.filter((p) => existingIds.includes(p.id))
-      );
-
-      if (body.type !== 'update') {
-        this.startWorkflow(
-          post.settings.__type.split('-')[0].toLowerCase(),
-          posts[0].id,
-          orgId,
-          posts[0].state
-        ).catch((err) => {});
-      }
-
-      Sentry.metrics.count('post_created', 1);
-      postList.push({
-        postId: posts[0].id,
-        integration: post.integration.id,
+        item.state
+      ).catch((err) => {
+        console.error('[PostsService] Error starting workflow after commit:', err);
       });
     }
 

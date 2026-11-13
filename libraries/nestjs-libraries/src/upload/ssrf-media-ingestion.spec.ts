@@ -67,38 +67,61 @@ describe('SsrfMediaIngestionService — SSRF, Redirect, Size and Protocol Harden
   });
 
   describe('Private IP Redirect Attacks', () => {
-    it('aborts immediately when an external URL redirects to a private IP (169.254.169.254 or 127.0.0.1)', async () => {
-      // Create local HTTP server simulating external redirect to private IP
-      const server = http.createServer((req, res) => {
+    it('aborts immediately when an external URL redirects to a private IP (169.254.169.254 or 127.0.0.1) before connecting to target', async () => {
+      let initialHitCount = 0;
+      let privateTargetHit = false;
+
+      // 1. Prohibited private destination server - must NEVER receive a connection
+      const privateServer = http.createServer((req, res) => {
+        privateTargetHit = true;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ secret: 'private-data-leak' }));
+      });
+      await new Promise<void>((resolve) => privateServer.listen(0, '127.0.0.1', () => resolve()));
+      const privatePort = (privateServer.address() as AddressInfo).port;
+
+      // 2. Initial test fixture server simulating a public origin returning a 302 redirect
+      const initialServer = http.createServer((req, res) => {
+        initialHitCount++;
         if (req.url === '/redirect-to-metadata') {
           res.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data/' });
           res.end();
-        } else if (req.url === '/redirect-to-local') {
-          res.writeHead(302, { Location: 'http://127.0.0.1:8080/admin' });
+        } else if (req.url === '/redirect-to-private') {
+          res.writeHead(302, { Location: `http://127.0.0.1:${privatePort}/secret-endpoint` });
           res.end();
         } else {
           res.writeHead(404);
           res.end();
         }
       });
-
-      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
-      const port = (server.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => initialServer.listen(0, '127.0.0.1', () => resolve()));
+      const initialPort = (initialServer.address() as AddressInfo).port;
 
       try {
+        // Test redirect to Cloud Metadata IP (169.254.169.254)
         await expect(
-          ingestionService.ingestMedia(`http://127.0.0.1:${port}/redirect-to-metadata`, {
+          ingestionService.ingestMedia(`http://127.0.0.1:${initialPort}/redirect-to-metadata`, {
             isProduction: true,
+            allowedInitialHosts: new Set(['127.0.0.1']),
           })
-        ).rejects.toThrow();
+        ).rejects.toThrow(/169\.254\.169\.254.*prohibited private\/reserved IP address/i);
 
+        expect(initialHitCount).toBe(1); // Verified: initial request reached origin and received 302
+        expect(privateTargetHit).toBe(false); // Verified: private target was never reached
+
+        // Test redirect to loopback private target (127.0.0.1)
         await expect(
-          ingestionService.ingestMedia(`http://127.0.0.1:${port}/redirect-to-local`, {
+          ingestionService.ingestMedia(`http://127.0.0.1:${initialPort}/redirect-to-private`, {
             isProduction: true,
+            allowedInitialHosts: new Set(['127.0.0.1']),
           })
-        ).rejects.toThrow();
+        ).rejects.toThrow(/127\.0\.0\.1.*prohibited private\/reserved IP address/i);
+
+        expect(initialHitCount).toBe(2);
+        expect(privateTargetHit).toBe(false); // CRITICAL: Target server was NEVER connected to
       } finally {
-        server.close();
+        initialServer.close();
+        privateServer.close();
       }
     });
 
@@ -224,3 +247,4 @@ describe('SsrfMediaIngestionService — SSRF, Redirect, Size and Protocol Harden
     });
   });
 });
+

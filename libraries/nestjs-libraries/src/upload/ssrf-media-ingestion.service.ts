@@ -22,6 +22,7 @@ export interface MediaIngestionOptions {
   connectTimeoutMs?: number; // default: 5s
   maxRedirects?: number; // default: 3
   isProduction?: boolean;
+  allowedInitialHosts?: Set<string>; // For testing: permit initial connection to fixture server while testing redirect blocking
 }
 
 export interface IngestedMedia {
@@ -133,9 +134,11 @@ export class SsrfMediaIngestionService {
       }
 
       const hostname = parsed.hostname.toLowerCase();
+      const isInitialRequest = redirectCount === 0;
+      const isAllowedInitial = isInitialRequest && (options.allowedInitialHosts?.has(hostname) ?? false);
 
       // Check destination IP before connection
-      if (isProd || !['localhost', '127.0.0.1', '::1'].includes(hostname)) {
+      if (!isAllowedInitial && (isProd || !['localhost', '127.0.0.1', '::1'].includes(hostname))) {
         if (ipaddr.isValid(hostname)) {
           if (isPrivateOrReservedIp(hostname)) {
             throw new HttpException(
@@ -176,6 +179,7 @@ export class SsrfMediaIngestionService {
         connectTimeoutMs,
         timeoutMs,
         maxSizeBytes,
+        bypassSafeLookup: isAllowedInitial,
       });
 
       if (fetchResult.isRedirect) {
@@ -250,7 +254,7 @@ export class SsrfMediaIngestionService {
 
   private executeSafeRequest(
     parsed: URL,
-    config: { connectTimeoutMs: number; timeoutMs: number; maxSizeBytes: number }
+    config: { connectTimeoutMs: number; timeoutMs: number; maxSizeBytes: number; bypassSafeLookup?: boolean }
   ): Promise<{
     isRedirect: boolean;
     redirectUrl?: string;
@@ -265,7 +269,7 @@ export class SsrfMediaIngestionService {
         parsed,
         {
           method: 'GET',
-          lookup: ssrfSafeLookup, // Socket-level IP pinning prevents DNS rebinding
+          lookup: config.bypassSafeLookup ? undefined : ssrfSafeLookup, // Socket-level IP pinning prevents DNS rebinding
           headers: {
             'User-Agent': 'WallzaOS-Media-Ingestion/1.0',
             Accept: 'image/*,video/*,*/*',

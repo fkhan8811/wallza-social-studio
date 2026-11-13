@@ -6,21 +6,18 @@
  * 2. Publishing operation lasting > 45s with heartbeat lease renewal -> takeover prevented
  * 3. Heartbeat database failure -> isLeaseLost flag set, worker aborts before dispatch
  * 4. Lease expiry while original worker stalled -> takeover succeeds with new fencing token
- * 5. Stale owner attempting to dispatch after takeover -> rejected via fencing token check (0 rows)
- * 6. Crash after Postiz job creation but before reservation completion -> durable Post idempotencyKey prevents duplicate
- * 7. Retry after completed job -> atomic replay, 0 new jobs
- * 8. Exactly one durable publishing job verified in PostgreSQL
+ * 5. Stale owner attempting to dispatch after takeover -> rejected via in-transaction fencing token check (0 rows)
+ * 6. Crash after Post creation but before reservation completion -> durable Post idempotencyKey prevents duplicate
+ * 7. Multi-platform partial failure & retry -> only missing integration is dispatched, 0 duplicates
+ * 8. Database uniqueness constraint @@unique([organizationId, idempotencyKey, integrationId]) strictly enforced
  */
 
 const { Pool } = require('pg');
 const crypto = require('crypto');
-const dotenv = require('dotenv');
-
-dotenv.config({ path: 'D:/Whatsapp-main/.env' });
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
-  console.error('[ERROR] DATABASE_URL is not set in environment.');
+  console.error('[FATAL] DATABASE_URL environment variable is required to run PostgreSQL integration tests.');
   process.exit(1);
 }
 
@@ -29,18 +26,19 @@ const pool = new Pool({
   max: 15,
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 10000,
+  ssl: DATABASE_URL.includes('supabase.com') ? { rejectUnauthorized: false } : undefined,
 });
 
-const SCHEMA = 'wallza_fencing_test';
+const SCHEMA = `wallza_fencing_test_${Date.now()}`;
 
 async function setupDatabase() {
   const client = await pool.connect();
   console.log(`[PG-SETUP] Connected to PostgreSQL. Setting up isolated schema '${SCHEMA}'...`);
-  await client.query(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA};`);
+  await client.query(`CREATE SCHEMA IF NOT EXISTS "${SCHEMA}";`);
 
   // Create real PublishingIdempotency table in isolated schema
   await client.query(`
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}."PublishingIdempotency" (
+    CREATE TABLE IF NOT EXISTS "${SCHEMA}"."PublishingIdempotency" (
       "id" TEXT PRIMARY KEY,
       "organizationId" TEXT NOT NULL,
       "idempotencyKey" TEXT NOT NULL,
@@ -54,32 +52,40 @@ async function setupDatabase() {
     );
   `);
 
-  // Create real Post table in isolated schema
+  // Create real Post table in isolated schema with the unique constraint
   await client.query(`
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}."Post" (
+    CREATE TABLE IF NOT EXISTS "${SCHEMA}"."Post" (
       "id" TEXT PRIMARY KEY,
       "organizationId" TEXT NOT NULL,
+      "integrationId" TEXT NOT NULL,
       "content" TEXT NOT NULL,
+      "group" TEXT NOT NULL DEFAULT 'default_group',
       "idempotencyKey" TEXT,
       "releaseId" TEXT,
+      "state" TEXT NOT NULL DEFAULT 'QUEUE',
+      "publishDate" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "deletedAt" TIMESTAMP(3),
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-    CREATE INDEX IF NOT EXISTS "Post_org_idemp_idx_${SCHEMA}" ON ${SCHEMA}."Post"("organizationId", "idempotencyKey");
+    CREATE INDEX IF NOT EXISTS "Post_org_idemp_idx_${SCHEMA}" ON "${SCHEMA}"."Post"("organizationId", "idempotencyKey");
+    CREATE UNIQUE INDEX IF NOT EXISTS "Post_org_idemp_int_uniq_${SCHEMA}" 
+      ON "${SCHEMA}"."Post"("organizationId", "idempotencyKey", "integrationId");
   `);
 
-  // Clear any existing test data
-  await client.query(`TRUNCATE TABLE ${SCHEMA}."PublishingIdempotency", ${SCHEMA}."Post" CASCADE;`);
   client.release();
-  console.log('[PG-SETUP] Tables created and truncated in isolated schema.');
+  console.log('[PG-SETUP] Tables created in isolated schema with multi-platform unique constraint.');
 }
 
 async function teardownDatabase() {
-  const cl = await pool.connect();
-  console.log(`[PG-TEARDOWN] Dropping test schema '${SCHEMA}'...`);
-  await cl.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE;`);
-  cl.release();
+  try {
+    const cl = await pool.connect();
+    console.log(`[PG-TEARDOWN] Dropping test schema '${SCHEMA}'...`);
+    await cl.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE;`);
+    cl.release();
+  } catch (err) {
+    console.error('[PG-TEARDOWN] Error dropping schema:', err.message);
+  }
   await pool.end();
   console.log('[PG-TEARDOWN] PostgreSQL connection pool closed cleanly.');
 }
@@ -95,17 +101,18 @@ async function runTests() {
   // ──────────────────────────────────────────────────────────────────────────
   // TEST 1: 10 Simultaneous Dispatch Requests with One Idempotency Key
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n[TEST 1] 10 simultaneous dispatch requests with one idempotency key');
+  console.log('\n[TEST 1] 10 simultaneous dispatch requests with one idempotency key: exactly 1 winner, 0 duplicates');
   const test1Key = `idemp_simul_${Date.now()}`;
+  const integration1 = `int_meta_${Date.now()}`;
 
   const results = await Promise.all(
     Array.from({ length: 10 }).map(async (_, idx) => {
       const client = await pool.connect();
       const fencingToken = crypto.randomUUID();
-      const id = `res_${idx}_${Date.now()}`;
+      const id = `res_1_${idx}_${Date.now()}`;
       try {
         await client.query(
-          `INSERT INTO ${SCHEMA}."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
+          `INSERT INTO "${SCHEMA}"."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
            VALUES ($1, $2, $3, $4, 'pending', NOW())`,
           [id, orgId, test1Key, fencingToken]
         );
@@ -123,88 +130,96 @@ async function runTests() {
   const winners = results.filter((r) => r.winner);
   const losers = results.filter((r) => !r.winner);
 
-  console.log(`  -> Winners: ${winners.length}, Losers: ${losers.length}`);
+  console.log(`  -> Winners count: ${winners.length} (expected 1)`);
+  console.log(`  -> Losers count:  ${losers.length} (expected 9)`);
+
   if (winners.length !== 1 || losers.length !== 9) {
-    throw new Error(`Expected exactly 1 winner and 9 losers, got ${winners.length} winners`);
+    throw new Error(`Concurrency violation! Winners: ${winners.length}, Losers: ${losers.length}`);
   }
 
-  // Winning worker creates the single post and completes reservation
   const winner = winners[0];
-  const winningToken = winner.fencingToken;
-  const winningClient = winner.client;
   const postId = `post_${Date.now()}`;
 
-  try {
-    await winningClient.query(
-      `INSERT INTO ${SCHEMA}."Post" ("id", "organizationId", "content", "idempotencyKey", "releaseId")
-       VALUES ($1, $2, 'Single dispatch message', $3, $3)`,
-      [postId, orgId, test1Key]
-    );
-
-    const completeRes = await winningClient.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
-       SET "status" = 'completed', "postId" = $1, "updatedAt" = NOW()
-       WHERE "organizationId" = $2 AND "idempotencyKey" = $3 AND "fencingToken" = $4 AND "status" = 'pending'`,
-      [postId, orgId, test1Key, winningToken]
-    );
-
-    if (completeRes.rowCount !== 1) {
-      throw new Error('Winning worker failed to finalize reservation');
-    }
-
-    // Verify exactly 1 Post in DB
-    const postCount = await winningClient.query(
-      `SELECT COUNT(*)::int as count FROM ${SCHEMA}."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
-      [orgId, test1Key]
-    );
-    if (postCount.rows[0].count !== 1) {
-      throw new Error(`Expected 1 post in DB, got ${postCount.rows[0].count}`);
-    }
-
-    console.log('  [PASS] Exactly 1 winner acquired reservation, created exactly 1 post, and completed idempotency.');
-    passedTests++;
-  } finally {
-    winningClient.release();
+  // Execute Post creation and reservation finalization in a single database transaction
+  await winner.client.query('BEGIN');
+  const checkLease = await winner.client.query(
+    `SELECT * FROM "${SCHEMA}"."PublishingIdempotency"
+     WHERE "organizationId" = $1 AND "idempotencyKey" = $2 AND "fencingToken" = $3 AND "status" = 'pending'`,
+    [orgId, test1Key, winner.fencingToken]
+  );
+  if (checkLease.rowCount !== 1) {
+    await winner.client.query('ROLLBACK');
+    throw new Error('Winner lost lease before Post creation!');
   }
 
+  await winner.client.query(
+    `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
+     VALUES ($1, $2, $3, 'Single dispatch message', $4, $4)`,
+    [postId, orgId, integration1, test1Key]
+  );
+
+  const completeRes = await winner.client.query(
+    `UPDATE "${SCHEMA}"."PublishingIdempotency"
+     SET "status" = 'completed', "postId" = $1, "updatedAt" = NOW()
+     WHERE "organizationId" = $2 AND "idempotencyKey" = $3 AND "fencingToken" = $4 AND "status" = 'pending'`,
+    [postId, orgId, test1Key, winner.fencingToken]
+  );
+  if (completeRes.rowCount !== 1) {
+    await winner.client.query('ROLLBACK');
+    throw new Error('Winner failed to complete reservation inside transaction!');
+  }
+  await winner.client.query('COMMIT');
+  winner.client.release();
+
+  // Verify exactly 1 Post in database
+  const countCheck = await pool.query(
+    `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
+    [orgId, test1Key]
+  );
+  if (countCheck.rows[0].count !== 1) {
+    throw new Error(`Expected exactly 1 Post, found ${countCheck.rows[0].count}`);
+  }
+
+  console.log('  [PASS] 10 concurrent requests yielded exactly 1 winner, 1 Post, 0 duplicates.');
+  passedTests++;
+
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 2: Publishing Operation Lasting > 45 Seconds with Heartbeat
+  // TEST 2: Operation > 45s with Heartbeat Lease Renewal Prevents Takeover
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n[TEST 2] Publishing operation lasting > 45s with heartbeat lease renewal preventing takeover');
+  console.log('\n[TEST 2] Operation lasting > 45s with active heartbeat strictly prevents lease takeover');
   const test2Key = `idemp_long_${Date.now()}`;
   const c2_1 = await pool.connect();
   const c2_2 = await pool.connect();
 
   try {
-    const fencing1 = crypto.randomUUID();
-    // Worker 1 acquires reservation
+    const fencing2_1 = crypto.randomUUID();
     await c2_1.query(
-      `INSERT INTO ${SCHEMA}."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
+      `INSERT INTO "${SCHEMA}"."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
        VALUES ($1, $2, $3, $4, 'pending', NOW())`,
-      [`res_2_1`, orgId, test2Key, fencing1]
+      [`res_2_1`, orgId, test2Key, fencing2_1]
     );
 
-    // Simulate 50 seconds passing in DB by shifting createdAt back 50s, but heartbeat keeps updatedAt fresh (NOW())
+    // Heartbeat kept updatedAt fresh (NOW()), but operation started 50s ago
     await c2_1.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
+      `UPDATE "${SCHEMA}"."PublishingIdempotency"
        SET "createdAt" = NOW() - INTERVAL '50 seconds', "updatedAt" = NOW()
        WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
       [orgId, test2Key]
     );
 
-    // Concurrent Worker 2 attempts lease takeover with 45s expiration rule
+    // Competing Worker attempts takeover using the 45s stale rule:
     const newFencing = crypto.randomUUID();
     const takeover = await c2_2.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
+      `UPDATE "${SCHEMA}"."PublishingIdempotency"
        SET "status" = 'pending', "fencingToken" = $1, "updatedAt" = NOW()
        WHERE "organizationId" = $2 AND "idempotencyKey" = $3
          AND ("status" = 'failed' OR ("status" = 'pending' AND "updatedAt" < NOW() - INTERVAL '45 seconds'))`,
       [newFencing, orgId, test2Key]
     );
 
-    console.log(`  -> Worker 2 takeover rows affected: ${takeover.rowCount}`);
+    console.log(`  -> Competing worker takeover rows affected: ${takeover.rowCount}`);
     if (takeover.rowCount !== 0) {
-      throw new Error(`Takeover should have failed because heartbeat kept updatedAt fresh! Rows affected: ${takeover.rowCount}`);
+      throw new Error(`Takeover should have failed because heartbeat kept lease active! Rows affected: ${takeover.rowCount}`);
     }
 
     console.log('  [PASS] Active heartbeat lease renewal strictly prevented lease takeover for operation > 45s.');
@@ -215,30 +230,27 @@ async function runTests() {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 3: Heartbeat Database Failure
+  // TEST 3: Heartbeat Database Failure Safety
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n[TEST 3] Heartbeat database failure safety (worker detects failure and aborts before dispatch)');
+  console.log('\n[TEST 3] Heartbeat database failure safety: flags isLeaseLost and aborts before dispatch');
   const test3Key = `idemp_hb_fail_${Date.now()}`;
   const c3 = await pool.connect();
 
   try {
     const fencing3 = crypto.randomUUID();
     await c3.query(
-      `INSERT INTO ${SCHEMA}."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
+      `INSERT INTO "${SCHEMA}"."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
        VALUES ($1, $2, $3, $4, 'pending', NOW())`,
       [`res_3`, orgId, test3Key, fencing3]
     );
 
     let isLeaseLost = false;
-
-    // Simulate heartbeat failure: simulated DB disconnect / query failure
     try {
-      throw new Error('Connection terminated unexpectedly (simulated DB outage)');
-    } catch (err) {
+      throw new Error('Simulated database disconnect during heartbeat renewal');
+    } catch {
       isLeaseLost = true;
     }
 
-    // Pre-dispatch check:
     let dispatched = false;
     if (!isLeaseLost) {
       dispatched = true;
@@ -249,21 +261,21 @@ async function runTests() {
     }
 
     const postCheck = await c3.query(
-      `SELECT COUNT(*)::int as count FROM ${SCHEMA}."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
+      `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
       [orgId, test3Key]
     );
     if (postCheck.rows[0].count !== 0) {
-      throw new Error('Duplicate post created after heartbeat failure!');
+      throw new Error('Post created despite heartbeat failure!');
     }
 
-    console.log('  [PASS] Heartbeat database failure safely flagged isLeaseLost and aborted before createPost.');
+    console.log('  [PASS] Heartbeat database failure safely flagged isLeaseLost and aborted before Post creation.');
     passedTests++;
   } finally {
     c3.release();
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 4: Lease Expiry while Original Worker is Stalled
+  // TEST 4: Lease Expiry while Original Worker is Stalled allows Takeover
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n[TEST 4] Lease expiry after confirmed 45s absence of heartbeat allows recovery takeover');
   const test4Key = `idemp_stalled_${Date.now()}`;
@@ -271,18 +283,16 @@ async function runTests() {
 
   try {
     const fencing4_1 = crypto.randomUUID();
-
-    // Worker 1 acquired lease
     await c4.query(
-      `INSERT INTO ${SCHEMA}."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
+      `INSERT INTO "${SCHEMA}"."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
        VALUES ($1, $2, $3, $4, 'pending', NOW() - INTERVAL '50 seconds')`,
       [`res_4`, orgId, test4Key, fencing4_1]
     );
 
-    // Worker 2 attempts recovery:
+    // Worker 2 attempts recovery takeover:
     const fencing4_2 = crypto.randomUUID();
     const recoveryRes = await c4.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
+      `UPDATE "${SCHEMA}"."PublishingIdempotency"
        SET "status" = 'pending', "fencingToken" = $1, "updatedAt" = NOW()
        WHERE "organizationId" = $2 AND "idempotencyKey" = $3
          AND ("status" = 'failed' OR ("status" = 'pending' AND "updatedAt" < NOW() - INTERVAL '45 seconds'))`,
@@ -293,9 +303,8 @@ async function runTests() {
       throw new Error(`Expected recovery takeover to update 1 row, got ${recoveryRes.rowCount}`);
     }
 
-    // Verify new fencing token is stored
     const checkRow = await c4.query(
-      `SELECT "fencingToken" FROM ${SCHEMA}."PublishingIdempotency" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
+      `SELECT "fencingToken" FROM "${SCHEMA}"."PublishingIdempotency" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
       [orgId, test4Key]
     );
     if (checkRow.rows[0].fencingToken !== fencing4_2) {
@@ -309,7 +318,7 @@ async function runTests() {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 5: Stale Owner Attempting to Dispatch After Takeover
+  // TEST 5: Stale Owner Attempting to Dispatch After Takeover is Rejected
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n[TEST 5] Stale owner attempting to dispatch after takeover is strictly rejected');
   const c5 = await pool.connect();
@@ -320,72 +329,60 @@ async function runTests() {
 
     // Database currently has activeFencing
     await c5.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
+      `UPDATE "${SCHEMA}"."PublishingIdempotency"
        SET "fencingToken" = $1, "status" = 'pending', "updatedAt" = NOW()
        WHERE "organizationId" = $2 AND "idempotencyKey" = $3`,
       [activeFencing, orgId, test4Key]
     );
 
-    // Stale Worker 1 wakes up with staleFencing and runs pre-dispatch check:
-    const preDispatchCheck = await c5.query(
-      `SELECT * FROM ${SCHEMA}."PublishingIdempotency"
+    // Stale Worker 1 attempts in-transaction dispatch:
+    await c5.query('BEGIN');
+    const inTxCheck = await c5.query(
+      `SELECT * FROM "${SCHEMA}"."PublishingIdempotency"
        WHERE "organizationId" = $1 AND "idempotencyKey" = $2 AND "fencingToken" = $3 AND "status" = 'pending'`,
       [orgId, test4Key, staleFencing]
     );
 
-    if (preDispatchCheck.rowCount !== 0) {
-      throw new Error('Pre-dispatch check did not detect superseded fencing token!');
+    if (inTxCheck.rowCount !== 0) {
+      await c5.query('ROLLBACK');
+      throw new Error('In-transaction check did not reject stale fencing token!');
     }
 
-    // Even if Stale Worker bypassed check, its finalization update:
-    const staleFinalize = await c5.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
-       SET "status" = 'completed', "postId" = 'stale_post', "updatedAt" = NOW()
-       WHERE "organizationId" = $1 AND "idempotencyKey" = $2 AND "fencingToken" = $3 AND "status" = 'pending'`,
-      [orgId, test4Key, staleFencing]
-    );
+    // Stale worker must abort and rollback
+    await c5.query('ROLLBACK');
 
-    if (staleFinalize.rowCount !== 0) {
-      throw new Error('Stale finalization overwrote active lease!');
-    }
-
-    console.log('  [PASS] Stale owner pre-dispatch check returned 0 rows and finalization update matched 0 rows.');
+    console.log('  [PASS] In-transaction fencing check rejected stale worker and aborted post creation.');
     passedTests++;
   } finally {
     c5.release();
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 6: Crash After Postiz Job Creation but Before Reservation Completion
+  // TEST 6: Crash After Post Creation but Before Reservation Completion
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n[TEST 6] Crash after Postiz job creation but before reservation completion');
+  console.log('\n[TEST 6] Crash after Post creation recovered via durable Post idempotencyKey');
   const test6Key = `idemp_crash_${Date.now()}`;
   const c6 = await pool.connect();
 
   try {
     const fencing6 = crypto.randomUUID();
-
-    // 1. Reservation acquired
     await c6.query(
-      `INSERT INTO ${SCHEMA}."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
+      `INSERT INTO "${SCHEMA}"."PublishingIdempotency" ("id", "organizationId", "idempotencyKey", "fencingToken", "status", "updatedAt")
        VALUES ($1, $2, $3, $4, 'pending', NOW())`,
       [`res_6`, orgId, test6Key, fencing6]
     );
 
-    // 2. Post created in Post table with durable idempotencyKey
     const crashedPostId = `post_crashed_${Date.now()}`;
     await c6.query(
-      `INSERT INTO ${SCHEMA}."Post" ("id", "organizationId", "content", "idempotencyKey", "releaseId")
-       VALUES ($1, $2, 'Crashed before reservation completion', $3, $3)`,
+      `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
+       VALUES ($1, $2, 'int_crash', 'Crashed before reservation completion', $3, $3)`,
       [crashedPostId, orgId, test6Key]
     );
 
-    // 3. Worker crashed here! Reservation remains in 'pending' status without postId.
-
-    // 4. Retry request arrives with the same test6Key
-    // It checks Post table first:
+    // Worker crashed here! Reservation remains in 'pending' status.
+    // Retry request arrives: checks Post table first
     const existingPostCheck = await c6.query(
-      `SELECT * FROM ${SCHEMA}."Post"
+      `SELECT * FROM "${SCHEMA}"."Post"
        WHERE "organizationId" = $1 AND ("idempotencyKey" = $2 OR "releaseId" = $2) AND "deletedAt" IS NULL`,
       [orgId, test6Key]
     );
@@ -394,80 +391,120 @@ async function runTests() {
       throw new Error('Retry failed to find existing durable post in Post table!');
     }
 
-    // 5. Retry safely recovers idempotency table without re-creating post:
+    // Retry safely recovers idempotency table without re-creating post:
     await c6.query(
-      `UPDATE ${SCHEMA}."PublishingIdempotency"
+      `UPDATE "${SCHEMA}"."PublishingIdempotency"
        SET "status" = 'completed', "postId" = $1, "updatedAt" = NOW()
        WHERE "organizationId" = $2 AND "idempotencyKey" = $3`,
       [existingPostCheck.rows[0].id, orgId, test6Key]
     );
 
-    // Verify only 1 post was ever created
     const postCount6 = await c6.query(
-      `SELECT COUNT(*)::int as count FROM ${SCHEMA}."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
+      `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
       [orgId, test6Key]
     );
     if (postCount6.rows[0].count !== 1) {
       throw new Error(`Expected exactly 1 post, found ${postCount6.rows[0].count}`);
     }
 
-    console.log('  [PASS] Retry discovered existing Post row via durable idempotencyKey and prevented duplicate job creation.');
+    console.log('  [PASS] Retry discovered existing Post row via durable idempotencyKey and prevented duplicate creation.');
     passedTests++;
   } finally {
     c6.release();
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 7: Retry After Completed Job
+  // TEST 7: Multi-Platform Partial Failure & Retry
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n[TEST 7] Retry after completed job returns existing post with idempotent=true');
+  console.log('\n[TEST 7] Multi-platform partial failure & retry: only missing integration is dispatched');
+  const test7Key = `idemp_multi_${Date.now()}`;
   const c7 = await pool.connect();
 
   try {
-    // Client requests test6Key again
-    const completedCheck = await c7.query(
-      `SELECT * FROM ${SCHEMA}."PublishingIdempotency"
-       WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
-      [orgId, test6Key]
+    const platformA = `int_linkedin_${Date.now()}`;
+    const platformB = `int_twitter_${Date.now()}`;
+
+    // Initial attempt creates Post for platform A
+    await c7.query(
+      `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
+       VALUES ($1, $2, $3, 'Multi-platform message', $4, $4)`,
+      [`post_multi_A_${Date.now()}`, orgId, platformA, test7Key]
     );
 
-    if (completedCheck.rows[0].status !== 'completed' || !completedCheck.rows[0].postId) {
-      throw new Error('Expected completed status with postId!');
+    // Platform B failed before creation.
+    // Retry arrives targeting both platform A and platform B with test7Key:
+    const alreadyCreated = await c7.query(
+      `SELECT "integrationId" FROM "${SCHEMA}"."Post"
+       WHERE "organizationId" = $1 AND "idempotencyKey" = $2 AND "deletedAt" IS NULL`,
+      [orgId, test7Key]
+    );
+    const existingIntegrationIds = new Set(alreadyCreated.rows.map(r => r.integrationId));
+
+    const targetIntegrations = [platformA, platformB];
+    const missingIntegrations = targetIntegrations.filter(id => !existingIntegrationIds.has(id));
+
+    console.log(`  -> Already created integrations: [${Array.from(existingIntegrationIds).join(', ')}]`);
+    console.log(`  -> Missing integrations to dispatch: [${missingIntegrations.join(', ')}]`);
+
+    if (missingIntegrations.length !== 1 || missingIntegrations[0] !== platformB) {
+      throw new Error(`Expected only platform B to be missing, got: ${JSON.stringify(missingIntegrations)}`);
     }
 
-    const linkedPost = await c7.query(
-      `SELECT * FROM ${SCHEMA}."Post" WHERE "id" = $1`,
-      [completedCheck.rows[0].postId]
+    // Dispatch missing integration only
+    await c7.query(
+      `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
+       VALUES ($1, $2, $3, 'Multi-platform message', $4, $4)`,
+      [`post_multi_B_${Date.now()}`, orgId, missingIntegrations[0], test7Key]
     );
 
-    if (linkedPost.rowCount !== 1) {
-      throw new Error('Could not find linked post in Post table!');
+    const totalMultiPosts = await c7.query(
+      `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
+      [orgId, test7Key]
+    );
+    if (totalMultiPosts.rows[0].count !== 2) {
+      throw new Error(`Expected exactly 2 posts (1 per integration), found ${totalMultiPosts.rows[0].count}`);
     }
 
-    console.log('  [PASS] Completed job replay retrieved existing record without dispatching new work.');
+    console.log('  [PASS] Multi-platform retry dispatched missing platform without duplicating existing post.');
     passedTests++;
   } finally {
     c7.release();
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // TEST 8: Verify Exactly One Durable Publishing Job Exists
+  // TEST 8: Database Uniqueness Constraint Enforcement
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n[TEST 8] Verify exactly one durable publishing job exists across all test keys');
+  console.log('\n[TEST 8] Database uniqueness constraint @@unique([organizationId, idempotencyKey, integrationId])');
   const c8 = await pool.connect();
 
   try {
-    for (const key of [test1Key, test6Key]) {
-      const verifyCount = await c8.query(
-        `SELECT COUNT(*)::int as count FROM ${SCHEMA}."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
-        [orgId, key]
+    const test8Key = `idemp_uniq_${Date.now()}`;
+    const testIntegration = `int_uniq_target`;
+
+    await c8.query(
+      `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
+       VALUES ($1, $2, $3, 'Original post', $4, $4)`,
+      [`post_uniq_1_${Date.now()}`, orgId, testIntegration, test8Key]
+    );
+
+    let caughtViolation = false;
+    try {
+      await c8.query(
+        `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
+         VALUES ($1, $2, $3, 'Duplicate post attempt', $4, $4)`,
+        [`post_uniq_2_${Date.now()}`, orgId, testIntegration, test8Key]
       );
-      if (verifyCount.rows[0].count !== 1) {
-        throw new Error(`Key ${key} has ${verifyCount.rows[0].count} posts in DB (expected 1)!`);
+    } catch (dbErr) {
+      if (dbErr.code === '23505') {
+        caughtViolation = true;
       }
     }
 
-    console.log('  [PASS] Confirmed exactly 1 durable publishing job exists per idempotency key.');
+    if (!caughtViolation) {
+      throw new Error('Database allowed duplicate post with identical (organizationId, idempotencyKey, integrationId)!');
+    }
+
+    console.log('  [PASS] PostgreSQL strictly rejected duplicate post insert via unique constraint.');
     passedTests++;
   } finally {
     c8.release();

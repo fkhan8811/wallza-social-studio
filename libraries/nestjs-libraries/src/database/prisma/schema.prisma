@@ -691,6 +691,7 @@ model Post {
   @@index([state])
   @@index([organizationId])
   @@index([organizationId, idempotencyKey])
+  @@unique([organizationId, idempotencyKey, integrationId])
   @@index([organizationId, publishDate])
   @@index([parentPostId])
   @@index([submittedForOrderId])

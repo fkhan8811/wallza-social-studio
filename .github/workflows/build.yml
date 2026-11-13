@@ -10,12 +10,32 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postiz_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-cmd-interval 5s
+          --health-timeout 5s
+          --health-retries 5
 
     strategy:
       matrix:
         node-version: ['22.12.0']
         # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+
+    env:
+      DATABASE_URL: "postgresql://postgres:password@localhost:5432/postiz_test?schema=public"
+      JWT_SECRET: "test_jwt_secret_value_minimum_32_characters_long_for_tests"
+      NODE_ENV: test
+      CI: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -38,24 +58,20 @@ jobs:
         run: |
           echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
 
-#      - name: Setup pnpm cache
-#        uses: actions/cache@v4
-#        with:
-#          path: |
-#            ${{ env.STORE_PATH }}
-#            ${{ github.workspace }}/.next/cache
-#          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
-#          restore-keys: |
-#            ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}-
-
       - name: Install dependencies
         run: pnpm install
 
       - name: Generate Prisma Client
         run: pnpm run prisma-generate
 
+      - name: Deploy Prisma Migrations
+        run: pnpm dlx prisma migrate deploy --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
+
       - name: Run Prisma and Security Tests
         run: cd libraries/nestjs-libraries && npx vitest run --globals
+
+      - name: Run PostgreSQL Fencing Concurrency Verification
+        run: node scripts/test_postgres_fencing_concurrency.cjs
 
       - name: Build
         run: pnpm run build
