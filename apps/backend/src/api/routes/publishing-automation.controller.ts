@@ -238,7 +238,7 @@ export class PublishingAutomationController {
       where: { id: queueId, organizationId: org.id, isActive: true },
     });
     if (!queue) throw new NotFoundException('Active publishing queue not found.');
-    const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId);
+    const nextSlot = await this.findNextAvailableSlot(org.id, queue);
     return { nextSlot: nextSlot.toISOString(), queueId: queue.id, timezone: queue.timezone };
   }
 
