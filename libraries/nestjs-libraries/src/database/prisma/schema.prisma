@@ -2035,9 +2035,30 @@ model CreativeProject {
 
   organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   owner           User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  versions        CreativeProjectVersion[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, updatedAt])
   @@index([organizationId, type])
+}
+
+model CreativeProjectVersion {
+  id              String          @id @default(uuid())
+  projectId       String
+  organizationId  String
+  version         Int
+  name            String
+  type            String
+  data            Json
+  dimensions      Json
+  thumbnailUrl    String?
+  assetReferences String[]        @default([])
+  createdById     String
+  createdAt       DateTime        @default(now())
+  project         CreativeProject @relation(fields: [projectId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([projectId, organizationId, version])
+  @@index([organizationId, projectId, createdAt])
 }
 
 model PublishingQueue {
