@@ -14,6 +14,11 @@ import { ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
+import {
+  AuthorizationActions,
+  Sections,
+} from '@gitroom/backend/services/auth/permissions/permission.exception.class';
 
 export interface ScheduleSlot {
   dayOfWeek: number; // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
@@ -411,6 +416,7 @@ export class PublishingAutomationController {
   }
 
   @Post('/queues/:id/enqueue')
+  @CheckPolicies([AuthorizationActions.Create, Sections.POSTS_PER_MONTH])
   async enqueuePosts(
     @GetOrgFromRequest() org: Organization,
     @Param('id') id: string,
@@ -438,7 +444,7 @@ export class PublishingAutomationController {
 
     const scheduled: Array<{ postId: string; publishDate: string }> = [];
     for (const post of posts) {
-      const nextSlot = await this.findNextAvailableSlot(org.id, queue);
+      const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId);
       const assigned = await this.prisma.post.updateMany({
         where: { id: post.id, organizationId: org.id, state: 'DRAFT', deletedAt: null },
         data: { queueId: queue.id },
