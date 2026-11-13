@@ -180,6 +180,48 @@ const BUILTIN_TEMPLATES: BuiltinTemplate[] = [
 export class CreativeStudioController {
   constructor(private readonly prisma: PrismaService) {}
 
+  private async saveVersionSnapshot(organizationId: string, userId: string, project: any) {
+    const versions = (this.prisma as any).creativeProjectVersion;
+    const latest = await versions.findFirst({
+      where: { projectId: project.id, organizationId },
+      orderBy: { version: 'desc' },
+      select: { version: true },
+    });
+    await versions.create({
+      data: {
+        projectId: project.id,
+        organizationId,
+        version: (latest?.version || 0) + 1,
+        name: project.name,
+        type: project.type,
+        data: project.data,
+        dimensions: project.dimensions,
+        // Browser data URLs are deliberately not copied into each database snapshot.
+        thumbnailUrl:
+          typeof project.thumbnailUrl === 'string' && project.thumbnailUrl.startsWith('data:')
+            ? null
+            : project.thumbnailUrl || null,
+        assetReferences: Array.isArray(project.assetReferences) ? project.assetReferences : [],
+        createdById: userId,
+      },
+    });
+
+    // Bound database growth: retain the latest 20 recoverable versions per project.
+    const retained = await versions.findMany({
+      where: { projectId: project.id, organizationId },
+      orderBy: { version: 'desc' },
+      take: 20,
+      select: { id: true },
+    });
+    await versions.deleteMany({
+      where: {
+        projectId: project.id,
+        organizationId,
+        id: { notIn: retained.map((item: { id: string }) => item.id) },
+      },
+    });
+  }
+
   @Get('/templates')
   async listTemplates(@Query('type') type?: string) {
     if (type && VALID_PROJECT_TYPES.includes(type as any)) {
@@ -293,13 +335,78 @@ export class CreativeStudioController {
         assetReferences: Array.isArray(body.assetReferences) ? body.assetReferences : [],
       },
     });
+    await this.saveVersionSnapshot(org.id, user.id, project);
 
     return project;
+  }
+
+  @Get('/projects/:id/versions')
+  async listProjectVersions(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const project = await (this.prisma as any).creativeProject.findFirst({
+      where: { id, organizationId: org.id },
+      select: { id: true },
+    });
+    if (!project) throw new NotFoundException('Project not found in this organization.');
+
+    return (this.prisma as any).creativeProjectVersion.findMany({
+      where: { projectId: id, organizationId: org.id },
+      orderBy: { version: 'desc' },
+      take: 20,
+      select: {
+        id: true,
+        version: true,
+        name: true,
+        type: true,
+        createdAt: true,
+        createdById: true,
+      },
+    });
+  }
+
+  @Post('/projects/:id/versions/:version/restore')
+  async restoreProjectVersion(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Param('id') id: string,
+    @Param('version') versionRaw: string
+  ) {
+    const version = Number.parseInt(versionRaw, 10);
+    if (!Number.isInteger(version) || version < 1) {
+      throw new BadRequestException('Choose a valid project version.');
+    }
+    const project = await (this.prisma as any).creativeProject.findFirst({
+      where: { id, organizationId: org.id },
+    });
+    if (!project) throw new NotFoundException('Project not found in this organization.');
+
+    const snapshot = await (this.prisma as any).creativeProjectVersion.findFirst({
+      where: { projectId: id, organizationId: org.id, version },
+    });
+    if (!snapshot) throw new NotFoundException('Project version not found. It may have expired from version retention.');
+
+    const restored = await (this.prisma as any).creativeProject.update({
+      where: { id },
+      data: {
+        name: snapshot.name,
+        type: snapshot.type,
+        data: snapshot.data,
+        dimensions: snapshot.dimensions,
+        thumbnailUrl: snapshot.thumbnailUrl,
+        assetReferences: snapshot.assetReferences,
+      },
+    });
+    // Record the restored state as a new version so the restore itself is reversible.
+    await this.saveVersionSnapshot(org.id, user.id, restored);
+    return restored;
   }
 
   @Put('/projects/:id')
   async updateProject(
     @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
     @Param('id') id: string,
     @Body() body: {
       name?: string;
@@ -320,6 +427,17 @@ export class CreativeStudioController {
     if (body.dimensions !== undefined) updateData.dimensions = body.dimensions;
     if (body.thumbnailUrl !== undefined) updateData.thumbnailUrl = body.thumbnailUrl;
     if (Array.isArray(body.assetReferences)) updateData.assetReferences = body.assetReferences;
+
+    const changed =
+      (body.name !== undefined && body.name.trim() !== existing.name) ||
+      (body.data !== undefined && JSON.stringify(body.data) !== JSON.stringify(existing.data)) ||
+      (body.dimensions !== undefined && JSON.stringify(body.dimensions) !== JSON.stringify(existing.dimensions)) ||
+      (body.thumbnailUrl !== undefined && body.thumbnailUrl !== existing.thumbnailUrl) ||
+      (Array.isArray(body.assetReferences) && JSON.stringify(body.assetReferences) !== JSON.stringify(existing.assetReferences));
+
+    if (changed) {
+      await this.saveVersionSnapshot(org.id, user.id, existing);
+    }
 
     const updated = await (this.prisma as any).creativeProject.update({
       where: { id },
