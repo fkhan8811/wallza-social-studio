@@ -35,6 +35,10 @@ CREATE INDEX "PublishingIdempotency_organizationId_status_idx" ON "PublishingIde
 -- AddForeignKey
 ALTER TABLE "PublishingIdempotency" ADD CONSTRAINT "PublishingIdempotency_organizationId_fkey" FOREIGN KEY ("organizationId") REFERENCES "Organization"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
+-- Add idempotencyKey column and index to Post
+ALTER TABLE "Post" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;
+CREATE INDEX IF NOT EXISTS "Post_organizationId_idempotencyKey_idx" ON "Post"("organizationId", "idempotencyKey");
+
 -- Enable Row Level Security
 ALTER TABLE "InternalRequestNonce" ENABLE ROW LEVEL SECURITY;
 

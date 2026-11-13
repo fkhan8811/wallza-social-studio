@@ -15,6 +15,7 @@ import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/in
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { verifyInternalRequestAsync } from '../auth/internal-hmac.util';
 import { validateMediaUrlComprehensive } from '@gitroom/nestjs-libraries/upload/ssrf-media-validator';
+import { SsrfMediaIngestionService } from '@gitroom/nestjs-libraries/upload/ssrf-media-ingestion.service';
 
 function validatePostContent(caption: string, mediaUrls: string[], platforms: string[]): void {
   const trimmed = (caption || '').trim();
@@ -86,7 +87,8 @@ export class WallzaSyncController {
   constructor(
     private _prisma: PrismaService,
     private _integrationService: IntegrationService,
-    private _postsService: PostsService
+    private _postsService: PostsService,
+    private _mediaIngestionService: SsrfMediaIngestionService
   ) {}
 
   @Get('/wallza-status')
@@ -311,19 +313,26 @@ export class WallzaSyncController {
       throw new HttpException('Missing organizationId', HttpStatus.BAD_REQUEST);
     }
 
-    // 1. Comprehensive SSRF, media format & content validation with real redirect checking
+    // 1. Dedicated SSRF-Protected Media Ingestion into Controlled Private Storage
     const isProduction = process.env.NODE_ENV === 'production';
-    const validatedMediaUrls: string[] = [];
+    const ingestedMedia: { url: string; path: string }[] = [];
     for (const url of mediaUrls) {
       const validated = await validateMediaUrlComprehensive(url, {
         isProduction,
-        checkHead: true,
+        checkHead: false, // Ingestion performs socket-level pinned download & verification
         timeoutMs: 5000,
       });
-      // Capture the validated destination URL!
-      validatedMediaUrls.push(validated.finalUrl);
+
+      const ingested = await this._mediaIngestionService.ingestMedia(validated.finalUrl, {
+        isProduction,
+        maxSizeBytes: 50 * 1024 * 1024,
+        timeoutMs: 15000,
+        connectTimeoutMs: 5000,
+        maxRedirects: 3,
+      });
+      ingestedMedia.push({ url: ingested.url, path: ingested.path });
     }
-    validatePostContent(caption, validatedMediaUrls, platforms);
+    validatePostContent(caption, ingestedMedia.map((m) => m.url), platforms);
     validateScheduleParameters(type, scheduledAt);
 
     // 2. Organization and Integration Verification (Requirement 11)
@@ -368,13 +377,51 @@ export class WallzaSyncController {
       }
     }
 
-    // 3. Atomic Database-Backed Idempotency Reservation with Fencing Token (Fail-Closed)
+    // 3. Durable Post Level Check & Atomic Database-Backed Idempotency Reservation with Fencing
     const trackingKey = (idempotencyKey || wallzaPostId || '').trim();
     if (!trackingKey) {
       throw new HttpException(
         'Missing required idempotencyKey for publishing request. All internal publishing must be idempotent.',
         HttpStatus.BAD_REQUEST
       );
+    }
+
+    // Check if an existing post was already created in Postiz with this durable idempotencyKey or releaseId
+    const existingDurablePost = await this._prisma.post.findFirst({
+      where: {
+        organizationId: org.id,
+        OR: [
+          { idempotencyKey: trackingKey },
+          { releaseId: trackingKey },
+        ],
+        deletedAt: null,
+      },
+    });
+
+    if (existingDurablePost) {
+      // Post was already created! Ensure reservation is recorded as completed
+      await this._prisma.publishingIdempotency.updateMany({
+        where: {
+          organizationId: org.id,
+          idempotencyKey: trackingKey,
+        },
+        data: {
+          postId: existingDurablePost.id,
+          status: 'completed',
+        },
+      });
+
+      return {
+        success: true,
+        message: 'Post already created in publishing engine (durable idempotency replay)',
+        post: existingDurablePost,
+        channels: targetIntegrations.map((i) => ({
+          id: i.id,
+          name: i.name,
+          platform: i.providerIdentifier,
+        })),
+        idempotent: true,
+      };
     }
 
     let fencingToken = crypto.randomUUID();
@@ -475,7 +522,14 @@ export class WallzaSyncController {
         }
 
         const fallbackPost = await this._prisma.post.findFirst({
-          where: { organizationId: org.id, releaseId: trackingKey, deletedAt: null },
+          where: {
+            organizationId: org.id,
+            OR: [
+              { idempotencyKey: trackingKey },
+              { releaseId: trackingKey },
+            ],
+            deletedAt: null,
+          },
         });
         if (fallbackPost) {
           return {
@@ -518,12 +572,13 @@ export class WallzaSyncController {
       }
     }
 
-    // 4. Dispatch via Postiz native PostsService with Heartbeat Lease Renewal
+    // 4. Dispatch via Postiz native PostsService with Heartbeat Lease Renewal & Fencing Verification
+    let isLeaseLost = false;
     let heartbeat: NodeJS.Timeout | null = null;
     if (isReservationOwner) {
       heartbeat = setInterval(async () => {
         try {
-          await this._prisma.publishingIdempotency.updateMany({
+          const hbResult = await this._prisma.publishingIdempotency.updateMany({
             where: {
               organizationId: org.id,
               idempotencyKey: trackingKey,
@@ -534,11 +589,69 @@ export class WallzaSyncController {
               updatedAt: new Date(),
             },
           });
-        } catch {}
-      }, 10_000);
+          if (hbResult.count === 0) {
+            isLeaseLost = true;
+            console.warn(`[WallzaSync] Heartbeat detected lost lease for key ${trackingKey}.`);
+          }
+        } catch (hbErr) {
+          // Database error / connection outage: treat as lost lease ownership!
+          isLeaseLost = true;
+          console.error(`[WallzaSync] Heartbeat DB failure for key ${trackingKey}:`, hbErr);
+        }
+      }, 5000);
     }
 
     try {
+      // PRE-DISPATCH FENCING VERIFICATION:
+      // Verify reservation ownership immediately before beginning publishing work.
+      if (isLeaseLost) {
+        throw new HttpException(
+          'Publishing lease lost during heartbeat renewal. Aborting before dispatch to prevent duplicate publishing.',
+          HttpStatus.CONFLICT
+        );
+      }
+
+      const activeLease = await this._prisma.publishingIdempotency.findFirst({
+        where: {
+          organizationId: org.id,
+          idempotencyKey: trackingKey,
+          fencingToken,
+          status: 'pending',
+        },
+      });
+
+      if (!activeLease || isLeaseLost) {
+        throw new HttpException(
+          'Publishing reservation lease expired or was superseded before dispatch. Aborting to prevent duplicate post.',
+          HttpStatus.CONFLICT
+        );
+      }
+
+      // Check again if another thread completed the post while we acquired reservation
+      const concurrentPost = await this._prisma.post.findFirst({
+        where: {
+          organizationId: org.id,
+          OR: [
+            { idempotencyKey: trackingKey },
+            { releaseId: trackingKey },
+          ],
+          deletedAt: null,
+        },
+      });
+      if (concurrentPost) {
+        return {
+          success: true,
+          message: 'Post already dispatched/scheduled (atomic idempotent replay)',
+          post: concurrentPost,
+          channels: targetIntegrations.map((i) => ({
+            id: i.id,
+            name: i.name,
+            platform: i.providerIdentifier,
+          })),
+          idempotent: true,
+        };
+      }
+
       const postPayload = {
         type: type === 'now' ? 'now' : 'schedule',
         date: scheduledAt || new Date().toISOString(),
@@ -547,7 +660,7 @@ export class WallzaSyncController {
           value: [
             {
               content: caption || '',
-              image: validatedMediaUrls.map((url) => ({ url, path: url })),
+              image: ingestedMedia.map((m) => ({ url: m.url, path: m.path })),
             },
           ],
           settings: {},
@@ -555,17 +668,30 @@ export class WallzaSyncController {
       };
 
       const mapped = await this._postsService.mapTypeToPost(postPayload as any, org.id);
+
+      // Verify lease once more right before createPost side-effect
+      if (isLeaseLost) {
+        throw new HttpException(
+          'Publishing lease lost before post creation. Aborting to prevent duplicate post.',
+          HttpStatus.CONFLICT
+        );
+      }
+
       const created = await this._postsService.createPost(org.id, mapped, 'API');
       const createdId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
 
       if (createdId) {
+        // Tag Post with durable idempotencyKey and releaseId immediately
         try {
           await this._prisma.post.update({
             where: { id: createdId },
-            data: { releaseId: trackingKey },
+            data: {
+              idempotencyKey: trackingKey,
+              releaseId: trackingKey,
+            },
           });
-        } catch (updateErr: any) {
-          console.error('[WallzaSync] Error tagging post releaseId:', updateErr);
+        } catch (tagErr: any) {
+          console.error('[WallzaSync] Error tagging post idempotencyKey:', tagErr);
         }
 
         // Fencing check: only finalize if this exact fencing token is still active!
@@ -589,11 +715,7 @@ export class WallzaSyncController {
             );
           }
         } catch (idempErr: any) {
-          console.error('[WallzaSync] CRITICAL: Failed to update publishing idempotency status:', idempErr);
-          throw new HttpException(
-            `Post was created (${createdId}) but idempotency record could not be completed: ${idempErr.message}`,
-            HttpStatus.INTERNAL_SERVER_ERROR
-          );
+          console.error('[WallzaSync] Non-fatal error updating idempotency completion:', idempErr);
         }
       }
 
@@ -609,7 +731,7 @@ export class WallzaSyncController {
         idempotent: false,
       };
     } catch (err: any) {
-      if (trackingKey && isReservationOwner) {
+      if (trackingKey && isReservationOwner && !isLeaseLost) {
         try {
           await this._prisma.publishingIdempotency.updateMany({
             where: {
@@ -629,7 +751,7 @@ export class WallzaSyncController {
       }
       throw new HttpException(
         err.message || 'Failed to dispatch post through publishing service',
-        HttpStatus.INTERNAL_SERVER_ERROR
+        err.status || HttpStatus.INTERNAL_SERVER_ERROR
       );
     } finally {
       if (heartbeat) {

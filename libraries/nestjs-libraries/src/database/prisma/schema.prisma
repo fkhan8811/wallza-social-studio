@@ -653,6 +653,7 @@ model Post {
   parentPostId               String?
   releaseId                  String?
   releaseURL                 String?
+  idempotencyKey             String?
   settings                   String?
   image                      String?
   submittedForOrderId        String?
@@ -689,6 +690,7 @@ model Post {
   @@index([publishDate, state, deletedAt, parentPostId, integrationId, organizationId, creationMethod])
   @@index([state])
   @@index([organizationId])
+  @@index([organizationId, idempotencyKey])
   @@index([organizationId, publishDate])
   @@index([parentPostId])
   @@index([submittedForOrderId])

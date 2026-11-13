@@ -49,6 +49,7 @@ import { OAuthRepository } from '@gitroom/nestjs-libraries/database/prisma/oauth
 import { OAuthService } from '@gitroom/nestjs-libraries/database/prisma/oauth/oauth.service';
 import { AnnouncementsRepository } from '@gitroom/nestjs-libraries/database/prisma/announcements/announcements.repository';
 import { NonceCleanupService } from '@gitroom/nestjs-libraries/auth/nonce-cleanup.service';
+import { SsrfMediaIngestionService } from '@gitroom/nestjs-libraries/upload/ssrf-media-ingestion.service';
 import { AnnouncementsService } from '@gitroom/nestjs-libraries/database/prisma/announcements/announcements.service';
 import { ErrorsRepository } from '@gitroom/nestjs-libraries/database/prisma/errors/errors.repository';
 import { ErrorsService } from '@gitroom/nestjs-libraries/database/prisma/errors/errors.service';
@@ -117,6 +118,7 @@ import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/adm
     AdminStatsRepository,
     AdminStatsService,
     NonceCleanupService,
+    SsrfMediaIngestionService,
   ],
   get exports() {
     return this.providers;
