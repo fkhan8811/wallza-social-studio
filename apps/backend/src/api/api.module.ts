@@ -63,6 +63,8 @@ import { FarcasterProvider } from '@gitroom/backend/services/auth/providers/farc
 import { WalletProvider } from '@gitroom/backend/services/auth/providers/wallet.provider';
 import { OauthProvider } from '@gitroom/backend/services/auth/providers/oauth.provider';
 import { StripeController } from '@gitroom/backend/api/routes/stripe.controller';
+import { WallzaSsoController } from '@gitroom/backend/api/routes/wallza-sso.controller';
+import { WallzaSyncController } from '@gitroom/backend/api/routes/wallza-sync.controller';
 
 const authenticatedController = [
   UsersController,
@@ -113,6 +115,8 @@ const authenticatedController = [
         EnterpriseController,
         NoAuthIntegrationsController,
         OAuthController,
+        WallzaSsoController,
+        WallzaSyncController,
         MediaWidgetController,
         ClippingWidgetController,
         ...authenticatedController,
