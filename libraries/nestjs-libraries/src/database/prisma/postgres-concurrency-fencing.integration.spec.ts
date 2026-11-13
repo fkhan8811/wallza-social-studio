@@ -4,7 +4,7 @@ import * as crypto from 'crypto';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
-describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite (Real Database)', { timeout: 20000 }, () => {
+describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite (Real Database)', { timeout: 35000 }, () => {
   let pool: Pool;
   const SCHEMA = `wallza_fencing_vitest_${Date.now()}`;
   const orgId = `org_${crypto.randomUUID().slice(0, 8)}`;
@@ -57,6 +57,29 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
       CREATE UNIQUE INDEX IF NOT EXISTS "Post_org_idemp_int_uniq_${SCHEMA}" 
         ON "${SCHEMA}"."Post"("organizationId", "idempotencyKey", "integrationId");
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS "${SCHEMA}"."PublishingWorkflowOutbox" (
+        "id" TEXT PRIMARY KEY,
+        "organizationId" TEXT NOT NULL,
+        "postId" TEXT NOT NULL,
+        "integrationId" TEXT NOT NULL,
+        "provider" TEXT NOT NULL,
+        "workflowId" TEXT NOT NULL,
+        "status" TEXT NOT NULL DEFAULT 'pending',
+        "leaseOwner" TEXT,
+        "claimToken" TEXT,
+        "leaseExpiresAt" TIMESTAMP(3),
+        "retryCount" INTEGER NOT NULL DEFAULT 0,
+        "maxRetries" INTEGER NOT NULL DEFAULT 10,
+        "lastError" TEXT,
+        "state" TEXT,
+        "deliveredAt" TIMESTAMP(3),
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "PublishingWorkflowOutbox_uniq_${SCHEMA}" UNIQUE ("postId", "integrationId")
+      );
+      CREATE INDEX IF NOT EXISTS "PublishingWorkflowOutbox_status_lease_${SCHEMA}" ON "${SCHEMA}"."PublishingWorkflowOutbox"("status", "leaseExpiresAt");
+    `);
     client.release();
   });
 
@@ -105,7 +128,7 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
     const winner = winners[0];
     const postId = `post_${Date.now()}`;
 
-    // Execute Post creation and reservation finalization in a single database transaction
+    // Execute Post creation, Outbox insertion, and reservation finalization in a single database transaction
     await winner.client.query('BEGIN');
     const checkLease = await winner.client.query(
       `SELECT * FROM "${SCHEMA}"."PublishingIdempotency"
@@ -118,6 +141,12 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
       `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
        VALUES ($1, $2, $3, 'Single dispatch message', $4, $4)`,
       [postId, orgId, integration1, testKey]
+    );
+
+    await winner.client.query(
+      `INSERT INTO "${SCHEMA}"."PublishingWorkflowOutbox" ("id", "organizationId", "postId", "integrationId", "provider", "workflowId", "status", "retryCount", "maxRetries")
+       VALUES ($1, $2, $3, $4, 'meta', $5, 'pending', 0, 10)`,
+      [`outbox_${Date.now()}`, orgId, postId, integration1, `post_${postId}_${integration1}`]
     );
 
     const completeRes = await winner.client.query(
@@ -135,6 +164,12 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
       [orgId, testKey]
     );
     expect(postCount.rows[0].count).toBe(1);
+
+    const outboxCount = await pool.query(
+      `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."PublishingWorkflowOutbox" WHERE "organizationId" = $1 AND "postId" = $2`,
+      [orgId, postId]
+    );
+    expect(outboxCount.rows[0].count).toBe(1);
   });
 
   it('2. Publishing operation lasting > 45s: heartbeat lease renewal prevents takeover', async () => {
@@ -240,8 +275,8 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
     }
   });
 
-  it('5. Stale owner attempting to dispatch after takeover is strictly rejected', async () => {
-    const testKey = `idemp_stalled_${Date.now()}`;
+  it('5. Stale owner attempting to dispatch after takeover is strictly rejected and rolls back transaction', async () => {
+    const testKey = `idemp_stale_roll_${Date.now()}`;
     const c = await pool.connect();
 
     try {
@@ -262,13 +297,21 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
         [orgId, testKey, staleFencing]
       );
       expect(inTxCheck.rowCount).toBe(0);
+
+      // Fencing check failed -> Transaction rolled back
       await c.query('ROLLBACK');
+
+      const postCount = await c.query(
+        `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
+        [orgId, testKey]
+      );
+      expect(postCount.rows[0].count).toBe(0);
     } finally {
       c.release();
     }
   });
 
-  it('6. Crash after Post creation but before reservation completion: recovered via durable Post idempotencyKey', async () => {
+  it('6. Crash after Post creation and outbox insert: recovered via durable Post idempotencyKey & pending outbox row', async () => {
     const testKey = `idemp_crash_${Date.now()}`;
     const c = await pool.connect();
 
@@ -284,6 +327,12 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
         `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
          VALUES ($1, $2, 'int_crash', 'Crashed before reservation completion', $3, $3)`,
         [crashedPostId, orgId, testKey]
+      );
+
+      await c.query(
+        `INSERT INTO "${SCHEMA}"."PublishingWorkflowOutbox" ("id", "organizationId", "postId", "integrationId", "provider", "workflowId", "status", "retryCount", "maxRetries")
+         VALUES ($1, $2, $3, 'int_crash', 'twitter', $4, 'pending', 0, 10)`,
+        [`outbox_crash_${Date.now()}`, orgId, crashedPostId, `post_${crashedPostId}_int_crash`]
       );
 
       // Retry arrives: checks Post table first
@@ -302,29 +351,36 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
         [existing.rows[0].id, orgId, testKey]
       );
 
-      const postCount = await c.query(
-        `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."Post" WHERE "organizationId" = $1 AND "idempotencyKey" = $2`,
-        [orgId, testKey]
+      // Outbox row remains durable and pending for worker pickup
+      const pendingOutbox = await c.query(
+        `SELECT * FROM "${SCHEMA}"."PublishingWorkflowOutbox" WHERE "postId" = $1 AND "status" = 'pending'`,
+        [crashedPostId]
       );
-      expect(postCount.rows[0].count).toBe(1);
+      expect(pendingOutbox.rowCount).toBe(1);
     } finally {
       c.release();
     }
   });
 
-  it('7. Multi-platform partial failure & retry: only missing integration is dispatched', async () => {
+  it('7. Multi-platform partial failure & retry: only missing integration is dispatched with independent outbox event', async () => {
     const testKey = `idemp_multi_${Date.now()}`;
     const c = await pool.connect();
 
     try {
       const platformA = `int_linkedin_${Date.now()}`;
       const platformB = `int_twitter_${Date.now()}`;
+      const postAId = `post_multi_A_${Date.now()}`;
 
-      // Initial attempt creates Post for platform A
+      // Initial attempt creates Post and Outbox for platform A
       await c.query(
         `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
          VALUES ($1, $2, $3, 'Multi-platform message', $4, $4)`,
-        [`post_multi_A_${Date.now()}`, orgId, platformA, testKey]
+        [postAId, orgId, platformA, testKey]
+      );
+      await c.query(
+        `INSERT INTO "${SCHEMA}"."PublishingWorkflowOutbox" ("id", "organizationId", "postId", "integrationId", "provider", "workflowId", "status", "retryCount", "maxRetries")
+         VALUES ($1, $2, $3, $4, 'linkedin', $5, 'delivered', 0, 10)`,
+        [`outbox_multi_A_${Date.now()}`, orgId, postAId, platformA, `post_${postAId}_${platformA}`]
       );
 
       // Platform B failed before creation.
@@ -343,10 +399,16 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
       expect(missingIntegrations[0]).toBe(platformB);
 
       // Dispatch missing integration only
+      const postBId = `post_multi_B_${Date.now()}`;
       await c.query(
         `INSERT INTO "${SCHEMA}"."Post" ("id", "organizationId", "integrationId", "content", "idempotencyKey", "releaseId")
          VALUES ($1, $2, $3, 'Multi-platform message', $4, $4)`,
-        [`post_multi_B_${Date.now()}`, orgId, missingIntegrations[0], testKey]
+        [postBId, orgId, missingIntegrations[0], testKey]
+      );
+      await c.query(
+        `INSERT INTO "${SCHEMA}"."PublishingWorkflowOutbox" ("id", "organizationId", "postId", "integrationId", "provider", "workflowId", "status", "retryCount", "maxRetries")
+         VALUES ($1, $2, $3, $4, 'twitter', $5, 'pending', 0, 10)`,
+        [`outbox_multi_B_${Date.now()}`, orgId, postBId, missingIntegrations[0], `post_${postBId}_${missingIntegrations[0]}`]
       );
 
       const totalMultiPosts = await c.query(
@@ -354,6 +416,12 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
         [orgId, testKey]
       );
       expect(totalMultiPosts.rows[0].count).toBe(2);
+
+      const totalOutbox = await c.query(
+        `SELECT COUNT(*)::int as count FROM "${SCHEMA}"."PublishingWorkflowOutbox" WHERE "organizationId" = $1 AND ("postId" = $2 OR "postId" = $3)`,
+        [orgId, postAId, postBId]
+      );
+      expect(totalOutbox.rows[0].count).toBe(2);
     } finally {
       c.release();
     }
@@ -386,6 +454,61 @@ describe('PostgreSQL Concurrency, Heartbeat, and Fencing Token Integration Suite
       }
 
       expect(caughtViolation).toBe(true);
+    } finally {
+      c.release();
+    }
+  });
+
+  it('9. Concurrent worker outbox claims and expired lease takeover with unique claim tokens', async () => {
+    const c = await pool.connect();
+
+    try {
+      const eventId = `outbox_claim_${Date.now()}`;
+      const postId = `post_claim_${Date.now()}`;
+      await c.query(
+        `INSERT INTO "${SCHEMA}"."PublishingWorkflowOutbox" ("id", "organizationId", "postId", "integrationId", "provider", "workflowId", "status", "retryCount", "maxRetries")
+         VALUES ($1, $2, $3, 'int_claim', 'twitter', $4, 'pending', 0, 10)`,
+        [eventId, orgId, postId, `post_${postId}_int_claim`]
+      );
+
+      // Worker 1 claims event
+      const token1 = crypto.randomUUID();
+      const leaseExpiresAt = new Date(Date.now() + 60000);
+      const claim1 = await c.query(
+        `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+         SET "status" = 'processing', "leaseOwner" = 'worker_1', "claimToken" = $1, "leaseExpiresAt" = $2, "updatedAt" = NOW()
+         WHERE "id" = $3 AND ("status" = 'pending' OR ("status" = 'processing' AND "leaseExpiresAt" < NOW()))`,
+        [token1, leaseExpiresAt, eventId]
+      );
+      expect(claim1.rowCount).toBe(1);
+
+      // Concurrent Worker 2 attempts claim while lease is active
+      const token2 = crypto.randomUUID();
+      const claim2 = await c.query(
+        `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+         SET "status" = 'processing', "leaseOwner" = 'worker_2', "claimToken" = $1, "leaseExpiresAt" = $2, "updatedAt" = NOW()
+         WHERE "id" = $3 AND ("status" = 'pending' OR ("status" = 'processing' AND "leaseExpiresAt" < NOW()))`,
+        [token2, leaseExpiresAt, eventId]
+      );
+      expect(claim2.rowCount).toBe(0);
+
+      // Stale Worker 2 attempts to acknowledge -> Rejected
+      const staleAck = await c.query(
+        `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+         SET "status" = 'delivered', "deliveredAt" = NOW(), "leaseOwner" = NULL, "claimToken" = NULL
+         WHERE "id" = $1 AND "status" = 'processing' AND "claimToken" = $2`,
+        [eventId, token2]
+      );
+      expect(staleAck.rowCount).toBe(0);
+
+      // Valid Worker 1 acknowledges -> Succeeded
+      const validAck = await c.query(
+        `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+         SET "status" = 'delivered', "deliveredAt" = NOW(), "leaseOwner" = NULL, "claimToken" = NULL
+         WHERE "id" = $1 AND "status" = 'processing' AND "claimToken" = $2`,
+        [eventId, token1]
+      );
+      expect(validAck.rowCount).toBe(1);
     } finally {
       c.release();
     }

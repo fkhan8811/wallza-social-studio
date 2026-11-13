@@ -955,13 +955,17 @@ export class PostsService {
 
     const workflowId = `post_${postId}`;
 
-    // 1. Idempotent check: Check if workflow is already RUNNING in Temporal.
-    // Retrying an outbox event must NOT terminate or restart an already-running workflow!
+    // 1. Idempotent check: Check if workflow is already RUNNING or COMPLETED in Temporal.
+    // Retrying an outbox event must NOT terminate, restart, or duplicate a workflow!
     try {
       const handle = await this._temporalService?.client?.getWorkflowHandle?.(workflowId);
       if (handle) {
         const desc = await handle.describe();
-        if (desc?.status?.name === 'RUNNING') {
+        const statusName = desc?.status?.name;
+        if (statusName === 'COMPLETED') {
+          return { workflowId, status: 'COMPLETED' };
+        }
+        if (statusName === 'RUNNING') {
           return { workflowId, status: 'RUNNING' };
         }
       }
@@ -969,7 +973,7 @@ export class PostsService {
       // Not yet created/running
     }
 
-    // 2. Start workflow with conflict policy FAIL to strictly prevent terminating running workflow
+    // 2. Start workflow with conflict policy FAIL and reuse policy REJECT_DUPLICATE
     try {
       await this._temporalService.client
         .getRawClient()
@@ -977,6 +981,7 @@ export class PostsService {
           workflowId,
           taskQueue: 'main',
           workflowIdConflictPolicy: 'FAIL',
+          workflowIdReusePolicy: 'REJECT_DUPLICATE',
           args: [
             {
               taskQueue: taskQueue,
@@ -1309,7 +1314,7 @@ export class PostsService {
                   postId: createdPostId,
                   integrationId: post.integration.id,
                   provider: post.settings.__type.split('-')[0].toLowerCase(),
-                  workflowId: `post_${createdPostId}_${post.integration.id}`,
+                  workflowId: `post_${createdPostId}`,
                   status: 'pending',
                   state: createdPostState,
                   retryCount: 0,
@@ -1382,7 +1387,11 @@ export class PostsService {
             },
           });
           if (outboxEvent) {
-            await this._outboxService.deliverEvent(outboxEvent);
+            // Unify immediate delivery with background recovery: atomically claim event before delivery
+            const claimed = await this._outboxService.claimEventById(outboxEvent.id);
+            if (claimed) {
+              await this._outboxService.deliverEvent(claimed, claimed.claimToken);
+            }
           } else {
             await this.startWorkflow(item.provider, item.id, orgId, item.state);
           }

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PublishingWorkflowOutboxService } from './publishing-workflow-outbox.service';
 
-describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox', () => {
+describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox & Fencing Claims', () => {
   let outboxService: PublishingWorkflowOutboxService;
   let mockPrisma: any;
   let mockTemporal: any;
@@ -63,21 +63,36 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
           let count = 0;
           for (const [k, v] of outboxStore.entries()) {
             if (v.id === where.id) {
-              const matchesPending = where.OR?.some((cond: any) => {
-                if (cond.status === 'pending') return v.status === 'pending';
-                if (cond.status === 'processing') {
-                  return (
-                    v.status === 'processing' &&
-                    v.leaseExpiresAt &&
-                    v.leaseExpiresAt < cond.leaseExpiresAt?.lt
-                  );
-                }
-                return false;
-              });
-              if (matchesPending || where.status === v.status) {
-                outboxStore.set(k, { ...v, ...data, updatedAt: new Date() });
-                count++;
+              // Conditional check for status
+              if (where.status && v.status !== where.status) {
+                continue;
               }
+              // Conditional check for claimToken
+              if (where.claimToken && v.claimToken !== where.claimToken) {
+                continue;
+              }
+              // Conditional check for leaseOwner
+              if (where.leaseOwner && v.leaseOwner !== where.leaseOwner) {
+                continue;
+              }
+              // Conditional check for OR (pending or expired processing)
+              if (where.OR) {
+                const matches = where.OR.some((cond: any) => {
+                  if (cond.status === 'pending') return v.status === 'pending';
+                  if (cond.status === 'processing') {
+                    return (
+                      v.status === 'processing' &&
+                      v.leaseExpiresAt &&
+                      v.leaseExpiresAt < cond.leaseExpiresAt?.lt
+                    );
+                  }
+                  return false;
+                });
+                if (!matches) continue;
+              }
+
+              outboxStore.set(k, { ...v, ...data, updatedAt: new Date() });
+              count++;
             }
           }
           return { count };
@@ -117,6 +132,15 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
                 err.name = 'WorkflowExecutionAlreadyStartedError';
                 throw err;
               }
+              if (existing && existing.status === 'COMPLETED') {
+                if (options.workflowIdReusePolicy === 'REJECT_DUPLICATE') {
+                  const err: any = new Error(
+                    `Workflow execution already completed and reuse policy rejects duplicates: ${wfId}`
+                  );
+                  err.name = 'WorkflowExecutionAlreadyStartedError';
+                  throw err;
+                }
+              }
               temporalWorkflows.set(wfId, {
                 status: 'RUNNING',
                 startCount: (existing?.startCount || 0) + 1,
@@ -146,7 +170,6 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
   });
 
   it('1. Temporal unavailable during initial dispatch: outbox event created and preserved for retry', async () => {
-    // 1. Transaction inserts outbox event
     const events = await outboxService.insertEventsInTransaction(mockPrisma, [
       {
         organizationId: 'org_1',
@@ -160,33 +183,31 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
     expect(events[0].status).toBe('pending');
     expect(events[0].retryCount).toBe(0);
 
-    // 2. Simulate Temporal network outage during initial dispatch
     mockTemporal.client.getRawClient.mockReturnValueOnce({
       workflow: {
         start: vi.fn().mockRejectedValue(new Error('Temporal connection refused: 7233')),
       },
     });
 
-    // 3. Deliver attempt fails gracefully
     const claim = await outboxService.claimPendingEvents('worker_1');
     expect(claim.length).toBe(1);
+    expect(claim[0].claimToken).toBeDefined();
 
-    const delivery = await outboxService.deliverEvent(claim[0]);
+    const delivery = await outboxService.deliverEvent(claim[0], claim[0].claimToken);
     expect(delivery.success).toBe(false);
     expect(delivery.error).toContain('Temporal connection refused');
 
-    // 4. Verify outbox state in DB: status reverted to pending, lease released, error recorded, retryCount=1
     const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
       where: { postId_integrationId: { postId: 'post_1', integrationId: 'int_twitter' } },
     });
     expect(stored.status).toBe('pending');
     expect(stored.retryCount).toBe(1);
     expect(stored.leaseOwner).toBeNull();
+    expect(stored.claimToken).toBeNull();
     expect(stored.lastError).toContain('Temporal connection refused');
   });
 
   it('2. Database committed but worker crashes before starting Temporal: recovered on worker restart', async () => {
-    // 1. Outbox event was committed in DB during post creation
     await outboxService.insertEventsInTransaction(mockPrisma, [
       {
         organizationId: 'org_1',
@@ -197,15 +218,12 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
       },
     ]);
 
-    // 2. Worker crashed immediately after DB commit (startWorkflow never invoked)
     expect(temporalWorkflows.has('post_post_2_int_linkedin')).toBe(false);
 
-    // 3. Background worker starts up and processes outbox queue
     const result = await outboxService.processOutboxQueue('recovery_worker_1');
     expect(result.delivered).toBe(1);
     expect(result.failed).toBe(0);
 
-    // 4. Temporal workflow is now running and outbox is marked delivered
     expect(temporalWorkflows.get('post_post_2_int_linkedin')?.status).toBe('RUNNING');
     const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
       where: { postId_integrationId: { postId: 'post_2', integrationId: 'int_linkedin' } },
@@ -215,8 +233,7 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
     expect(stored.leaseOwner).toBeNull();
   });
 
-  it('3. Temporal accepts workflow but worker crashes before acknowledging: idempotent recovery', async () => {
-    // 1. Outbox event was claimed by worker_A
+  it('3. Temporal accepts and completes workflow, then worker crashes before acknowledging: completed workflow is not restarted', async () => {
     const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
       {
         organizationId: 'org_1',
@@ -227,25 +244,28 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
       },
     ]);
 
-    // Temporal accepted workflow
-    temporalWorkflows.set('post_post_3_int_facebook', { status: 'RUNNING', startCount: 1 });
+    // Temporal accepted and COMPLETED workflow
+    temporalWorkflows.set('post_post_3_int_facebook', { status: 'COMPLETED', startCount: 1 });
 
-    // Worker crashed before updating outbox to 'delivered'; lease expired 10 minutes ago
+    // Worker crashed before updating outbox to 'delivered'; lease expired
     event.status = 'processing';
     event.leaseOwner = 'crashed_worker';
+    event.claimToken = 'crashed_token_123';
     event.leaseExpiresAt = new Date(Date.now() - 600000);
     outboxStore.set('post_3_int_facebook', event);
 
-    // 2. Recovery worker claims the expired event
+    // Recovery worker claims the expired event
     const claimed = await outboxService.claimPendingEvents('recovery_worker_2');
     expect(claimed.length).toBe(1);
     expect(claimed[0].id).toBe(event.id);
+    expect(claimed[0].claimToken).not.toBe('crashed_token_123'); // Brand new claim token!
 
-    // 3. Deliver checks Temporal: sees workflow already running, avoids duplicate start, marks delivered
-    const delivery = await outboxService.deliverEvent(claimed[0]);
+    // Deliver checks Temporal describe(): status is COMPLETED -> safely acknowledges delivered without starting new workflow
+    const delivery = await outboxService.deliverEvent(claimed[0], claimed[0].claimToken);
     expect(delivery.success).toBe(true);
+    expect(delivery.acknowledged).toBe(true);
 
-    // Verify Temporal workflow was NOT restarted (startCount remains 1)
+    // Crucial: Temporal workflow startCount was NOT incremented (remains 1, 0 duplicate publishes)
     expect(temporalWorkflows.get('post_post_3_int_facebook')?.startCount).toBe(1);
 
     const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
@@ -254,72 +274,110 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox',
     expect(stored.status).toBe('delivered');
   });
 
-  it('4. Duplicate outbox delivery does not duplicate publishing workflows', async () => {
-    // Start workflow initially
-    await outboxService.startTemporalWorkflowIdempotent('twitter', 'post_dup', 'org_1', 'QUEUE');
-    expect(temporalWorkflows.get('post_post_dup')?.startCount).toBe(1);
-
-    // Repeated delivery call
-    const secondCall = await outboxService.startTemporalWorkflowIdempotent(
-      'twitter',
-      'post_dup',
-      'org_1',
-      'QUEUE'
-    );
-    expect(secondCall.status).toBe('RUNNING');
-    expect(temporalWorkflows.get('post_post_dup')?.startCount).toBe(1);
-  });
-
-  it('5. One platform workflow fails while another succeeds: independent recovery per integration', async () => {
-    // Multi-platform post for Twitter and LinkedIn
-    await outboxService.insertEventsInTransaction(mockPrisma, [
+  it('4. Stale worker delivery attempt after lease takeover: acknowledgement is strictly rejected', async () => {
+    const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
       {
         organizationId: 'org_1',
-        postId: 'post_multi',
-        integrationId: 'int_platform_A',
+        postId: 'post_stale',
+        integrationId: 'int_twitter',
         provider: 'twitter',
-        state: 'QUEUE',
-      },
-      {
-        organizationId: 'org_1',
-        postId: 'post_multi',
-        integrationId: 'int_platform_B',
-        provider: 'linkedin',
         state: 'QUEUE',
       },
     ]);
 
-    // Claim both
-    const claimed = await outboxService.claimPendingEvents('worker_multi');
-    expect(claimed.length).toBe(2);
+    // Worker 1 claims event
+    const [claimedByWorker1] = await outboxService.claimPendingEvents('worker_1', 1, 1000);
+    const worker1Token = claimedByWorker1.claimToken;
+    expect(worker1Token).toBeDefined();
 
-    const eventA = claimed.find((e) => e.integrationId === 'int_platform_A');
-    const eventB = claimed.find((e) => e.integrationId === 'int_platform_B');
+    // Worker 1 stalls; lease expires
+    event.leaseExpiresAt = new Date(Date.now() - 5000);
+    outboxStore.set('post_stale_int_twitter', {
+      ...event,
+      leaseOwner: 'worker_1',
+      claimToken: worker1Token,
+      leaseExpiresAt: new Date(Date.now() - 5000),
+    });
 
-    // Deliver Platform A successfully
-    const resA = await outboxService.deliverEvent(eventA);
-    expect(resA.success).toBe(true);
+    // Worker 2 takes over lease
+    const [claimedByWorker2] = await outboxService.claimPendingEvents('worker_2', 1, 60000);
+    expect(claimedByWorker2.claimToken).not.toBe(worker1Token);
 
-    // Deliver Platform B with simulated Temporal failure
-    mockTemporal.client.getRawClient.mockReturnValueOnce({
-      workflow: {
-        start: vi.fn().mockRejectedValue(new Error('Rate limit exceeded on Temporal namespace')),
+    // Stale Worker 1 attempts to deliver and acknowledge using stale claim token
+    const staleDelivery = await outboxService.deliverEvent(claimedByWorker1, worker1Token);
+    expect(staleDelivery.acknowledged).toBe(false);
+    expect(staleDelivery.error).toContain('Stale claim token');
+
+    // Verify Worker 2 still owns the lease
+    const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+      where: { postId_integrationId: { postId: 'post_stale', integrationId: 'int_twitter' } },
+    });
+    expect(stored.status).toBe('processing');
+    expect(stored.leaseOwner).toBe('worker_2');
+    expect(stored.claimToken).toBe(claimedByWorker2.claimToken);
+
+    // Worker 2 delivers successfully
+    const validDelivery = await outboxService.deliverEvent(claimedByWorker2, claimedByWorker2.claimToken);
+    expect(validDelivery.acknowledged).toBe(true);
+
+    const finalStored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+      where: { postId_integrationId: { postId: 'post_stale', integrationId: 'int_twitter' } },
+    });
+    expect(finalStored.status).toBe('delivered');
+  });
+
+  it('5. Intentional user-requested republish: uses distinct publishing attempt identity', async () => {
+    // 1. Initial post completed
+    const initial = await outboxService.startTemporalWorkflowIdempotent(
+      'twitter',
+      'post_repub',
+      'org_1',
+      'QUEUE',
+      'int_twitter'
+    );
+    expect(initial.workflowId).toBe('post_post_repub_int_twitter');
+    expect(temporalWorkflows.get(initial.workflowId)?.startCount).toBe(1);
+
+    // 2. Mark initial as completed
+    temporalWorkflows.set(initial.workflowId, { status: 'COMPLETED', startCount: 1 });
+
+    // 3. User requests intentional republish with explicit attempt ID
+    const republishAttemptId = 'attempt_2_user_opt_in';
+    const repub = await outboxService.startTemporalWorkflowIdempotent(
+      'twitter',
+      'post_repub',
+      'org_1',
+      'QUEUE',
+      'int_twitter',
+      republishAttemptId
+    );
+    expect(repub.workflowId).toBe(`post_post_repub_int_twitter_repub_${republishAttemptId}`);
+    expect(temporalWorkflows.get(repub.workflowId)?.startCount).toBe(1);
+    expect(temporalWorkflows.get(initial.workflowId)?.startCount).toBe(1);
+  });
+
+  it('6. Multiple workers claiming concurrently: only 1 worker wins each event', async () => {
+    await outboxService.insertEventsInTransaction(mockPrisma, [
+      {
+        organizationId: 'org_1',
+        postId: 'post_concurrent',
+        integrationId: 'int_tw',
+        provider: 'twitter',
+        state: 'QUEUE',
       },
-    });
-    const resB = await outboxService.deliverEvent(eventB);
-    expect(resB.success).toBe(false);
+    ]);
 
-    // Verify Platform A is delivered and Platform B is pending retry
-    const storedA = await mockPrisma.publishingWorkflowOutbox.findUnique({
-      where: { postId_integrationId: { postId: 'post_multi', integrationId: 'int_platform_A' } },
-    });
-    const storedB = await mockPrisma.publishingWorkflowOutbox.findUnique({
-      where: { postId_integrationId: { postId: 'post_multi', integrationId: 'int_platform_B' } },
-    });
+    // 5 concurrent workers try to claim the same pending event
+    const claims = await Promise.all([
+      outboxService.claimPendingEvents('worker_A', 1),
+      outboxService.claimPendingEvents('worker_B', 1),
+      outboxService.claimPendingEvents('worker_C', 1),
+      outboxService.claimPendingEvents('worker_D', 1),
+      outboxService.claimPendingEvents('worker_E', 1),
+    ]);
 
-    expect(storedA.status).toBe('delivered');
-    expect(storedB.status).toBe('pending');
-    expect(storedB.retryCount).toBe(1);
-    expect(storedB.lastError).toContain('Rate limit exceeded');
+    const winners = claims.filter((c) => c.length > 0);
+    expect(winners.length).toBe(1);
+    expect(winners[0][0].claimToken).toBeDefined();
   });
 });

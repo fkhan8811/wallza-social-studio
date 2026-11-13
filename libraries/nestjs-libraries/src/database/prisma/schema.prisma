@@ -2233,6 +2233,7 @@ model PublishingWorkflowOutbox {
   workflowId      String
   status          String       @default("pending") // "pending" | "processing" | "delivered" | "failed"
   leaseOwner      String?
+  claimToken      String?
   leaseExpiresAt  DateTime?
   retryCount      Int          @default(0)
   maxRetries      Int          @default(10)

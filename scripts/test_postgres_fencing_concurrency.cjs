@@ -73,6 +73,31 @@ async function setupDatabase() {
       ON "${SCHEMA}"."Post"("organizationId", "idempotencyKey", "integrationId");
   `);
 
+  // Create real PublishingWorkflowOutbox table in isolated schema
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS "${SCHEMA}"."PublishingWorkflowOutbox" (
+      "id" TEXT PRIMARY KEY,
+      "organizationId" TEXT NOT NULL,
+      "postId" TEXT NOT NULL,
+      "integrationId" TEXT NOT NULL,
+      "provider" TEXT NOT NULL,
+      "workflowId" TEXT NOT NULL,
+      "status" TEXT NOT NULL DEFAULT 'pending',
+      "leaseOwner" TEXT,
+      "claimToken" TEXT,
+      "leaseExpiresAt" TIMESTAMP(3),
+      "retryCount" INTEGER NOT NULL DEFAULT 0,
+      "maxRetries" INTEGER NOT NULL DEFAULT 10,
+      "lastError" TEXT,
+      "state" TEXT,
+      "deliveredAt" TIMESTAMP(3),
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "PublishingWorkflowOutbox_uniq_${SCHEMA}" UNIQUE ("postId", "integrationId")
+    );
+    CREATE INDEX IF NOT EXISTS "PublishingWorkflowOutbox_status_lease_${SCHEMA}" ON "${SCHEMA}"."PublishingWorkflowOutbox"("status", "leaseExpiresAt");
+  `);
+
   client.release();
   console.log('[PG-SETUP] Tables created in isolated schema with multi-platform unique constraint.');
 }
@@ -96,7 +121,7 @@ async function runTests() {
 
   const orgId = `org_${crypto.randomUUID().slice(0, 8)}`;
   let passedTests = 0;
-  const totalTests = 8;
+  const totalTests = 9;
 
   // ──────────────────────────────────────────────────────────────────────────
   // TEST 1: 10 Simultaneous Dispatch Requests with One Idempotency Key
@@ -508,6 +533,74 @@ async function runTests() {
     passedTests++;
   } finally {
     c8.release();
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // TEST 9: Concurrent Worker Outbox Claims & Stale Token Acknowledgement Rejection
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log('\n[TEST 9] Concurrent worker outbox claims and stale claim token rejection');
+  const c9 = await pool.connect();
+
+  try {
+    const eventId = `outbox_claim_${Date.now()}`;
+    const postId = `post_claim_${Date.now()}`;
+    await c9.query(
+      `INSERT INTO "${SCHEMA}"."PublishingWorkflowOutbox" ("id", "organizationId", "postId", "integrationId", "provider", "workflowId", "status", "retryCount", "maxRetries")
+       VALUES ($1, $2, $3, 'int_claim', 'twitter', $4, 'pending', 0, 10)`,
+      [eventId, orgId, postId, `post_${postId}_int_claim`]
+    );
+
+    // Worker 1 claims event
+    const token1 = crypto.randomUUID();
+    const leaseExpiresAt = new Date(Date.now() + 60000);
+    const claim1 = await c9.query(
+      `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+       SET "status" = 'processing', "leaseOwner" = 'worker_1', "claimToken" = $1, "leaseExpiresAt" = $2, "updatedAt" = NOW()
+       WHERE "id" = $3 AND ("status" = 'pending' OR ("status" = 'processing' AND "leaseExpiresAt" < NOW()))`,
+      [token1, leaseExpiresAt, eventId]
+    );
+    if (claim1.rowCount !== 1) {
+      throw new Error(`Worker 1 failed to claim pending outbox event!`);
+    }
+
+    // Concurrent Worker 2 attempts claim while lease is active -> 0 rows
+    const token2 = crypto.randomUUID();
+    const claim2 = await c9.query(
+      `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+       SET "status" = 'processing', "leaseOwner" = 'worker_2', "claimToken" = $1, "leaseExpiresAt" = $2, "updatedAt" = NOW()
+       WHERE "id" = $3 AND ("status" = 'pending' OR ("status" = 'processing' AND "leaseExpiresAt" < NOW()))`,
+      [token2, leaseExpiresAt, eventId]
+    );
+    if (claim2.rowCount !== 0) {
+      throw new Error(`Worker 2 improperly stole an active lease!`);
+    }
+
+    // Stale Worker 2 attempts to acknowledge -> Rejected (0 rows affected)
+    const staleAck = await c9.query(
+      `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+       SET "status" = 'delivered', "deliveredAt" = NOW(), "leaseOwner" = NULL, "claimToken" = NULL
+       WHERE "id" = $1 AND "status" = 'processing' AND "claimToken" = $2`,
+      [eventId, token2]
+    );
+    if (staleAck.rowCount !== 0) {
+      throw new Error(`Stale worker was allowed to acknowledge outbox event!`);
+    }
+
+    // Valid Worker 1 acknowledges -> Succeeded (1 row affected)
+    const validAck = await c9.query(
+      `UPDATE "${SCHEMA}"."PublishingWorkflowOutbox"
+       SET "status" = 'delivered', "deliveredAt" = NOW(), "leaseOwner" = NULL, "claimToken" = NULL
+       WHERE "id" = $1 AND "status" = 'processing' AND "claimToken" = $2`,
+      [eventId, token1]
+    );
+    if (validAck.rowCount !== 1) {
+      throw new Error(`Valid worker failed to acknowledge outbox event!`);
+    }
+
+    console.log('  [PASS] Concurrent claim correctly isolated, and stale worker acknowledgement strictly rejected.');
+    passedTests++;
+  } finally {
+    c9.release();
   }
 
   console.log(`\n======================================================`);

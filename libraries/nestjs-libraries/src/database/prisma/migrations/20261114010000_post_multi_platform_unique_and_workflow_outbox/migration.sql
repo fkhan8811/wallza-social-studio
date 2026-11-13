@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS "PublishingWorkflowOutbox" (
     "workflowId" TEXT NOT NULL,
     "status" TEXT NOT NULL DEFAULT 'pending',
     "leaseOwner" TEXT,
+    "claimToken" TEXT,
     "leaseExpiresAt" TIMESTAMP(3),
     "retryCount" INTEGER NOT NULL DEFAULT 0,
     "maxRetries" INTEGER NOT NULL DEFAULT 10,
@@ -43,3 +44,4 @@ ALTER TABLE "PublishingWorkflowOutbox" ADD CONSTRAINT "PublishingWorkflowOutbox_
 
 -- AddForeignKey
 ALTER TABLE "PublishingWorkflowOutbox" ADD CONSTRAINT "PublishingWorkflowOutbox_integrationId_fkey" FOREIGN KEY ("integrationId") REFERENCES "Integration"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
