@@ -167,7 +167,7 @@ export class ActivityInboxController {
 
     return {
       items: visible,
-      total: items.length,
+      total: visible.length,
       lastReadAt: lastRead,
       counts: {
         notifications: notifications.length,
