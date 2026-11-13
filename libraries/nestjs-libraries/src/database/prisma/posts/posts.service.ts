@@ -5,7 +5,9 @@ import {
   ValidationPipe,
   HttpException,
   HttpStatus,
+  Optional,
 } from '@nestjs/common';
+import { PublishingWorkflowOutboxService } from './publishing-workflow-outbox.service';
 import { PostsRepository } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
 import { CreatePostDto } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import dayjs from 'dayjs';
@@ -77,7 +79,8 @@ export class PostsService {
     private _shortLinkService: ShortLinkService,
     private _openaiService: OpenaiService,
     private _temporalService: TemporalService,
-    private _refreshIntegrationService: RefreshIntegrationService
+    private _refreshIntegrationService: RefreshIntegrationService,
+    @Optional() private _outboxService?: PublishingWorkflowOutboxService
   ) {}
 
   searchForMissingThreeHoursPosts() {
@@ -946,39 +949,34 @@ export class PostsService {
     orgId: string,
     state: State
   ) {
-    try {
-      const workflows = this._temporalService.client
-        .getRawClient()
-        ?.workflow.list({
-          query: `postId="${postId}" AND ExecutionStatus="Running"`,
-        });
-
-      for await (const executionInfo of workflows) {
-        try {
-          const workflow = await this._temporalService.client.getWorkflowHandle(
-            executionInfo.workflowId
-          );
-          if (
-            workflow &&
-            (await workflow.describe()).status.name !== 'TERMINATED'
-          ) {
-            await workflow.terminate();
-          }
-        } catch (err) {}
-      }
-    } catch (err) {}
-
     if (state === 'DRAFT') {
       return;
     }
 
+    const workflowId = `post_${postId}`;
+
+    // 1. Idempotent check: Check if workflow is already RUNNING in Temporal.
+    // Retrying an outbox event must NOT terminate or restart an already-running workflow!
+    try {
+      const handle = await this._temporalService?.client?.getWorkflowHandle?.(workflowId);
+      if (handle) {
+        const desc = await handle.describe();
+        if (desc?.status?.name === 'RUNNING') {
+          return { workflowId, status: 'RUNNING' };
+        }
+      }
+    } catch {
+      // Not yet created/running
+    }
+
+    // 2. Start workflow with conflict policy FAIL to strictly prevent terminating running workflow
     try {
       await this._temporalService.client
         .getRawClient()
         ?.workflow.start('postWorkflowV112', {
-          workflowId: `post_${postId}`,
+          workflowId,
           taskQueue: 'main',
-          workflowIdConflictPolicy: 'TERMINATE_EXISTING',
+          workflowIdConflictPolicy: 'FAIL',
           args: [
             {
               taskQueue: taskQueue,
@@ -997,7 +995,20 @@ export class PostsService {
             },
           ]),
         });
-    } catch (err) {}
+      return { workflowId, status: 'STARTED' };
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      if (
+        err?.name === 'WorkflowExecutionAlreadyStartedError' ||
+        msg.includes('already started') ||
+        msg.includes('Workflow execution already started') ||
+        msg.includes('ALREADY_EXISTS')
+      ) {
+        return { workflowId, status: 'RUNNING' };
+      }
+      // Re-throw genuine Temporal failures so the outbox records the failure and schedules retry!
+      throw err;
+    }
   }
 
   /**
@@ -1162,7 +1173,15 @@ export class PostsService {
     }
   ): Promise<{ postId: string; integration: string }[]> {
     const prisma = (this._postRepository as any)?._post?.model;
-    const postsToWorkflow: { provider: string; id: string; state: any }[] = [];
+    const postsToWorkflow: { provider: string; id: string; state: any; integrationId: string }[] = [];
+
+    // Requirement 10: Transaction unavailability fails closed whenever a fencing context is supplied.
+    if (fencingContext && !prisma?.$transaction) {
+      throw new HttpException(
+        'Transactional execution unavailable for fenced publishing. Failing closed.',
+        HttpStatus.SERVICE_UNAVAILABLE
+      );
+    }
 
     const executeInTransaction = async (tx: any) => {
       // 1. In-Transaction Fencing Verification
@@ -1273,7 +1292,36 @@ export class PostsService {
               provider: post.settings.__type.split('-')[0].toLowerCase(),
               id: createdPostId,
               state: createdPostState,
+              integrationId: post.integration.id,
             });
+
+            // Persist durable workflow outbox record in the same transaction as Post creation
+            if (tx.publishingWorkflowOutbox && createdPostState !== 'DRAFT') {
+              await tx.publishingWorkflowOutbox.upsert({
+                where: {
+                  postId_integrationId: {
+                    postId: createdPostId,
+                    integrationId: post.integration.id,
+                  },
+                },
+                create: {
+                  organizationId: orgId,
+                  postId: createdPostId,
+                  integrationId: post.integration.id,
+                  provider: post.settings.__type.split('-')[0].toLowerCase(),
+                  workflowId: `post_${createdPostId}_${post.integration.id}`,
+                  status: 'pending',
+                  state: createdPostState,
+                  retryCount: 0,
+                  maxRetries: 10,
+                },
+                update: {
+                  status: 'pending',
+                  state: createdPostState,
+                  updatedAt: new Date(),
+                },
+              });
+            }
           }
         }
 
@@ -1321,16 +1369,32 @@ export class PostsService {
       postList = await executeInTransaction(this._postRepository.model);
     }
 
-    // START WORKFLOWS ONLY AFTER TRANSACTION COMMITS!
+    // DELIVER WORKFLOWS ONLY AFTER TRANSACTION COMMITS!
     for (const item of postsToWorkflow) {
-      this.startWorkflow(
-        item.provider,
-        item.id,
-        orgId,
-        item.state
-      ).catch((err) => {
-        console.error('[PostsService] Error starting workflow after commit:', err);
-      });
+      try {
+        if (this._outboxService) {
+          const outboxEvent = await prisma.publishingWorkflowOutbox.findUnique({
+            where: {
+              postId_integrationId: {
+                postId: item.id,
+                integrationId: item.integrationId,
+              },
+            },
+          });
+          if (outboxEvent) {
+            await this._outboxService.deliverEvent(outboxEvent);
+          } else {
+            await this.startWorkflow(item.provider, item.id, orgId, item.state);
+          }
+        } else {
+          await this.startWorkflow(item.provider, item.id, orgId, item.state);
+        }
+      } catch (err: any) {
+        console.error(
+          `[PostsService] Workflow startup error for post ${item.id} (outbox event preserved for retry):`,
+          err.message || err
+        );
+      }
     }
 
     return postList;

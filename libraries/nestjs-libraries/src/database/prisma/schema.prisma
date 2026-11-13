@@ -60,6 +60,7 @@ model Organization {
   dynamicVariables   DynamicVariable[]
   hashtagGroups      HashtagGroup[]
   publishingIdempotency PublishingIdempotency[]
+  publishingWorkflowOutbox PublishingWorkflowOutbox[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -578,6 +579,7 @@ model Integration {
   orderItems            OrderItems[]
   plugs                 Plugs[]
   posts                 Post[]
+  workflowOutbox        PublishingWorkflowOutbox[]
 
   @@unique([organizationId, internalId])
   @@index([rootInternalId])
@@ -682,6 +684,7 @@ model Post {
   submittedForOrder          Orders?                   @relation(fields: [submittedForOrderId], references: [id])
   submittedForOrganization   Organization?             @relation("submittedForOrg", fields: [submittedForOrganizationId], references: [id])
   tags                       TagsPosts[]
+  workflowOutbox             PublishingWorkflowOutbox[]
 
   @@index([group])
   @@index([batchId])
@@ -2219,5 +2222,33 @@ model PublishingIdempotency {
 
   @@unique([organizationId, idempotencyKey])
   @@index([organizationId, status])
+}
+
+model PublishingWorkflowOutbox {
+  id              String       @id @default(cuid())
+  organizationId  String
+  postId          String
+  integrationId   String
+  provider        String
+  workflowId      String
+  status          String       @default("pending") // "pending" | "processing" | "delivered" | "failed"
+  leaseOwner      String?
+  leaseExpiresAt  DateTime?
+  retryCount      Int          @default(0)
+  maxRetries      Int          @default(10)
+  lastError       String?
+  state           String?
+  deliveredAt     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  post            Post         @relation(fields: [postId], references: [id], onDelete: Cascade)
+  integration     Integration  @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, integrationId])
+  @@index([status, leaseExpiresAt])
+  @@index([organizationId, status])
+  @@index([workflowId])
 }
 
