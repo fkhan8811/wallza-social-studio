@@ -637,6 +637,7 @@ model Post {
   publishDate                DateTime
   organizationId             String
   integrationId              String
+  queueId                    String?
   content                    String
   delay                      Int                       @default(0)
   group                      String
@@ -662,6 +663,7 @@ model Post {
   errors                     Errors[]
   payoutProblems             PayoutProblems[]
   integration                Integration               @relation(fields: [integrationId], references: [id])
+  queue                      PublishingQueue?          @relation(fields: [queueId, organizationId], references: [id, organizationId], onDelete: Restrict)
   lastMessage                Messages?                 @relation(fields: [lastMessageId], references: [id])
   organization               Organization              @relation("organization", fields: [organizationId], references: [id])
   parentPost                 Post?                     @relation("parentPostId", fields: [parentPostId], references: [id])
@@ -688,6 +690,7 @@ model Post {
   @@index([updatedAt])
   @@index([releaseURL])
   @@index([integrationId])
+  @@index([queueId, organizationId, state, publishDate])
 }
 
 model Notifications {
@@ -2076,7 +2079,9 @@ model PublishingQueue {
   updatedAt         DateTime     @updatedAt
 
   organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  posts             Post[]
 
+  @@unique([id, organizationId])
   @@index([organizationId, isActive])
   @@index([organizationId, isDefault])
 }
