@@ -107,6 +107,16 @@ export const useMenuItem = () => {
       path: '/reviews',
     },
     {
+      name: t('activity_inbox', 'Activity Inbox'),
+      icon: (
+        <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 24 24" fill="none">
+          <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M3 13H7L9 16H15L17 13H21M8 8H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ),
+      path: '/activity-inbox',
+    },
+    {
       name: 'Agent',
       icon: (
         <svg
