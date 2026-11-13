@@ -149,7 +149,7 @@ export class PublishingAutomationController {
     }
   }
 
-  private async findNextAvailableSlot(organizationId: string, queue: any) {
+  private async findNextAvailableSlot(organizationId: string, queue: any, integrationId?: string) {
     const timeZone = queue.timezone || 'UTC';
     if (!isValidTimeZone(timeZone)) {
       throw new BadRequestException('Queue timezone must be a valid IANA timezone.');
@@ -191,7 +191,8 @@ export class PublishingAutomationController {
           slot.dayOfWeek <= 6 &&
           slot.dayOfWeek === dayOfWeek &&
           typeof slot.time === 'string' &&
-          /^(?:[01]\\d|2[0-3]):[0-5]\\d$/.test(slot.time)
+          /^(?:[01]\\d|2[0-3]):[0-5]\\d$/.test(slot.time) &&
+          (!integrationId || !Array.isArray(slot.integrations) || !slot.integrations.length || slot.integrations.includes(integrationId))
         )
         .sort((a, b) => a.time.localeCompare(b.time));
 
@@ -218,7 +219,9 @@ export class PublishingAutomationController {
             lte: new Date(target.getTime() + spacingMs),
           },
         };
-        if (Array.isArray(slot.integrations) && slot.integrations.length) {
+        if (integrationId) {
+          where.integrationId = integrationId;
+        } else if (Array.isArray(slot.integrations) && slot.integrations.length) {
           where.integrationId = { in: slot.integrations };
         }
 
@@ -235,7 +238,7 @@ export class PublishingAutomationController {
       where: { id: queueId, organizationId: org.id, isActive: true },
     });
     if (!queue) throw new NotFoundException('Active publishing queue not found.');
-    const nextSlot = await this.findNextAvailableSlot(org.id, queue);
+    const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId);
     return { nextSlot: nextSlot.toISOString(), queueId: queue.id, timezone: queue.timezone };
   }
 
@@ -427,7 +430,7 @@ export class PublishingAutomationController {
 
     const posts = await this.prisma.post.findMany({
       where: { organizationId: org.id, id: { in: ids }, state: 'DRAFT', deletedAt: null },
-      select: { id: true },
+      select: { id: true, integrationId: true },
     });
     if (posts.length !== ids.length) {
       throw new BadRequestException('One or more selected posts are not active drafts in this organization.');
@@ -639,21 +642,29 @@ export class PublishingAutomationController {
             },
             orderBy: { createdAt: 'asc' },
             take: body.targetPostId || payload.postId ? 1 : 5,
-            select: { id: true },
+            select: { id: true, integrationId: true },
           });
 
           for (const post of candidatePosts) {
-            const nextSlot = await this.findNextAvailableSlot(org.id, targetQueue);
+            const nextSlot = await this.findNextAvailableSlot(org.id, targetQueue, post.integrationId);
             await this.prisma.post.update({
               where: { id: post.id },
               data: { queueId: targetQueue.id },
             });
-            await this.postsService.changeDate(
-              org.id,
-              post.id,
-              nextSlot.toISOString(),
-              'schedule'
-            );
+            try {
+              await this.postsService.changeDate(
+                org.id,
+                post.id,
+                nextSlot.toISOString(),
+                'schedule'
+              );
+            } catch (error) {
+              await this.prisma.post.updateMany({
+                where: { id: post.id, organizationId: org.id, queueId: targetQueue.id },
+                data: { queueId: null },
+              });
+              throw error;
+            }
             executionResults.push({
               action: 'assign_to_queue',
               postId: post.id,
