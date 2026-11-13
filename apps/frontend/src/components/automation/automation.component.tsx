@@ -93,7 +93,7 @@ export const AutomationComponent: FC = () => {
 
   const { data: queues = [], mutate: mutateQueues, isLoading: queuesLoading } = useSWR<PublishingQueue[]>(
     '/automation/queues',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
@@ -101,7 +101,7 @@ export const AutomationComponent: FC = () => {
 
   const { data: rules = [], mutate: mutateRules, isLoading: rulesLoading } = useSWR<AutomationRule[]>(
     '/automation/rules',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
@@ -109,7 +109,7 @@ export const AutomationComponent: FC = () => {
 
   const { data: integrationData } = useSWR<IntegrationResponse>(
     '/integrations/list',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       if (!res.ok) throw new Error('Could not load connected social accounts.');
       return res.json();
@@ -445,7 +445,7 @@ export const AutomationComponent: FC = () => {
               <div>
                 <p className="text-xs font-bold text-white">Next Available Posting Slot Calculated</p>
                 <p className="text-sm font-mono text-indigo-300 mt-0.5">
-                  {new Date(nextSlotInfo.nextSlot).toUTCString()} ({nextSlotInfo.timezone})
+                  {nextSlotInfo.localFormatted || `${new Date(nextSlotInfo.nextSlot).toLocaleString()} (${nextSlotInfo.timezone})`}
                 </p>
               </div>
               <button

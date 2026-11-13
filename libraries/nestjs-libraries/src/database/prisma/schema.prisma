@@ -21,6 +21,7 @@ model Organization {
   allowTrial          Boolean              @default(false)
   isTrailing          Boolean              @default(false)
   shortlink           ShortLinkPreference  @default(ASK)
+  requireApprovalForPublish Boolean            @default(false)
   autoPost            AutoPost[]
   Comments            Comments[]
   credits             Credits[]
@@ -284,6 +285,7 @@ model UserOrganization {
   organizationId String
   disabled       Boolean      @default(false)
   role           Role         @default(USER)
+  lastReadNotifications DateTime?
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   organization   Organization @relation(fields: [organizationId], references: [id])
@@ -652,6 +654,10 @@ model Post {
   submittedForOrderId        String?
   submittedForOrganizationId String?
   approvedSubmitForOrder     APPROVED_SUBMIT_FOR_ORDER @default(NO)
+  requiresApproval           Boolean                   @default(false)
+  approvalStatus             String?                   @default("none")
+  approvedById               String?
+  approvedAt                 DateTime?
   creationMethod             CreationMethod            @default(UNKNOWN)
   lastMessageId              String?
   intervalInDays             Int?
@@ -691,6 +697,7 @@ model Post {
   @@index([releaseURL])
   @@index([integrationId])
   @@index([queueId, organizationId, state, publishDate])
+  @@index([organizationId, requiresApproval, approvalStatus])
 }
 
 model Notifications {

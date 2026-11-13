@@ -35,7 +35,7 @@ export const CreativeStudioEditorComponent: FC<{ projectId: string }> = ({ proje
 
   const { data: versions, mutate: mutateVersions, isLoading: versionsLoading } = useSWR<CreativeProjectVersion[]>(
     historyOpen ? `/creative-studio/projects/${projectId}/versions` : null,
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       if (!res.ok) throw new Error('Failed to load project version history');
       return res.json();

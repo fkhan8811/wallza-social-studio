@@ -62,7 +62,7 @@ export const TemplatesComponent: FC = () => {
 
   const { data: templates = [], mutate: mutateTemplates, isLoading: tplsLoading } = useSWR<PostTemplate[]>(
     `/content/templates?search=${encodeURIComponent(searchTpl)}`,
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
@@ -70,7 +70,7 @@ export const TemplatesComponent: FC = () => {
 
   const { data: variables = [], mutate: mutateVariables, isLoading: varsLoading } = useSWR<DynamicVariable[]>(
     '/content/variables',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
@@ -78,7 +78,7 @@ export const TemplatesComponent: FC = () => {
 
   const { data: hashtagGroups = [], mutate: mutateHashtags, isLoading: hashesLoading } = useSWR<HashtagGroup[]>(
     '/content/hashtag-groups',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }

@@ -39,7 +39,7 @@ export const CreativeStudioComponent: FC = () => {
 
   const { data: projectsData, mutate, isLoading } = useSWR(
     `/creative-studio/projects?type=${selectedType !== 'all' ? selectedType : ''}&search=${encodeURIComponent(search)}`,
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }
@@ -47,7 +47,7 @@ export const CreativeStudioComponent: FC = () => {
 
   const { data: templates = [] } = useSWR<Template[]>(
     '/creative-studio/templates',
-    async (url) => {
+    async (url: string) => {
       const res = await fetch(url);
       return res.json();
     }

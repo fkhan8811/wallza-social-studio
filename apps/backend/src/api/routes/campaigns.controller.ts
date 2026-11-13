@@ -374,8 +374,8 @@ export class CampaignsController {
       campaignId: campaign.id,
       campaignName: campaign.name,
       status: campaign.status,
-      startDate: campaign.startDate,
-      endDate: campaign.endDate,
+      startDate: campaign.startAt,
+      endDate: campaign.endAt,
       totalPostGroups: postGroups.length,
       totalPosts: posts.length,
       statesSummary,
@@ -460,12 +460,12 @@ export class CampaignsController {
       [
         'Date Range',
         `${
-          campaign.startDate
-            ? new Date(campaign.startDate).toISOString().slice(0, 10)
+          campaign.startAt
+            ? new Date(campaign.startAt).toISOString().slice(0, 10)
             : 'N/A'
         } to ${
-          campaign.endDate
-            ? new Date(campaign.endDate).toISOString().slice(0, 10)
+          campaign.endAt
+            ? new Date(campaign.endAt).toISOString().slice(0, 10)
             : 'N/A'
         }`,
       ],

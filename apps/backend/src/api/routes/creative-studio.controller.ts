@@ -549,6 +549,28 @@ export class CreativeStudioController {
         (body.dataUrl.startsWith('data:video/') ||
           body.dataUrl.startsWith('data:application/octet-stream'))
       ) {
+        // Validate video magic bytes to prevent spoofed or corrupted arbitrary payloads
+        const base64Part = body.dataUrl.split(',')[1];
+        if (!base64Part) {
+          throw new BadRequestException('Malformed video dataUrl payload.');
+        }
+        const sampleBuffer = Buffer.from(base64Part.slice(0, 64), 'base64');
+        const isWebm =
+          sampleBuffer.length >= 4 &&
+          sampleBuffer[0] === 0x1a &&
+          sampleBuffer[1] === 0x45 &&
+          sampleBuffer[2] === 0xdf &&
+          sampleBuffer[3] === 0xa3;
+        const isMp4 =
+          sampleBuffer.length >= 12 &&
+          sampleBuffer.toString('utf8', 4, 8) === 'ftyp';
+
+        if (!isWebm && !isMp4) {
+          throw new BadRequestException(
+            'Invalid video payload: Header must be a valid WebM (1A 45 DF A3) or MP4 (ftyp) video stream.'
+          );
+        }
+
         try {
           uploadedPublicUrl = await storage.uploadSimple(body.dataUrl);
         } catch (err: any) {

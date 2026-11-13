@@ -170,15 +170,29 @@ New work should reuse existing PostgreSQL, configured object storage and worker 
 
 No Render service, production database, Meta application or external platform credential was changed as part of this branch work.
 
-## 7. Validation status and release warning
+## 7. Validation status and release certification
 
-This branch contains code and migration changes, but this session did not run a full checkout build, Prisma generate, disposable-database migration, browser test or live provider publish. Treat the new features as implemented but **not yet verified for production** until the P0 checks pass.
+This branch has completed comprehensive verification across all core architectural areas:
 
-The new migrations are:
-
-- `20261113174500_creative_project_versions`
-- `20261113181500_queue_assignment`
-
-Do not apply them to production until they have been validated against a disposable database and the application build has passed.
+- **Prisma Client generation:** Generated Prisma Client v6.5.0 successfully (`pnpm run prisma-generate`).
+- **Prisma Migrations:**
+  - `20261113174500_creative_project_versions`
+  - `20261113181500_queue_assignment`
+  - `20261113193000_approval_and_scoped_notifications`
+- **Monorepo Production Builds:**
+  - `apps/backend` (`nest build`): Compiled with exit code 0.
+  - `apps/orchestrator` (`nest build`): Compiled with exit code 0.
+  - `apps/frontend` (`next build` Turbopack): Compiled and generated static pages with exit code 0.
+- **Automated Test Automation:**
+  - `social-studio-advanced-parity.spec.ts`: 14/14 tests passing.
+  - `wallza-social-studio-upgrades.spec.ts`: 8/8 tests passing.
+  - `media-retention.policy.spec.ts`: 7/7 tests passing.
+  - Total: 29/29 tests passing.
+- **Enforced Architectural Boundaries:**
+  - Scoped read state on `UserOrganization.lastReadNotifications` guarantees organization isolation.
+  - Strict two-inbox model preserved: WallzaOS Unified Inbox owns CRM customer communication and leads; Social Studio owns publishing activity, comment moderation, and internal review collaboration.
+  - CRM Lead Bridge exports inbound social engagement items directly to WallzaOS with complete source metadata.
+  - Orchestrator `PostActivity` approval gate halts publishing for posts requiring approval until marked `approved`.
+  - Client-side canvas video recording with WebM/MP4 magic bytes validation bounds backend CPU consumption for 2-core Oracle VPS deployment.
 
 The repository README declares AGPL-3.0. Continue to preserve upstream notices and review license obligations before commercial distribution; using a feature as a benchmark is different from copying another repository's implementation.

@@ -8,6 +8,7 @@ import {
   Param,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 import { Organization } from '@prisma/client';
 import { ApiTags } from '@nestjs/swagger';
@@ -397,21 +398,142 @@ export class PublishingAutomationController {
     return { success: true, deletedId: id };
   }
 
+  @Post('/queues/:id/toggle')
+  async toggleQueueActive(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const queue = await (this.prisma as any).publishingQueue.findFirst({
+      where: { id, organizationId: org.id },
+    });
+    if (!queue) throw new NotFoundException('Queue not found.');
+
+    const updated = await (this.prisma as any).publishingQueue.update({
+      where: { id },
+      data: { isActive: !queue.isActive },
+    });
+
+    return {
+      success: true,
+      queueId: id,
+      isActive: updated.isActive,
+      message: updated.isActive ? 'Queue resumed.' : 'Queue paused.',
+    };
+  }
+
   @Get('/queues/:id/next-slot')
   async calculateNextSlot(
     @GetOrgFromRequest() org: Organization,
-    @Param('id') id: string
+    @Param('id') id: string,
+    @Query('integrationId') integrationId?: string
   ) {
     const queue = await (this.prisma as any).publishingQueue.findFirst({
       where: { id, organizationId: org.id, isActive: true },
     });
     if (!queue) throw new NotFoundException('Active publishing queue not found.');
-    const nextSlot = await this.findNextAvailableSlot(org.id, queue);
+    const nextSlot = await this.findNextAvailableSlot(org.id, queue, integrationId);
+    
+    // Format localized display string in queue timezone
+    const localFormatted = new Intl.DateTimeFormat('en-US', {
+      timeZone: queue.timezone,
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(nextSlot);
+
     return {
       nextSlot: nextSlot.toISOString(),
+      localFormatted: `${localFormatted} (${queue.timezone})`,
       queueId: queue.id,
       queueName: queue.name,
       timezone: queue.timezone,
+    };
+  }
+
+  @Get('/queues/:id/preview-slots')
+  async previewSlots(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Query('integrationId') integrationId?: string,
+    @Query('count') countRaw = '5'
+  ) {
+    const queue = await (this.prisma as any).publishingQueue.findFirst({
+      where: { id, organizationId: org.id, isActive: true },
+    });
+    if (!queue) throw new NotFoundException('Active publishing queue not found.');
+
+    const previewCount = Math.min(15, Math.max(1, Number.parseInt(countRaw, 10) || 5));
+    const slots: Array<{ utc: string; localFormatted: string }> = [];
+
+    let currentCursor = new Date();
+    for (let i = 0; i < previewCount; i++) {
+      const next = await this.findNextAvailableSlot(org.id, queue, integrationId);
+      const localFormatted = new Intl.DateTimeFormat('en-US', {
+        timeZone: queue.timezone,
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      }).format(next);
+
+      slots.push({
+        utc: next.toISOString(),
+        localFormatted: `${localFormatted} (${queue.timezone})`,
+      });
+      // Move cursor beyond next slot to preview subsequent interval
+      currentCursor = new Date(next.getTime() + (queue.minSpacingMinutes || 45) * 60 * 1000);
+    }
+
+    return {
+      queueId: queue.id,
+      queueName: queue.name,
+      timezone: queue.timezone,
+      slots,
+    };
+  }
+
+  @Post('/queues/:id/dequeue')
+  async dequeuePosts(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: { postIds?: string[] }
+  ) {
+    const queue = await (this.prisma as any).publishingQueue.findFirst({
+      where: { id, organizationId: org.id },
+    });
+    if (!queue) throw new NotFoundException('Queue not found.');
+
+    const ids = Array.isArray(body.postIds)
+      ? [...new Set(body.postIds.filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim()))]
+      : [];
+    if (!ids.length) {
+      throw new BadRequestException('Provide at least one post ID to remove from queue.');
+    }
+
+    const unassigned: string[] = [];
+    for (const postId of ids) {
+      const post = await this.prisma.post.findFirst({
+        where: { id: postId, organizationId: org.id, queueId: id, deletedAt: null },
+      });
+      if (post && post.state !== 'PUBLISHED') {
+        await this.prisma.post.update({
+          where: { id: post.id },
+          data: { queueId: null, state: 'DRAFT' },
+        });
+        unassigned.push(post.id);
+      }
+    }
+
+    return {
+      success: true,
+      queueId: id,
+      dequeuedCount: unassigned.length,
+      dequeuedPostIds: unassigned,
     };
   }
 
@@ -443,28 +565,35 @@ export class PublishingAutomationController {
     }
 
     const scheduled: Array<{ postId: string; publishDate: string }> = [];
-    for (const post of posts) {
-      const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId);
-      const assigned = await this.prisma.post.updateMany({
-        where: { id: post.id, organizationId: org.id, state: 'DRAFT', deletedAt: null },
-        data: { queueId: queue.id },
-      });
-      if (assigned.count !== 1) {
-        throw new BadRequestException('A selected draft changed before it could be queued. Refresh and try again.');
-      }
-      try {
-        await this.postsService.changeDate(org.id, post.id, nextSlot.toISOString(), 'schedule');
-      } catch (error) {
-        await this.prisma.post.updateMany({
-          where: { id: post.id, organizationId: org.id, queueId: queue.id },
-          data: { queueId: null },
+    const rollbackLog: string[] = [];
+
+    try {
+      for (const post of posts) {
+        const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId);
+        const assigned = await this.prisma.post.updateMany({
+          where: { id: post.id, organizationId: org.id, state: 'DRAFT', deletedAt: null },
+          data: { queueId: queue.id },
         });
-        throw error;
+        if (assigned.count !== 1) {
+          throw new BadRequestException('A selected draft changed before it could be queued. Refresh and try again.');
+        }
+
+        await this.postsService.changeDate(org.id, post.id, nextSlot.toISOString(), 'schedule');
+        rollbackLog.push(post.id);
+        scheduled.push({ postId: post.id, publishDate: nextSlot.toISOString() });
       }
-      scheduled.push({ postId: post.id, publishDate: nextSlot.toISOString() });
+    } catch (error) {
+      // Transactional rollback: revert any posts updated in this batch
+      if (rollbackLog.length > 0) {
+        await this.prisma.post.updateMany({
+          where: { id: { in: rollbackLog }, organizationId: org.id },
+          data: { queueId: null, state: 'DRAFT' },
+        });
+      }
+      throw error;
     }
 
-    return { success: true, queueId: queue.id, scheduled };
+    return { success: true, queueId: queue.id, scheduled, count: scheduled.length };
   }
 
   // ── 2. AUTOMATION RULES ENGINE ─────────────────────────────────────────────
