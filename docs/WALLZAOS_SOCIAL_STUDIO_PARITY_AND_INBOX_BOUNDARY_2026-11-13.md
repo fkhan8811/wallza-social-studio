@@ -108,8 +108,9 @@ Improved the publishing queue foundation:
 - Daylight-saving clock times that do not exist are skipped.
 - Collision detection is scoped to the queue and can be narrowed by the integration IDs listed on a schedule slot.
 - Queue capacity is checked against posts assigned to that queue.
-- Added `POST /automation/queues/:id/enqueue` for 1–50 organization-owned draft posts.
-- Enqueue and retry actions use the existing Postiz `PostsService.changeDate(..., 'schedule')` workflow path rather than only changing database state.
+- Added `POST /automation/queues/:id/enqueue` for 1–50 organization-owned draft posts, protected by the existing post-creation permission.
+- Added an Automation UI flow on each queue card to load upcoming drafts, select up to 50 and enqueue them into the selected queue.
+- Slot assignment is matched to each draft's connected account, and enqueue/retry actions use the existing Postiz `PostsService.changeDate(..., 'schedule')` workflow path rather than only changing database state.
 - Deleting a queue detaches its posts but preserves their current publish dates.
 
 This borrows the operational direction of TryPost/BrightBean queues without introducing another scheduler service.
@@ -123,7 +124,7 @@ The working branch already has `PostTemplate.platformVersions` for per-platform 
 | Capability | Reference strength | Current Wallza Social Studio | Remaining work |
 |---|---|---|---|
 | AI-agent operations | TryPost's broad MCP/REST control surface | Postiz already has MCP/agent foundations | Add tools for Wallza Ideas, Campaigns, Reviews, queue operations and Creative Studio versions; do not duplicate existing Postiz post tools |
-| Timezone-aware queues | TryPost/BrightBean scheduling workflows | Queue timezone, queue assignment and capacity logic added in this branch | Add UI for selecting drafts and assigning them to named queues; test DST, capacity and provider-specific constraints |
+| Timezone-aware queues | TryPost/BrightBean scheduling workflows | Queue timezone, persistent queue assignment, capacity logic and draft-selection/enqueue UI added in this branch | Add editing for existing queue schedules; test DST, capacity and provider-specific constraints |
 | Per-platform content | BrightBean platform overrides | Template variants are stored | Verify one-click application in the native composer and provider-level output |
 | Internal/client approval | BrightBean configurable stages and comments; TryPost approval actions | External reviewer links, independent decisions and audit events | Add publish-pipeline approval enforcement, internal approvers, revision rounds, consolidated policies, reminders and email delivery |
 | Client portal | BrightBean external client workflow | Token-only review page | Improve branding, post-level decisions and client feedback rounds without granting workspace access |
