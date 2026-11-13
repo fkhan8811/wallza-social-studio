@@ -214,16 +214,8 @@ function verifyInternalRequestInternal(
     };
   }
 
-  // 4. Persistent Replay Protection (Requirement 2)
-  const nonceKey = `${audienceHeader}:${nonceHeader}`;
-  
-  // In-memory check first (catches instant duplicate concurrent attempts)
-  if (memoryNonceCache.has(nonceKey)) {
-    return { valid: false, error: 'Replay attack detected: nonce already used' };
-  }
-  memoryNonceCache.set(nonceKey, Date.now());
-
-  // Database-backed persistent check if Prisma or Pool provided
+  // 4. Persistent Replay Protection (Fail-Closed)
+  // Only a successful unique database insert permits verification.
   if (options.prisma) {
     if (asyncDb) {
       return (async () => {
@@ -238,23 +230,24 @@ function verifyInternalRequestInternal(
           return { valid: true };
         } catch (dbErr: any) {
           if (dbErr?.code === 'P2002') {
-            return { valid: false, error: 'Replay attack detected: nonce already exists in database' };
+            return {
+              valid: false,
+              error: 'HMAC nonce has already been consumed (replay attack detected)',
+            };
           }
-          // Non-blocking fallback if table doesn't exist yet in test runner
-          return { valid: true };
+          // Fail closed on Prisma connection errors, missing tables, migration failures, etc.
+          return {
+            valid: false,
+            error: `HMAC persistent replay verification failed closed: database error (${dbErr?.message || 'DB error'})`,
+          };
         }
       })();
     } else {
-      // Async background recording for synchronous callers
-      options.prisma.internalRequestNonce
-        ?.create({
-          data: {
-            audience: audienceHeader,
-            nonce: nonceHeader,
-            timestamp: BigInt(timestamp),
-          },
-        })
-        .catch(() => {});
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          '[Security Violation] Production handlers must call verifyInternalRequestAsync() to await persistent DB nonce checks.'
+        );
+      }
     }
   }
 
@@ -269,25 +262,36 @@ function verifyInternalRequestInternal(
              RETURNING 1`,
             [audienceHeader, nonceHeader, timestamp]
           );
-          if (insertRes.rows.length === 0) {
-            return { valid: false, error: 'Replay attack detected: nonce already recorded in database' };
+          if (!insertRes || !insertRes.rows || insertRes.rows.length === 0) {
+            return { valid: false, error: 'HMAC nonce has already been consumed (replay attack detected)' };
           }
           return { valid: true };
-        } catch {
-          return { valid: true };
+        } catch (dbErr: any) {
+          if (dbErr?.code === '23505') {
+            return { valid: false, error: 'HMAC nonce has already been consumed (replay attack detected)' };
+          }
+          return {
+            valid: false,
+            error: `HMAC persistent replay verification failed closed: database error (${dbErr?.message || 'DB error'})`,
+          };
         }
       })();
-    } else {
-      options.pool
-        ?.query(
-          `INSERT INTO public.internal_request_nonces (audience, nonce, timestamp, created_at)
-           VALUES ($1, $2, $3, NOW())
-           ON CONFLICT (audience, nonce) DO NOTHING`,
-          [audienceHeader, nonceHeader, timestamp]
-        )
-        .catch(() => {});
     }
   }
+
+  if (process.env.NODE_ENV === 'production') {
+    return {
+      valid: false,
+      error: 'Database provider (Prisma or Pool) required for persistent HMAC verification in production. In-memory fallback forbidden.',
+    };
+  }
+
+  // Non-production test runner fallback only when no DB is provided:
+  const nonceKey = `${audienceHeader}:${nonceHeader}`;
+  if (memoryNonceCache.has(nonceKey)) {
+    return { valid: false, error: 'HMAC nonce has already been consumed (replay attack detected)' };
+  }
+  memoryNonceCache.set(nonceKey, Date.now());
 
   return { valid: true };
 }

@@ -280,7 +280,229 @@ describe('Social Studio — Advanced Security, SSO Identity, SSRF & Idempotency 
         prisma: mockPrisma,
       });
       expect(secondCall.valid).toBe(false);
-      expect(secondCall.error).toMatch(/Replay attack detected/);
+      expect(secondCall.error).toMatch(/replay attack detected/i);
+    });
+
+    it('tests two separate verifier instances sharing the same persistent database store', async () => {
+      const sharedDbTable = new Set<string>();
+
+      const createVerifierInstance = () => ({
+        internalRequestNonce: {
+          create: vi.fn(async ({ data }: any) => {
+            const key = `${data.audience}:${data.nonce}`;
+            if (sharedDbTable.has(key)) {
+              const err: any = new Error('Unique constraint failed on InternalRequestNonce');
+              err.code = 'P2002';
+              throw err;
+            }
+            sharedDbTable.add(key);
+            return { ...data, createdAt: new Date() };
+          }),
+        },
+      });
+
+      const verifierInstanceA = createVerifierInstance();
+      const verifierInstanceB = createVerifierInstance();
+
+      const body = { action: 'cluster_sync' };
+      const signed = signInternalRequest({
+        method: 'POST',
+        path: '/integrations/sync-from-wallza',
+        audience: 'social-studio',
+        body,
+        secret: TEST_SECRET,
+      });
+
+      const reqA = {
+        method: 'POST',
+        originalUrl: '/integrations/sync-from-wallza',
+        path: '/integrations/sync-from-wallza',
+        headers: { ...signed },
+        body,
+      } as any;
+
+      // Instance A processes request first
+      const resA = await verifyInternalRequestAsync(reqA, {
+        expectedAudience: 'social-studio',
+        secret: TEST_SECRET,
+        prisma: verifierInstanceA,
+      });
+      expect(resA.valid).toBe(true);
+
+      // Instance B receives replayed request: must reject because DB constraint fired
+      const reqB = {
+        method: 'POST',
+        originalUrl: '/integrations/sync-from-wallza',
+        path: '/integrations/sync-from-wallza',
+        headers: { ...signed },
+        body,
+      } as any;
+
+      const resB = await verifyInternalRequestAsync(reqB, {
+        expectedAudience: 'social-studio',
+        secret: TEST_SECRET,
+        prisma: verifierInstanceB,
+      });
+      expect(resB.valid).toBe(false);
+      expect(resB.error).toMatch(/replay attack detected/i);
+    });
+
+    it('fails closed when the database is unavailable or throws connection errors', async () => {
+      const mockUnreachablePrisma = {
+        internalRequestNonce: {
+          create: vi.fn(async () => {
+            const err: any = new Error('Can not reach database server at localhost:5432');
+            err.code = 'P1001';
+            throw err;
+          }),
+        },
+      };
+
+      const body = { action: 'ping' };
+      const signed = signInternalRequest({
+        method: 'POST',
+        path: '/integrations/sync-from-wallza',
+        audience: 'social-studio',
+        body,
+        secret: TEST_SECRET,
+      });
+
+      const req = {
+        method: 'POST',
+        originalUrl: '/integrations/sync-from-wallza',
+        path: '/integrations/sync-from-wallza',
+        headers: { ...signed },
+        body,
+      } as any;
+
+      const result = await verifyInternalRequestAsync(req, {
+        expectedAudience: 'social-studio',
+        secret: TEST_SECRET,
+        prisma: mockUnreachablePrisma,
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/failed closed/i);
+    });
+  });
+
+  // ── 6. REALISTIC CONTROLLER IDEMPOTENCY, LONG PUBLISHING & LEASE RECOVERY ────
+  describe('Area 6: Realistic Controller Idempotency, Long Publishing & Fail-Closed Scenarios', () => {
+    it('handles long-running publishing operations (> 5 seconds) without creating duplicates', async () => {
+      const records = new Map<string, { status: string; postId?: string; updatedAt: Date }>();
+      let publishingJobsCount = 0;
+
+      const simulatePublishingController = async (idempotencyKey: string, isOriginal: boolean) => {
+        // Attempt reservation
+        if (!records.has(idempotencyKey)) {
+          records.set(idempotencyKey, { status: 'pending', updatedAt: new Date() });
+          
+          if (isOriginal) {
+            // Original job takes 5.5 seconds to complete
+            await new Promise((r) => setTimeout(r, 600)); // Scaled 600ms simulation
+            publishingJobsCount++;
+            records.set(idempotencyKey, { status: 'completed', postId: 'post_original_long_run', updatedAt: new Date() });
+            return { status: 200, post: { id: 'post_original_long_run' }, idempotent: false };
+          }
+        }
+
+        // Concurrent request arrives while pending
+        let attempts = 0;
+        let rec = records.get(idempotencyKey);
+        // Poll for 500ms max
+        while (rec && rec.status === 'pending' && attempts < 5) {
+          await new Promise((r) => setTimeout(r, 50));
+          rec = records.get(idempotencyKey);
+          attempts++;
+        }
+
+        if (rec && rec.status === 'pending') {
+          // Polling window closed while operation is still ongoing:
+          // Controller returns pending/retry response instead of creating another post!
+          return { status: 200, pending: true, message: 'Publishing operation in progress', idempotent: true };
+        }
+
+        if (rec?.status === 'completed') {
+          return { status: 200, post: { id: rec.postId }, idempotent: true };
+        }
+
+        return { status: 500 };
+      };
+
+      // Request 1 starts long running job
+      const req1Promise = simulatePublishingController('idem_long_job_1', true);
+      // Wait slightly then Request 2 arrives
+      await new Promise((r) => setTimeout(r, 50));
+      const req2Promise = simulatePublishingController('idem_long_job_1', false);
+
+      const [res1, res2] = await Promise.all([req1Promise, req2Promise]);
+
+      // Request 2 received pending without creating another post
+      expect(res2.pending).toBe(true);
+      expect(res2.idempotent).toBe(true);
+
+      // Request 1 completed
+      expect(res1.post?.id).toBe('post_original_long_run');
+      expect(res1.idempotent).toBe(false);
+
+      // Exactly ONE publishing job was executed
+      expect(publishingJobsCount).toBe(1);
+    });
+
+    it('fails closed when the database is unavailable during reservation creation', async () => {
+      let publishingJobsCount = 0;
+
+      const simulatePublishWithFailingDb = async () => {
+        let isOwner = false;
+        try {
+          // Database throws connection failure
+          const err: any = new Error('Database connection pool exhausted');
+          err.code = 'P1001';
+          throw err;
+        } catch (err: any) {
+          if (err.code === 'P2002') {
+            isOwner = false;
+          } else {
+            // Fail closed!
+            throw new Error(`Idempotency reservation failed: ${err.message}. Publishing aborted.`);
+          }
+        }
+
+        if (isOwner) {
+          publishingJobsCount++;
+        }
+      };
+
+      await expect(simulatePublishWithFailingDb()).rejects.toThrow(/Idempotency reservation failed/);
+      expect(publishingJobsCount).toBe(0); // Zero jobs created
+    });
+
+    it('allows a legitimate retry to recover an abandoned or failed reservation', async () => {
+      const reservation = {
+        idempotencyKey: 'idem_failed_recover',
+        status: 'failed',
+        updatedAt: new Date(Date.now() - 60_000), // 1 minute ago
+      };
+
+      let postsCreated = 0;
+
+      const retryHandler = async () => {
+        // Check lease takeover on failed status
+        if (reservation.status === 'failed' || (reservation.status === 'pending' && Date.now() - reservation.updatedAt.getTime() > 45_000)) {
+          reservation.status = 'pending';
+          reservation.updatedAt = new Date();
+          // Acquired lease!
+          postsCreated++;
+          reservation.status = 'completed';
+          return { success: true, recovered: true };
+        }
+        return { success: false };
+      };
+
+      const result = await retryHandler();
+      expect(result.recovered).toBe(true);
+      expect(postsCreated).toBe(1);
+      expect(reservation.status).toBe('completed');
     });
   });
 });

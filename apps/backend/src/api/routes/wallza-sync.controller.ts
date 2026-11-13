@@ -310,10 +310,14 @@ export class WallzaSyncController {
       throw new HttpException('Missing organizationId', HttpStatus.BAD_REQUEST);
     }
 
-    // 1. Comprehensive SSRF, media format & content validation (Requirement 6 & 11)
+    // 1. Comprehensive SSRF, media format & content validation with real redirect checking
     const isProduction = process.env.NODE_ENV === 'production';
     for (const url of mediaUrls) {
-      await validateMediaUrlComprehensive(url, { isProduction, checkHead: false });
+      await validateMediaUrlComprehensive(url, {
+        isProduction,
+        checkHead: true,
+        timeoutMs: 5000,
+      });
     }
     validatePostContent(caption, mediaUrls, platforms);
     validateScheduleParameters(type, scheduledAt);
@@ -360,33 +364,65 @@ export class WallzaSyncController {
       }
     }
 
-    // 3. Atomic Database-Backed Idempotency Reservation (Requirement 5 & 12)
-    const trackingKey = idempotencyKey || wallzaPostId;
-    let idempotencyRecord: any = null;
+    // 3. Atomic Database-Backed Idempotency Reservation (Fail-Closed)
+    const trackingKey = (idempotencyKey || wallzaPostId || '').trim();
+    if (!trackingKey) {
+      throw new HttpException(
+        'Missing required idempotencyKey for publishing request. All internal publishing must be idempotent.',
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
     let isReservationOwner = false;
-
-    if (trackingKey) {
-      try {
-        idempotencyRecord = await this._prisma.publishingIdempotency.create({
-          data: {
-            organizationId: org.id,
-            idempotencyKey: trackingKey,
-            status: 'pending',
-          },
-        });
-        isReservationOwner = true;
-      } catch (err: any) {
-        if (err?.code === 'P2002') {
-          // Key already exists! Another concurrent request or retry arrived first.
-          isReservationOwner = false;
-        } else {
-          // If table doesn't exist yet, proceed with soft releaseId check
-          isReservationOwner = true;
-        }
+    try {
+      await this._prisma.publishingIdempotency.create({
+        data: {
+          organizationId: org.id,
+          idempotencyKey: trackingKey,
+          status: 'pending',
+        },
+      });
+      isReservationOwner = true;
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        // Unique violation: another request created the record first.
+        isReservationOwner = false;
+      } else {
+        // Database connection error, missing table, or DB unavailable: FAIL CLOSED!
+        throw new HttpException(
+          `Idempotency reservation failed: ${err.message || 'Database unavailable'}. Publishing aborted to prevent duplicate execution.`,
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
       }
+    }
 
-      if (!isReservationOwner) {
-        // Poll for completion of the first request (up to 4.5 seconds)
+    if (!isReservationOwner) {
+      // Lease and recovery mechanism:
+      // If reservation is 'failed' OR abandoned 'pending' with updatedAt older than 45 seconds,
+      // allow this retry to take over the lease atomically.
+      const LEASE_ABANDON_MS = 45_000;
+      const expiredBefore = new Date(Date.now() - LEASE_ABANDON_MS);
+
+      const takeover = await this._prisma.publishingIdempotency.updateMany({
+        where: {
+          organizationId: org.id,
+          idempotencyKey: trackingKey,
+          OR: [
+            { status: 'failed' },
+            { status: 'pending', updatedAt: { lt: expiredBefore } },
+          ],
+        },
+        data: {
+          status: 'pending',
+          updatedAt: new Date(),
+        },
+      });
+
+      if (takeover.count > 0) {
+        // Ownership recovered safely!
+        isReservationOwner = true;
+      } else {
+        // Another request actively owns the reservation. Poll for completion up to 5 seconds (10 * 500ms).
         let attempts = 0;
         let existingRecord = await this._prisma.publishingIdempotency.findUnique({
           where: {
@@ -397,8 +433,8 @@ export class WallzaSyncController {
           },
         });
 
-        while (existingRecord && existingRecord.status === 'pending' && attempts < 15) {
-          await new Promise((r) => setTimeout(r, 300));
+        while (existingRecord && existingRecord.status === 'pending' && attempts < 10) {
+          await new Promise((r) => setTimeout(r, 500));
           existingRecord = await this._prisma.publishingIdempotency.findUnique({
             where: {
               organizationId_idempotencyKey: {
@@ -410,7 +446,7 @@ export class WallzaSyncController {
           attempts++;
         }
 
-        if (existingRecord?.postId) {
+        if (existingRecord?.status === 'completed' && existingRecord?.postId) {
           const existingPost = await this._prisma.post.findUnique({
             where: { id: existingRecord.postId },
           });
@@ -429,15 +465,14 @@ export class WallzaSyncController {
           }
         }
 
-        // Check fallback post by releaseId
-        const existingPost = await this._prisma.post.findFirst({
+        const fallbackPost = await this._prisma.post.findFirst({
           where: { organizationId: org.id, releaseId: trackingKey, deletedAt: null },
         });
-        if (existingPost) {
+        if (fallbackPost) {
           return {
             success: true,
             message: 'Post already dispatched/scheduled (atomic idempotent replay)',
-            post: existingPost,
+            post: fallbackPost,
             channels: targetIntegrations.map((i) => ({
               id: i.id,
               name: i.name,
@@ -446,6 +481,31 @@ export class WallzaSyncController {
             idempotent: true,
           };
         }
+
+        // When another request owns a pending reservation, DO NOT create another post!
+        // Return a pending/retry response safely.
+        if (existingRecord?.status === 'pending') {
+          return {
+            success: true,
+            pending: true,
+            message: 'Publishing operation is currently in progress by another request. Please retry shortly.',
+            idempotent: true,
+          };
+        }
+
+        if (existingRecord?.status === 'failed') {
+          throw new HttpException(
+            `Previous publishing attempt failed: ${existingRecord.response || 'Unknown error'}. Please retry to recover.`,
+            HttpStatus.BAD_GATEWAY
+          );
+        }
+
+        return {
+          success: true,
+          pending: true,
+          message: 'Publishing operation in progress. Please retry shortly.',
+          idempotent: true,
+        };
       }
     }
 
@@ -471,12 +531,16 @@ export class WallzaSyncController {
       const createdId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
 
       if (createdId) {
-        await this._prisma.post.update({
-          where: { id: createdId },
-          data: { releaseId: trackingKey },
-        }).catch(() => {});
+        try {
+          await this._prisma.post.update({
+            where: { id: createdId },
+            data: { releaseId: trackingKey },
+          });
+        } catch (updateErr: any) {
+          console.error('[WallzaSync] Error tagging post releaseId:', updateErr);
+        }
 
-        if (trackingKey && isReservationOwner) {
+        try {
           await this._prisma.publishingIdempotency.update({
             where: {
               organizationId_idempotencyKey: {
@@ -488,7 +552,13 @@ export class WallzaSyncController {
               postId: createdId,
               status: 'completed',
             },
-          }).catch(() => {});
+          });
+        } catch (idempErr: any) {
+          console.error('[WallzaSync] CRITICAL: Failed to update publishing idempotency status:', idempErr);
+          throw new HttpException(
+            `Post was created (${createdId}) but idempotency record could not be completed: ${idempErr.message}`,
+            HttpStatus.INTERNAL_SERVER_ERROR
+          );
         }
       }
 
@@ -505,18 +575,22 @@ export class WallzaSyncController {
       };
     } catch (err: any) {
       if (trackingKey && isReservationOwner) {
-        await this._prisma.publishingIdempotency.update({
-          where: {
-            organizationId_idempotencyKey: {
-              organizationId: org.id,
-              idempotencyKey: trackingKey,
+        try {
+          await this._prisma.publishingIdempotency.update({
+            where: {
+              organizationId_idempotencyKey: {
+                organizationId: org.id,
+                idempotencyKey: trackingKey,
+              },
             },
-          },
-          data: {
-            status: 'failed',
-            response: err.message,
-          },
-        }).catch(() => {});
+            data: {
+              status: 'failed',
+              response: err.message || 'Dispatch failure',
+            },
+          });
+        } catch (failErr: any) {
+          console.error('[WallzaSync] Error marking idempotency record as failed:', failErr);
+        }
       }
       throw new HttpException(
         err.message || 'Failed to dispatch post through publishing service',

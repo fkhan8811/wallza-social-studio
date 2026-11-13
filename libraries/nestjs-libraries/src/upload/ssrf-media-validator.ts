@@ -1,4 +1,6 @@
 import dns from 'dns';
+import http from 'http';
+import https from 'https';
 import { HttpException, HttpStatus } from '@nestjs/common';
 import ipaddr from 'ipaddr.js';
 
@@ -84,7 +86,83 @@ export function isPrivateOrReservedIp(ipStr: string): boolean {
 }
 
 /**
- * Validates a media URL against SSRF vulnerabilities, DNS rebinding, and invalid formats.
+ * Custom DNS lookup function that validates all resolved IP addresses at socket
+ * creation time, strictly preventing DNS rebinding attacks.
+ */
+export function ssrfSafeLookup(
+  hostname: string,
+  options: any,
+  callback: (err: Error | null, address?: any, family?: number) => void
+): void {
+  dns.lookup(hostname, { all: true }, (err, addresses) => {
+    if (err) return callback(err);
+    if (!addresses || addresses.length === 0) {
+      return callback(new Error(`No DNS records found for host '${hostname}'`));
+    }
+    for (const record of addresses) {
+      if (isPrivateOrReservedIp(record.address)) {
+        return callback(
+          new Error(`Blocked SSRF target: '${hostname}' resolves to prohibited internal address ${record.address}`)
+        );
+      }
+    }
+    if (options && options.all) {
+      return callback(null, addresses);
+    }
+    return callback(null, addresses[0].address, addresses[0].family);
+  });
+}
+
+/**
+ * Performs a HEAD request using Node's native HTTP/HTTPS client with socket-level
+ * IP pinning / safe lookup to prevent DNS rebinding.
+ */
+export async function performSsrfSafeHead(
+  urlStr: string,
+  timeoutMs: number = 5000
+): Promise<{ status: number; headers: Record<string, string> }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(urlStr);
+    const isHttps = parsed.protocol === 'https:';
+    const lib = isHttps ? https : http;
+
+    const timer = setTimeout(() => {
+      req.destroy(new Error(`Media verification timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    const req = lib.request(
+      parsed,
+      {
+        method: 'HEAD',
+        lookup: ssrfSafeLookup,
+        headers: {
+          'User-Agent': 'WallzaOS-Media-Validator/1.0',
+        },
+      },
+      (res) => {
+        clearTimeout(timer);
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (typeof v === 'string') headers[k.toLowerCase()] = v;
+          else if (Array.isArray(v)) headers[k.toLowerCase()] = v.join(', ');
+        }
+        res.resume();
+        resolve({ status: res.statusCode || 0, headers });
+      }
+    );
+
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    req.end();
+  });
+}
+
+/**
+ * Validates a media URL against SSRF vulnerabilities, DNS rebinding, redirect chains,
+ * and unsupported media types.
  */
 export async function validateMediaUrlComprehensive(
   urlStr: string,
@@ -134,7 +212,7 @@ export async function validateMediaUrlComprehensive(
           );
         }
       } else {
-        // Resolve DNS
+        // Resolve DNS pre-check
         let addresses: dns.LookupAddress[] = [];
         try {
           addresses = await dns.promises.lookup(hostname, { all: true });
@@ -175,30 +253,35 @@ export async function validateMediaUrlComprehensive(
       );
     }
 
-    // 5. Optional HEAD check to verify Content-Type and detect redirect-based SSRF
-    if (options.checkHead && isProd) {
+    // 5. Real HEAD check to verify Content-Type, follow & validate redirects, and prevent DNS rebinding
+    if (options.checkHead) {
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 5000);
-
-        const headRes = await fetch(currentUrl, {
-          method: 'HEAD',
-          redirect: 'manual', // Manual handling to inspect each redirect hop
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
+        const headRes = await performSsrfSafeHead(currentUrl, options.timeoutMs ?? 5000);
 
         if ([301, 302, 303, 307, 308].includes(headRes.status)) {
-          const location = headRes.headers.get('location');
+          const location = headRes.headers['location'];
           if (!location) {
             throw new HttpException('Redirect response missing Location header', HttpStatus.BAD_REQUEST);
           }
           currentUrl = new URL(location, currentUrl).toString();
           redirectCount++;
-          continue; // Loop back and validate redirect target!
+          if (redirectCount > maxRedirects) {
+            throw new HttpException(
+              `Too many redirects while verifying media URL (maximum ${maxRedirects} permitted)`,
+              HttpStatus.BAD_REQUEST
+            );
+          }
+          continue; // Loop back and re-validate entire redirect destination!
         }
 
-        const contentType = (headRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        if (headRes.status >= 400) {
+          throw new HttpException(
+            `Media target URL is unreachable or returned HTTP status ${headRes.status}`,
+            HttpStatus.BAD_REQUEST
+          );
+        }
+
+        const contentType = (headRes.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
         if (contentType && !ALLOWED_MEDIA_CONTENT_TYPES.has(contentType) && contentType !== 'application/octet-stream') {
           throw new HttpException(
             `Unsupported media Content-Type: ${contentType}. Must be image or video.`,
