@@ -8,6 +8,19 @@ import { LoadingComponent } from '@gitroom/frontend/components/layout/loading';
 interface ScheduleSlot {
   dayOfWeek: number;
   time: string;
+  integrations?: string[];
+}
+
+interface ConnectedIntegration {
+  id: string;
+  name: string;
+  originalName?: string;
+  identifier: string;
+  disabled: boolean;
+}
+
+interface IntegrationResponse {
+  integrations: ConnectedIntegration[];
 }
 
 interface PublishingQueue {
@@ -79,6 +92,35 @@ export const AutomationComponent: FC = () => {
       return res.json();
     }
   );
+
+  const { data: integrationData } = useSWR<IntegrationResponse>(
+    '/integrations/list',
+    async (url) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Could not load connected social accounts.');
+      return res.json();
+    }
+  );
+  const availableIntegrations = (integrationData?.integrations || []).filter((item) => !item.disabled);
+
+  const updateQueueSlot = (slotIndex: number, changes: Partial<ScheduleSlot>) => {
+    setQueueSlots((current) =>
+      current.map((slot, index) => (index === slotIndex ? { ...slot, ...changes } : slot))
+    );
+  };
+
+  const toggleQueueSlotIntegration = (slotIndex: number, integrationId: string, checked: boolean) => {
+    setQueueSlots((current) =>
+      current.map((slot, index) => {
+        if (index !== slotIndex) return slot;
+        const existing = slot.integrations || [];
+        const integrations = checked
+          ? [...new Set([...existing, integrationId])]
+          : existing.filter((id) => id !== integrationId);
+        return { ...slot, integrations: integrations.length ? integrations : undefined };
+      })
+    );
+  };
 
   const handleCreateQueue = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -389,7 +431,7 @@ export const AutomationComponent: FC = () => {
       {/* Modal: Create Queue */}
       {isQueueModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="w-full max-w-md bg-card rounded-2xl border border-border p-6 shadow-2xl space-y-4">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto bg-card rounded-2xl border border-border p-6 shadow-2xl space-y-4">
             <h3 className="text-lg font-bold text-white">Create Publishing Queue</h3>
             <form onSubmit={handleCreateQueue} className="space-y-4">
               <div>
@@ -412,13 +454,78 @@ export const AutomationComponent: FC = () => {
                   className="w-full px-3 py-2 rounded-xl bg-background border border-border text-sm text-white focus:outline-none focus:border-indigo-500"
                 >
                   <option value="UTC">UTC (Coordinated Universal Time)</option>
-                  <option value="America/New_York">America/New_York (EST)</option>
-                  <option value="America/Los_Angeles">America/Los_Angeles (PST)</option>
-                  <option value="Europe/London">Europe/London (GMT)</option>
-                  <option value="Europe/Paris">Europe/Paris (CET)</option>
-                  <option value="Asia/Dubai">Asia/Dubai (GST)</option>
+                  <option value="America/New_York">America/New_York</option>
+                  <option value="America/Los_Angeles">America/Los_Angeles</option>
+                  <option value="Europe/London">Europe/London</option>
+                  <option value="Europe/Paris">Europe/Paris</option>
+                  <option value="Asia/Dubai">Asia/Dubai</option>
                   <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
                 </select>
+              </div>
+
+              <div className="space-y-3 rounded-xl border border-border/60 bg-background/50 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h4 className="text-xs font-bold text-white">Weekly posting slots</h4>
+                    <p className="text-[10px] text-muted-foreground">Choose days, local times and optional accounts for each slot.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setQueueSlots((current) => [...current, { dayOfWeek: 1, time: '09:00' }])}
+                    className="rounded-lg border border-indigo-500/40 px-2.5 py-1.5 text-[10px] font-semibold text-indigo-300 hover:bg-indigo-500/10"
+                  >
+                    + Add slot
+                  </button>
+                </div>
+
+                {queueSlots.map((slot, index) => (
+                  <div key={index} className="space-y-2 rounded-lg border border-border/50 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={slot.dayOfWeek}
+                        onChange={(e) => updateQueueSlot(index, { dayOfWeek: Number(e.target.value) })}
+                        className="min-w-[110px] flex-1 rounded-lg border border-border bg-card px-2 py-2 text-xs text-white"
+                        aria-label={`Slot ${index + 1} day`}
+                      >
+                        {DAYS_OF_WEEK.map((day, dayIndex) => <option key={dayIndex} value={dayIndex}>{day}</option>)}
+                      </select>
+                      <input
+                        type="time"
+                        value={slot.time}
+                        onChange={(e) => updateQueueSlot(index, { time: e.target.value })}
+                        className="rounded-lg border border-border bg-card px-2 py-2 text-xs text-white"
+                        aria-label={`Slot ${index + 1} time`}
+                      />
+                      <button
+                        type="button"
+                        disabled={queueSlots.length <= 1}
+                        onClick={() => setQueueSlots((current) => current.filter((_, slotIndex) => slotIndex !== index))}
+                        className="rounded-lg border border-red-500/30 px-2.5 py-2 text-[10px] text-red-300 disabled:opacity-30"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <div>
+                      <p className="mb-1.5 text-[10px] font-semibold text-muted-foreground">Apply to accounts (empty = all accounts)</p>
+                      {availableIntegrations.length ? (
+                        <div className="flex flex-wrap gap-x-3 gap-y-1.5">
+                          {availableIntegrations.map((integration) => (
+                            <label key={integration.id} className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                              <input
+                                type="checkbox"
+                                checked={(slot.integrations || []).includes(integration.id)}
+                                onChange={(e) => toggleQueueSlotIntegration(index, integration.id, e.target.checked)}
+                              />
+                              {integration.name || integration.originalName || integration.identifier}
+                            </label>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-amber-300">Connect social accounts first to configure account-specific slots.</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-border/40">
