@@ -355,7 +355,10 @@ export class ReviewsController {
       await tx.post.updateMany({
         where: { group: review.postGroup, organizationId: org.id },
         data: {
+          requiresApproval: true,
           approvalStatus: 'pending',
+          approvedById: null,
+          approvedAt: null,
         },
       });
 
@@ -496,6 +499,13 @@ export class PublicReviewsController {
           where: { group: review.postGroup, organizationId: review.organizationId },
           data: {
             approvalStatus: 'changes_requested',
+          },
+        });
+      } else if (decision === 'rejected') {
+        await tx.post.updateMany({
+          where: { group: review.postGroup, organizationId: review.organizationId },
+          data: {
+            approvalStatus: 'rejected',
           },
         });
       }

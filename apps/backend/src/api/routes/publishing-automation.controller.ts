@@ -155,7 +155,12 @@ export class PublishingAutomationController {
     }
   }
 
-  private async findNextAvailableSlot(organizationId: string, queue: any, integrationId?: string) {
+  private async findNextAvailableSlot(
+    organizationId: string,
+    queue: any,
+    integrationId?: string,
+    allocatedInBatch: Date[] = []
+  ) {
     const timeZone = queue.timezone || 'UTC';
     if (!isValidTimeZone(timeZone)) {
       throw new BadRequestException('Queue timezone must be a valid IANA timezone.');
@@ -175,7 +180,7 @@ export class PublishingAutomationController {
       Promise.resolve(zonedParts(now, timeZone)),
     ]);
 
-    if (queue.capacityLimit && pendingCount >= queue.capacityLimit) {
+    if (queue.capacityLimit && (pendingCount + allocatedInBatch.length) >= queue.capacityLimit) {
       throw new BadRequestException('This publishing queue has reached its pending-post capacity.');
     }
 
@@ -183,6 +188,8 @@ export class PublishingAutomationController {
       ? queue.scheduleSlots
       : DEFAULT_SCHEDULE_SLOTS;
     if (!slots.length) return new Date(now.getTime() + 60 * 60 * 1000);
+
+    const spacingMs = Math.max(0, Number(queue.minSpacingMinutes) || 30) * 60 * 1000;
 
     // Advance through local calendar dates, not UTC dates, so weekday slots
     // and daylight-saving changes follow the queue's configured timezone.
@@ -214,7 +221,12 @@ export class PublishingAutomationController {
         );
         if (!target || target <= now) continue;
 
-        const spacingMs = Math.max(0, Number(queue.minSpacingMinutes) || 30) * 60 * 1000;
+        // Check collision against in-progress slots within the current batch
+        const batchCollision = allocatedInBatch.some(
+          (batchSlot) => Math.abs(batchSlot.getTime() - target.getTime()) <= spacingMs
+        );
+        if (batchCollision) continue;
+
         const where: any = {
           organizationId,
           queueId: queue.id,
@@ -545,9 +557,12 @@ export class PublishingAutomationController {
     @Body() body: { postIds?: string[] }
   ) {
     const queue = await (this.prisma as any).publishingQueue.findFirst({
-      where: { id, organizationId: org.id, isActive: true },
+      where: { id, organizationId: org.id },
     });
-    if (!queue) throw new NotFoundException('Active publishing queue not found.');
+    if (!queue) throw new NotFoundException('Publishing queue not found.');
+    if (!queue.isActive) {
+      throw new BadRequestException('This publishing queue is paused. Please resume the queue before enqueuing posts.');
+    }
 
     const ids = Array.isArray(body.postIds)
       ? [...new Set(body.postIds.filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim()))]
@@ -558,37 +573,90 @@ export class PublishingAutomationController {
 
     const posts = await this.prisma.post.findMany({
       where: { organizationId: org.id, id: { in: ids }, state: 'DRAFT', deletedAt: null },
-      select: { id: true, integrationId: true },
+      select: { id: true, integrationId: true, publishDate: true, state: true, queueId: true },
     });
     if (posts.length !== ids.length) {
       throw new BadRequestException('One or more selected posts are not active drafts in this organization.');
     }
 
+    // Capacity validation upfront before modifying any records
+    const now = new Date();
+    const currentPending = await this.prisma.post.count({
+      where: {
+        organizationId: org.id,
+        queueId: queue.id,
+        state: 'QUEUE',
+        deletedAt: null,
+        publishDate: { gte: now },
+      },
+    });
+
+    if (queue.capacityLimit && (currentPending + posts.length) > queue.capacityLimit) {
+      throw new BadRequestException(
+        `Adding ${posts.length} posts would exceed queue capacity (${currentPending}/${queue.capacityLimit} queued).`
+      );
+    }
+
+    // Snapshot exact prior state of each post to guarantee non-destructive restoration on error
+    const snapshots = new Map<string, { state: string; publishDate: Date; queueId: string | null }>();
+    posts.forEach((p) => {
+      snapshots.set(p.id, {
+        state: p.state,
+        publishDate: p.publishDate,
+        queueId: p.queueId,
+      });
+    });
+
+    // Pre-calculate collision-free distinct slots for all posts in the batch
+    const plannedAssignments: Array<{ post: typeof posts[0]; slot: Date }> = [];
+    const allocatedInBatch: Date[] = [];
+
+    for (const post of posts) {
+      const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId, allocatedInBatch);
+      plannedAssignments.push({ post, slot: nextSlot });
+      allocatedInBatch.push(nextSlot);
+    }
+
+    // Apply scheduling operations sequentially
     const scheduled: Array<{ postId: string; publishDate: string }> = [];
-    const rollbackLog: string[] = [];
+    const modifiedPostIds: string[] = [];
 
     try {
-      for (const post of posts) {
-        const nextSlot = await this.findNextAvailableSlot(org.id, queue, post.integrationId);
+      for (const { post, slot } of plannedAssignments) {
         const assigned = await this.prisma.post.updateMany({
           where: { id: post.id, organizationId: org.id, state: 'DRAFT', deletedAt: null },
           data: { queueId: queue.id },
         });
         if (assigned.count !== 1) {
-          throw new BadRequestException('A selected draft changed before it could be queued. Refresh and try again.');
+          throw new BadRequestException('A selected draft changed state concurrently before it could be queued.');
         }
+        modifiedPostIds.push(post.id);
 
-        await this.postsService.changeDate(org.id, post.id, nextSlot.toISOString(), 'schedule');
-        rollbackLog.push(post.id);
-        scheduled.push({ postId: post.id, publishDate: nextSlot.toISOString() });
+        await this.postsService.changeDate(org.id, post.id, slot.toISOString(), 'schedule');
+        scheduled.push({ postId: post.id, publishDate: slot.toISOString() });
       }
     } catch (error) {
-      // Transactional rollback: revert any posts updated in this batch
-      if (rollbackLog.length > 0) {
-        await this.prisma.post.updateMany({
-          where: { id: { in: rollbackLog }, organizationId: org.id },
-          data: { queueId: null, state: 'DRAFT' },
-        });
+      // Revert each modified post to its EXACT original snapshot
+      for (const postId of modifiedPostIds) {
+        const snap = snapshots.get(postId);
+        if (snap) {
+          try {
+            if (snap.publishDate) {
+              await this.postsService.changeDate(
+                org.id,
+                postId,
+                snap.publishDate.toISOString(),
+                snap.state === 'QUEUE' ? 'schedule' : 'update'
+              );
+            }
+            await this.prisma.post.update({
+              where: { id: postId },
+              data: { queueId: snap.queueId, state: snap.state as any },
+            });
+          } catch {
+            // best-effort restoration
+          }
+        }
       }
       throw error;
     }

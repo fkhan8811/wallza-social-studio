@@ -170,7 +170,49 @@ export class CopilotController {
     };
   }
 
-  // ── DETERMINISTIC AI & MCP WORKFLOW OPERATIONS ─────────────────────────────
+  // ── GENUINE AI & MCP WORKFLOW OPERATIONS ─────────────────────────────────
+
+  private async callAiEngine(messages: any[], maxTokens = 1200): Promise<{ content: string; provider: string; model: string } | null> {
+    const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY;
+    if (!apiKey) return null;
+
+    const isRouter = !!process.env.OPENROUTER_API_KEY;
+    const url = isRouter
+      ? 'https://openrouter.ai/api/v1/chat/completions'
+      : 'https://api.openai.com/v1/chat/completions';
+    const model = isRouter
+      ? (process.env.AI_MODEL || 'meta-llama/llama-3-8b-instruct')
+      : 'gpt-4o-mini';
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          ...(isRouter ? { 'HTTP-Referer': 'https://app.wallza.in', 'X-Title': 'Wallza Social Studio' } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens: maxTokens,
+          temperature: 0.7,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (!res.ok) return null;
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      return content ? { content, provider: isRouter ? 'openrouter' : 'openai', model } : null;
+    } catch {
+      clearTimeout(timeout);
+      return null;
+    }
+  }
 
   @Post('/operations/generate-ideas')
   async generateIdeas(
@@ -192,60 +234,115 @@ export class CopilotController {
       ? body.platforms
       : ['linkedin', 'x', 'instagram'];
 
-    const ideas = [];
-    const templates = [
-      {
-        angle: 'Tactical Breakdown',
-        title: `How to master ${body.topic} in 5 steps`,
-        desc: `Actionable framework for teams scaling ${body.topic}. Focus on common pitfalls, real metrics, and immediate wins.`,
-        tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'productivity', 'tactics'],
-      },
-      {
-        angle: 'Contrarian Perspective',
-        title: `Why everyone is wrong about ${body.topic}`,
-        desc: `Debunking standard industry assumptions regarding ${body.topic}. What the data actually proves and why conventional wisdom fails.`,
-        tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'hot-take', 'insights'],
-      },
-      {
-        angle: 'Case Study & Results',
-        title: `What happened when we completely revamped ${body.topic}`,
-        desc: `Behind-the-scenes metrics, before/after numbers, and key takeaways from optimizing ${body.topic}.`,
-        tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'casestudy', 'growth'],
-      },
-      {
-        angle: 'Curated Resource Kit',
-        title: `The ultimate checklist for ${body.topic}`,
-        desc: `Comprehensive swipe-file and operational checklist for anyone executing ${body.topic} this quarter.`,
-        tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'cheatsheet', 'resources'],
-      },
-      {
-        angle: 'Future Trends & Predictions',
-        title: `The future of ${body.topic} over the next 18 months`,
-        desc: `Emerging trends, technology shifts, and strategic positioning to stay ahead in ${body.topic}.`,
-        tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'trends', 'future'],
-      },
-    ];
+    let generatedIdeas: Array<{
+      id: string;
+      title: string;
+      description: string;
+      angle: string;
+      platform: string;
+      tags: string[];
+    }> = [];
+    let source: 'ai' | 'fallback' = 'fallback';
+    let aiMeta: any = null;
 
-    for (let i = 0; i < count; i++) {
-      const template = templates[i % templates.length];
-      const platform = platforms[i % platforms.length];
-      ideas.push({
-        id: `idea_${randomUUID().slice(0, 8)}`,
-        title: `${template.title} [${platform.toUpperCase()}]`,
-        description: template.desc,
-        angle: template.angle,
-        platform,
-        tags: template.tags,
-      });
+    // 1. Attempt genuine AI generation via configured OpenRouter / OpenAI provider
+    const aiResult = await this.callAiEngine([
+      {
+        role: 'system',
+        content: `You are Wallza Social Studio's Senior Content Strategist. Generate exactly ${count} distinct, high-performing content angles for topic "${body.topic}" tailored across platforms: ${platforms.join(', ')}.
+Return ONLY valid JSON matching this schema:
+{"ideas": [{"title": "Short punchy headline", "description": "2-3 sentences with hook, value points, and CTA", "angle": "Tactical/Contrarian/Case Study/Framework", "platform": "x/linkedin/instagram", "tags": ["tag1", "tag2"]}]}`,
+      },
+      {
+        role: 'user',
+        content: `Generate ${count} ideas for topic: ${body.topic}`,
+      },
+    ]);
+
+    if (aiResult?.content) {
+      try {
+        const cleanedJson = aiResult.content
+          .replace(/```json/gi, '')
+          .replace(/```/g, '')
+          .trim();
+        const parsed = JSON.parse(cleanedJson);
+        if (Array.isArray(parsed?.ideas) && parsed.ideas.length > 0) {
+          generatedIdeas = parsed.ideas.slice(0, count).map((item: any) => ({
+            id: `idea_${randomUUID().slice(0, 8)}`,
+            title: String(item.title || body.topic).slice(0, 140),
+            description: String(item.description || '').slice(0, 500),
+            angle: String(item.angle || 'Strategic Angle'),
+            platform: String(item.platform || platforms[0]).toLowerCase(),
+            tags: Array.isArray(item.tags)
+              ? item.tags.map((t: string) => String(t).replace(/^#/, '').toLowerCase()).slice(0, 5)
+              : [body.topic.toLowerCase().replace(/\s+/g, '')],
+          }));
+          source = 'ai';
+          aiMeta = { provider: aiResult.provider, model: aiResult.model };
+        }
+      } catch {
+        // Fallback on JSON parse error
+      }
     }
 
+    // 2. Deterministic calibrated templates as robust offline fallback
+    if (generatedIdeas.length === 0) {
+      const templates = [
+        {
+          angle: 'Tactical Breakdown',
+          title: `How to master ${body.topic} in 5 steps`,
+          desc: `Actionable framework for teams scaling ${body.topic}. Focus on common pitfalls, real metrics, and immediate wins.`,
+          tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'productivity', 'tactics'],
+        },
+        {
+          angle: 'Contrarian Perspective',
+          title: `Why conventional wisdom fails around ${body.topic}`,
+          desc: `Debunking standard industry assumptions regarding ${body.topic}. What the data actually proves and why conventional wisdom fails.`,
+          tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'hot-take', 'insights'],
+        },
+        {
+          angle: 'Case Study & Results',
+          title: `What happened when we completely revamped ${body.topic}`,
+          desc: `Behind-the-scenes metrics, before/after numbers, and key takeaways from optimizing ${body.topic}.`,
+          tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'casestudy', 'growth'],
+        },
+        {
+          angle: 'Curated Resource Kit',
+          title: `The ultimate checklist for ${body.topic}`,
+          desc: `Comprehensive swipe-file and operational checklist for anyone executing ${body.topic} this quarter.`,
+          tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'cheatsheet', 'resources'],
+        },
+        {
+          angle: 'Future Trends & Predictions',
+          title: `The future of ${body.topic} over the next 18 months`,
+          desc: `Emerging trends, technology shifts, and strategic positioning to stay ahead in ${body.topic}.`,
+          tags: [body.topic.toLowerCase().replace(/\s+/g, ''), 'trends', 'future'],
+        },
+      ];
+
+      for (let i = 0; i < count; i++) {
+        const template = templates[i % templates.length];
+        const platform = platforms[i % platforms.length];
+        generatedIdeas.push({
+          id: `idea_${randomUUID().slice(0, 8)}`,
+          title: `${template.title} [${platform.toUpperCase()}]`,
+          description: template.desc,
+          angle: template.angle,
+          platform,
+          tags: template.tags,
+        });
+      }
+      source = 'fallback';
+    }
+
+    // 3. Optional persistence to ContentIdea pipeline
     if (body.autoSave) {
       const defaultStage = await (this._prisma as any).contentIdeaStage.findFirst({
         where: { organizationId: organization.id },
         orderBy: { position: 'asc' },
       });
       if (defaultStage) {
-        for (const idea of ideas) {
+        for (const idea of generatedIdeas) {
           await (this._prisma as any).contentIdea.create({
             data: {
               organizationId: organization.id,
@@ -260,9 +357,11 @@ export class CopilotController {
     }
 
     return {
+      source,
+      aiMeta: aiMeta || { note: 'Generated using calibrated content strategist templates (AI key not set or unreachable).' },
       topic: body.topic,
-      generatedCount: ideas.length,
-      ideas,
+      generatedCount: generatedIdeas.length,
+      ideas: generatedIdeas,
       savedToInbox: !!body.autoSave,
     };
   }
@@ -327,45 +426,133 @@ export class CopilotController {
       ? body.platforms
       : ['x', 'linkedin', 'instagram', 'facebook'];
 
-    const variants: Record<string, { content: string; characterCount: number; maxRecommended: number; note: string }> = {};
+    const platformLimits: Record<string, number> = {
+      x: 280,
+      twitter: 280,
+      bluesky: 300,
+      threads: 500,
+      instagram: 2200,
+      linkedin: 3000,
+      facebook: 5000,
+    };
 
-    for (const p of platforms) {
-      const lower = p.toLowerCase();
-      if (lower.includes('x') || lower.includes('twitter') || lower.includes('bluesky')) {
-        const truncated = cleanBase.length > 270 ? `${cleanBase.slice(0, 267)}...` : cleanBase;
-        variants[p] = {
-          content: truncated,
-          characterCount: truncated.length,
-          maxRecommended: 280,
-          note: 'Optimized for high-impact hook and scannability within short character limit.',
-        };
-      } else if (lower.includes('linkedin')) {
-        const linkedInFormatted = `${cleanBase}\n\nWhat are your thoughts on this?\n\n#Leadership #Innovation #Growth`;
-        variants[p] = {
-          content: linkedInFormatted,
-          characterCount: linkedInFormatted.length,
-          maxRecommended: 3000,
-          note: 'Formatted with professional pacing, conversational question, and thought leadership tags.',
-        };
-      } else if (lower.includes('instagram') || lower.includes('threads')) {
-        const instaFormatted = `${cleanBase}\n.\n.\n👉 Double tap if this helped.\n📌 Save for later reference.`;
-        variants[p] = {
-          content: instaFormatted,
-          characterCount: instaFormatted.length,
-          maxRecommended: 2200,
-          note: 'Visual caption layout with engagement CTA and clean line break spacing.',
-        };
-      } else {
-        variants[p] = {
-          content: cleanBase,
-          characterCount: cleanBase.length,
-          maxRecommended: 5000,
-          note: 'Full-length omnichannel post copy.',
-        };
+    let variants: Record<string, {
+      content: string;
+      characterCount: number;
+      maxRecommended: number;
+      isTruncated: boolean;
+      truncationReason?: string | null;
+      note: string;
+    }> = {};
+    let source: 'ai' | 'fallback' = 'fallback';
+
+    // 1. Attempt genuine AI variant generation
+    const aiResult = await this.callAiEngine([
+      {
+        role: 'system',
+        content: `You are an expert social media copywriter. Adapt the given base content for each platform respecting their native formatting conventions:
+- x / twitter: Under 270 chars, strong hook, bulleted takeaways, max 1 hashtag.
+- linkedin: Professional narrative, double spacing between thoughts, thought-provoking question, 3-5 tags.
+- instagram: Visual-first caption, structured emojis, CTA, followed by clean line-breaks and 5-8 relevant hashtags.
+- facebook: Engaging community-first storytelling with discussion question.
+- threads: Informal, conversational, authentic tone.
+
+Return ONLY valid JSON:
+{"variants": {"x": {"content": "...", "note": "..."}, "linkedin": {"content": "...", "note": "..."}, "instagram": {"content": "...", "note": "..."}, "facebook": {"content": "...", "note": "..."}}}`,
+      },
+      {
+        role: 'user',
+        content: `Base Content:\n${cleanBase}\n\nPlatforms: ${platforms.join(', ')}`,
+      },
+    ]);
+
+    if (aiResult?.content) {
+      try {
+        const cleanedJson = aiResult.content
+          .replace(/```json/gi, '')
+          .replace(/```/g, '')
+          .trim();
+        const parsed = JSON.parse(cleanedJson);
+        if (parsed?.variants && typeof parsed.variants === 'object') {
+          for (const p of platforms) {
+            const lower = p.toLowerCase();
+            const rawItem = parsed.variants[lower] || parsed.variants[p];
+            if (rawItem && typeof rawItem.content === 'string') {
+              const max = platformLimits[lower] || 3000;
+              const content = rawItem.content.trim();
+              const isTruncated = content.length > max;
+              const finalContent = isTruncated ? `${content.slice(0, max - 3)}...` : content;
+              variants[p] = {
+                content: finalContent,
+                characterCount: finalContent.length,
+                maxRecommended: max,
+                isTruncated,
+                truncationReason: isTruncated ? `Exceeded platform limit of ${max} characters.` : null,
+                note: rawItem.note || `Adapted with native ${p.toUpperCase()} formatting.`,
+              };
+            }
+          }
+          if (Object.keys(variants).length > 0) {
+            source = 'ai';
+          }
+        }
+      } catch {
+        // Fallback to rules on error
       }
     }
 
+    // 2. Fallback rule-based adapter when AI is unavailable
+    if (Object.keys(variants).length === 0) {
+      for (const p of platforms) {
+        const lower = p.toLowerCase();
+        const max = platformLimits[lower] || 3000;
+        if (lower.includes('x') || lower.includes('twitter') || lower.includes('bluesky')) {
+          const isTruncated = cleanBase.length > (max - 10);
+          const formatted = isTruncated ? `${cleanBase.slice(0, max - 13)}...` : cleanBase;
+          variants[p] = {
+            content: formatted,
+            characterCount: formatted.length,
+            maxRecommended: max,
+            isTruncated,
+            truncationReason: isTruncated ? `Content exceeded ${max} characters and was trimmed to retain hook.` : null,
+            note: 'Optimized for high-impact hook and scannability within short character limit.',
+          };
+        } else if (lower.includes('linkedin')) {
+          const linkedInFormatted = `${cleanBase}\n\nWhat are your thoughts on this?\n\n#Leadership #Innovation #Growth`;
+          variants[p] = {
+            content: linkedInFormatted,
+            characterCount: linkedInFormatted.length,
+            maxRecommended: max,
+            isTruncated: false,
+            truncationReason: null,
+            note: 'Formatted with professional pacing, conversational question, and thought leadership tags.',
+          };
+        } else if (lower.includes('instagram') || lower.includes('threads')) {
+          const instaFormatted = `${cleanBase}\n.\n.\n👉 Double tap if this helped.\n📌 Save for later reference.`;
+          variants[p] = {
+            content: instaFormatted,
+            characterCount: instaFormatted.length,
+            maxRecommended: max,
+            isTruncated: false,
+            truncationReason: null,
+            note: 'Visual caption layout with engagement CTA and clean line break spacing.',
+          };
+        } else {
+          variants[p] = {
+            content: cleanBase,
+            characterCount: cleanBase.length,
+            maxRecommended: max,
+            isTruncated: false,
+            truncationReason: null,
+            note: 'Full-length omnichannel post copy.',
+          };
+        }
+      }
+      source = 'fallback';
+    }
+
     return {
+      source,
       originalContent: cleanBase,
       variants,
     };

@@ -478,9 +478,10 @@ export class CreativeStudioController {
     });
     if (!project) throw new NotFoundException('Project not found.');
 
-    const format = (
-      body.exportFormat || (project.type === 'video' ? 'mp4' : 'png')
+    const requestedFormat = (
+      body.exportFormat || (project.type === 'video' ? 'webm' : 'png')
     ).toLowerCase();
+    let actualFormat = requestedFormat;
     const storage = UploadFactory.createStorage();
     let uploadedPublicUrl: string;
 
@@ -526,12 +527,12 @@ export class CreativeStudioController {
         }).composite([{ input: svgOverlay, blend: 'over' }]);
 
         const renderedBuffer =
-          format === 'jpeg' || format === 'jpg'
+          requestedFormat === 'jpeg' || requestedFormat === 'jpg'
             ? await sharpInstance.jpeg({ quality: 90 }).toBuffer()
             : await sharpInstance.png().toBuffer();
 
         const mime =
-          format === 'jpeg' || format === 'jpg' ? 'image/jpeg' : 'image/png';
+          requestedFormat === 'jpeg' || requestedFormat === 'jpg' ? 'image/jpeg' : 'image/png';
         sourceDataUrl = `data:${mime};base64,${renderedBuffer.toString('base64')}`;
       }
 
@@ -571,6 +572,8 @@ export class CreativeStudioController {
           );
         }
 
+        actualFormat = isWebm ? 'webm' : 'mp4';
+
         try {
           uploadedPublicUrl = await storage.uploadSimple(body.dataUrl);
         } catch (err: any) {
@@ -587,14 +590,14 @@ export class CreativeStudioController {
       throw new BadRequestException(`Unsupported project type: ${project.type}`);
     }
 
-    const assetName = `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_export_${Date.now()}.${format}`;
+    const assetName = `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_export_${Date.now()}.${actualFormat}`;
 
     // Register exported asset directly into Organization Media Library with real accessible storage URL
     const media = await this.prisma.media.create({
       data: {
         organizationId: org.id,
         name: assetName,
-        originalName: `${project.name}.${format}`,
+        originalName: `${project.name}.${actualFormat}`,
         path: uploadedPublicUrl,
         type: project.type === 'video' ? 'video' : 'image',
         alt: `Creative Studio export from ${project.name}`,

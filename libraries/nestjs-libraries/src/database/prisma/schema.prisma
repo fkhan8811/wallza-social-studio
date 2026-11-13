@@ -34,6 +34,7 @@ model Organization {
   mediaCollections   MediaCollection[]
   buyerOrganization   MessagesGroup[]
   notifications       Notifications[]
+  socialLeadOutbox    SocialLeadOutbox[]
   plugs               Plugs[]
   post                Post[]               @relation("organization")
   submittedPost       Post[]               @relation("submittedForOrg")
@@ -2159,4 +2160,30 @@ model HashtagGroup {
 
   @@index([organizationId, category])
   @@index([organizationId, updatedAt])
+}
+
+model SocialLeadOutbox {
+  id                String       @id @default(uuid())
+  organizationId    String
+  idempotencyKey    String       @unique
+  platform          String
+  channel           String
+  postId            String?
+  commentId         String?
+  authorName        String
+  authorHandle      String?
+  content           String
+  permalink         String?
+  leadNotes         String?
+  status            String       @default("pending") // "pending" | "dispatched" | "failed"
+  dispatchedAt      DateTime?
+  dispatchAttempts  Int          @default(0)
+  targetResponse    String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([organizationId, platform, commentId])
 }

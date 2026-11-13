@@ -9,6 +9,7 @@ import {
   Put,
   Query,
 } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { Organization, User } from '@prisma/client';
 import { ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
@@ -57,10 +58,10 @@ export interface ConvertLeadDto {
 export interface EngagementCapability {
   provider: string;
   name: string;
-  readComments: boolean;
-  replyComments: boolean;
-  moderation: boolean;
-  mentions: boolean;
+  firstCommentPublishing: 'available' | 'unsupported';
+  inboundCommentSync: 'unsupported' | 'permission_required' | 'available';
+  commentModeration: 'unsupported' | 'permission_required';
+  crmLeadBridge: 'available';
   authTier: string;
   notes: string;
 }
@@ -69,82 +70,82 @@ const PROVIDER_CAPABILITIES: Record<string, EngagementCapability> = {
   facebook: {
     provider: 'facebook',
     name: 'Facebook Pages',
-    readComments: true,
-    replyComments: true,
-    moderation: true,
-    mentions: false,
-    authTier: 'Standard OAuth (pages_read_engagement)',
-    notes: 'Reads and replies to comments on published page posts.',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'permission_required',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'Standard OAuth (pages_manage_posts)',
+    notes: 'Outbound publishing and first-comments supported. Inbound feed sync requires Meta Webhooks configured in WallzaOS core.',
   },
   instagram: {
     provider: 'instagram',
     name: 'Instagram Professional',
-    readComments: true,
-    replyComments: true,
-    moderation: true,
-    mentions: true,
-    authTier: 'Meta Graph API (instagram_manage_comments)',
-    notes: 'Handles comments and @mentions on Instagram business media.',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'permission_required',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'Meta Graph API (instagram_content_publish)',
+    notes: 'Outbound publishing and first-comments supported. Inbound customer communication is managed via WallzaOS Unified Inbox.',
   },
   youtube: {
     provider: 'youtube',
     name: 'YouTube',
-    readComments: true,
-    replyComments: true,
-    moderation: false,
-    mentions: false,
-    authTier: 'Google OAuth (youtube.force-ssl)',
-    notes: 'Reads top-level comments and posts channel responses.',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'unsupported',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'Google OAuth (youtube.upload)',
+    notes: 'Publishing and first-comment response supported. Inbound sync not available on publisher scope.',
   },
   threads: {
     provider: 'threads',
     name: 'Threads',
-    readComments: true,
-    replyComments: true,
-    moderation: false,
-    mentions: false,
-    authTier: 'Threads API (threads_read_replies)',
-    notes: 'Fetches replies and publishes thread responses.',
-  },
-  x: {
-    provider: 'x',
-    name: 'X (Twitter)',
-    readComments: false,
-    replyComments: false,
-    moderation: false,
-    mentions: false,
-    authTier: 'Requires X API Basic/Pro Tier ($100-$5000/mo)',
-    notes: 'Publishing supported on Free tier. Comment reading requires paid developer tier.',
-  },
-  linkedin: {
-    provider: 'linkedin',
-    name: 'LinkedIn',
-    readComments: false,
-    replyComments: false,
-    moderation: false,
-    mentions: false,
-    authTier: 'Restricted Partner API (Community Management)',
-    notes: 'Requires LinkedIn Partner approval for organization post comments.',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'unsupported',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'Threads API (threads_content_publish)',
+    notes: 'Outbound publishing supported. Inbound comments not supported by standard publishing token.',
   },
   bluesky: {
     provider: 'bluesky',
     name: 'Bluesky',
-    readComments: true,
-    replyComments: true,
-    moderation: false,
-    mentions: true,
-    authTier: 'AT Protocol API',
-    notes: 'Reads public thread replies and mentions via ATProto.',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'unsupported',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'AT Protocol App Password',
+    notes: 'Outbound posts and replies supported. Inbound stream ingestion handled outside publisher.',
   },
   mastodon: {
     provider: 'mastodon',
     name: 'Mastodon',
-    readComments: true,
-    replyComments: true,
-    moderation: false,
-    mentions: true,
-    authTier: 'Mastodon Instance API',
-    notes: 'Reads instance federated replies and mentions.',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'unsupported',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'Instance Access Token (write:statuses)',
+    notes: 'Outbound posts and replies supported. Inbound notifications require streaming socket.',
+  },
+  linkedin: {
+    provider: 'linkedin',
+    name: 'LinkedIn',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'unsupported',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'Community Management API / w_member_social',
+    notes: 'Outbound company updates and first comments supported.',
+  },
+  x: {
+    provider: 'x',
+    name: 'X (Twitter)',
+    firstCommentPublishing: 'available',
+    inboundCommentSync: 'unsupported',
+    commentModeration: 'unsupported',
+    crmLeadBridge: 'available',
+    authTier: 'X API v2 (tweet.write, tweet.read)',
+    notes: 'Outbound posts and first replies supported. User stream/mention ingestion not configured.',
   },
 };
 
@@ -178,25 +179,18 @@ export class ActivityInboxController {
     const includeComments = kind === 'all' || kind === 'comment';
     const includeReviews = kind === 'all' || kind === 'review';
 
-    // Tenant-isolated read tracking: check UserOrganization first
-    const [userOrg, userRecord] = await Promise.all([
-      (this.prisma as any).userOrganization.findUnique({
-        where: {
-          userId_organizationId: {
-            userId: user.id,
-            organizationId: org.id,
-          },
+    // Tenant-isolated read tracking: strictly read from UserOrganization for the active organization
+    const userOrg = await (this.prisma as any).userOrganization.findUnique({
+      where: {
+        userId_organizationId: {
+          userId: user.id,
+          organizationId: org.id,
         },
-        select: { lastReadNotifications: true },
-      }),
-      this.prisma.user.findUnique({
-        where: { id: user.id },
-        select: { lastReadNotifications: true },
-      }),
-    ]);
+      },
+      select: { lastReadNotifications: true },
+    });
 
-    const lastRead =
-      userOrg?.lastReadNotifications ?? userRecord?.lastReadNotifications ?? new Date(0);
+    const lastRead = userOrg?.lastReadNotifications ?? new Date(0);
 
     const notificationWhere: any = { organizationId: org.id, deletedAt: null };
     if (search && search.trim()) {
@@ -410,7 +404,7 @@ export class ActivityInboxController {
   ) {
     const updatedAt = new Date();
 
-    // 1. Scoped update on UserOrganization
+    // Scoped update strictly on UserOrganization for active organization
     await (this.prisma as any).userOrganization.upsert({
       where: {
         userId_organizationId: {
@@ -426,12 +420,6 @@ export class ActivityInboxController {
       update: {
         lastReadNotifications: updatedAt,
       },
-    });
-
-    // 2. Also update User table as fallback
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: { lastReadNotifications: updatedAt },
     });
 
     return { success: true, lastReadAt: updatedAt, organizationId: org.id };
@@ -474,8 +462,9 @@ export class ActivityInboxController {
 
   /**
    * WallzaOS Lead Bridge:
-   * Explicitly converts an engagement comment or mention into a sales/CRM lead
+   * Converts an engagement comment or mention into a sales/CRM lead
    * formatted for WallzaOS Unified Inbox without duplicating customer conversation threads.
+   * Uses durable SocialLeadOutbox with idempotency and target acceptance verification.
    */
   @Post('/convert-lead')
   async convertToLead(
@@ -487,41 +476,222 @@ export class ActivityInboxController {
       throw new BadRequestException('authorName, content, and platform are required to create a CRM lead.');
     }
 
-    const capturedAt = new Date();
+    const contentHash = createHash('sha256').update(body.content.trim()).digest('hex').slice(0, 16);
+    const identifier = (body.commentId?.trim() || body.postId?.trim() || contentHash).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const idempotencyKey = `lead_${org.id}_${body.platform.toLowerCase()}_${identifier}`;
 
-    // Audit record in organization notifications
-    await this.prisma.notifications.create({
+    // 1. Idempotency Check: Prevent duplicate lead creation for the same social interaction
+    const existing = await (this.prisma as any).socialLeadOutbox.findUnique({
+      where: { idempotencyKey },
+    });
+
+    if (existing && existing.status === 'dispatched') {
+      return {
+        success: true,
+        alreadyExists: true,
+        outboxId: existing.id,
+        status: 'dispatched',
+        message: 'This social interaction was already converted and confirmed by Wallza CRM.',
+        lead: {
+          id: existing.id,
+          source: `social_${existing.platform}`,
+          platform: existing.platform,
+          authorName: existing.authorName,
+          content: existing.content,
+          permalink: existing.permalink,
+          dispatchedAt: existing.dispatchedAt,
+        },
+      };
+    }
+
+    // 2. Persist to Durable Outbox
+    const outboxEntry = existing || await (this.prisma as any).socialLeadOutbox.create({
       data: {
         organizationId: org.id,
-        content: `Social lead created from ${body.platform} comment by ${body.authorName}: "${body.content.slice(0, 80)}"`,
-        link: body.permalink || `/launches?postGroup=${body.postGroup || ''}`,
+        idempotencyKey,
+        platform: body.platform.toLowerCase(),
+        channel: body.channel || body.platform,
+        postId: body.postId || null,
+        commentId: body.commentId || null,
+        authorName: body.authorName.trim(),
+        authorHandle: body.authorHandle?.trim() || null,
+        content: body.content.trim(),
+        permalink: body.permalink || null,
+        leadNotes: body.leadNotes || null,
+        status: 'pending',
       },
     });
 
-    const leadPayload = {
-      source: 'wallza_social_studio',
-      organizationId: org.id,
-      convertedByUserId: user.id,
-      platform: body.platform.toLowerCase(),
-      channel: body.channel || body.platform,
-      externalPostId: body.postId || null,
-      externalPostGroup: body.postGroup || null,
-      externalCommentId: body.commentId || null,
-      authorName: body.authorName.trim(),
-      authorHandle: body.authorHandle?.trim() || null,
-      content: body.content.trim(),
-      permalink: body.permalink || null,
-      leadNotes: body.leadNotes || null,
-      capturedAt: capturedAt.toISOString(),
-      wallzaInboxEndpoint: '/inbox?leadSource=social_studio',
+    // 3. Dispatch to WallzaOS Unified Inbox API
+    const wallzaUrl = process.env.WALLZAOS_API_URL || process.env.MAIN_URL || 'http://localhost:5001';
+    const dispatchPayload = {
+      org_id: org.id,
+      name: body.authorName.trim(),
+      to_number: body.authorHandle?.trim() || '',
+      email: '',
+      source: `social_${body.platform.toLowerCase()}`,
+      source_id: identifier,
+      notes: `[Social Studio Inbound Lead]\nPlatform: ${body.platform}\nChannel: ${body.channel || body.platform}\nPost URL: ${body.permalink || body.postId || 'N/A'}\nComment ID: ${body.commentId || 'N/A'}\nContent: "${body.content.trim()}"\nNotes: ${body.leadNotes || 'None'}`,
     };
 
-    return {
-      success: true,
-      lead: leadPayload,
-      message:
-        'Engagement item converted to lead contract. Dispatched for WallzaOS Unified Inbox ingestion.',
+    let dispatchSuccess = false;
+    let responseData: any = null;
+    let errorMessage: string | null = null;
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const response = await fetch(`${wallzaUrl}/api/leads`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-organization-id': org.id,
+          ...(process.env.INTERNAL_SERVICE_SECRET ? { 'x-service-token': process.env.INTERNAL_SERVICE_SECRET } : {}),
+        },
+        body: JSON.stringify(dispatchPayload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        responseData = await response.json();
+        dispatchSuccess = true;
+      } else {
+        const errText = await response.text().catch(() => '');
+        errorMessage = `Target returned HTTP ${response.status}: ${errText.slice(0, 300)}`;
+      }
+    } catch (dispatchErr: any) {
+      errorMessage = dispatchErr.name === 'AbortError' ? 'Target request timed out after 6000ms' : dispatchErr.message;
+    }
+
+    // 4. Update Outbox Record & Verify Acceptance
+    if (dispatchSuccess) {
+      await (this.prisma as any).socialLeadOutbox.update({
+        where: { id: outboxEntry.id },
+        data: {
+          status: 'dispatched',
+          dispatchedAt: new Date(),
+          dispatchAttempts: { increment: 1 },
+          targetResponse: JSON.stringify(responseData),
+        },
+      });
+
+      await this.prisma.notifications.create({
+        data: {
+          organizationId: org.id,
+          content: `Social lead created from ${body.platform} by ${body.authorName} and confirmed by Wallza CRM.`,
+          link: body.permalink || `/launches?postGroup=${body.postGroup || ''}`,
+        },
+      });
+
+      return {
+        success: true,
+        status: 'dispatched',
+        outboxId: outboxEntry.id,
+        lead: responseData || dispatchPayload,
+        message: 'Lead confirmed and ingested by WallzaOS Unified Inbox.',
+      };
+    }
+
+    // Mark failed in outbox and report block
+    await (this.prisma as any).socialLeadOutbox.update({
+      where: { id: outboxEntry.id },
+      data: {
+        status: 'failed',
+        dispatchAttempts: { increment: 1 },
+        targetResponse: errorMessage,
+      },
+    });
+
+    throw new BadRequestException(
+      `Lead ingestion could not be confirmed by target CRM (${errorMessage}). Lead preserved in durable outbox (ID: ${outboxEntry.id}) for retry.`
+    );
+  }
+
+  /**
+   * Retry dispatching a pending or failed lead from the outbox.
+   */
+  @Post('/leads/:outboxId/retry')
+  async retryLeadDispatch(
+    @GetOrgFromRequest() org: Organization,
+    @Param('outboxId') outboxId: string
+  ) {
+    const entry = await (this.prisma as any).socialLeadOutbox.findFirst({
+      where: { id: outboxId, organizationId: org.id },
+    });
+    if (!entry) throw new NotFoundException('Outbox lead not found.');
+    if (entry.status === 'dispatched') {
+      return { success: true, message: 'Lead already confirmed by CRM.', entry };
+    }
+
+    const wallzaUrl = process.env.WALLZAOS_API_URL || process.env.MAIN_URL || 'http://localhost:5001';
+    const dispatchPayload = {
+      org_id: org.id,
+      name: entry.authorName,
+      to_number: entry.authorHandle || '',
+      email: '',
+      source: `social_${entry.platform.toLowerCase()}`,
+      source_id: entry.commentId || entry.postId || entry.id,
+      notes: `[Social Studio Inbound Lead - Retried]\nPlatform: ${entry.platform}\nChannel: ${entry.channel}\nPost: ${entry.permalink || entry.postId || 'N/A'}\nComment ID: ${entry.commentId || 'N/A'}\nContent: "${entry.content}"\nNotes: ${entry.leadNotes || 'None'}`,
     };
+
+    try {
+      const response = await fetch(`${wallzaUrl}/api/leads`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-organization-id': org.id,
+          ...(process.env.INTERNAL_SERVICE_SECRET ? { 'x-service-token': process.env.INTERNAL_SERVICE_SECRET } : {}),
+        },
+        body: JSON.stringify(dispatchPayload),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const updated = await (this.prisma as any).socialLeadOutbox.update({
+          where: { id: outboxId },
+          data: {
+            status: 'dispatched',
+            dispatchedAt: new Date(),
+            dispatchAttempts: { increment: 1 },
+            targetResponse: JSON.stringify(data),
+          },
+        });
+        return { success: true, status: 'dispatched', lead: data, outbox: updated };
+      }
+
+      const errText = await response.text().catch(() => '');
+      await (this.prisma as any).socialLeadOutbox.update({
+        where: { id: outboxId },
+        data: {
+          dispatchAttempts: { increment: 1 },
+          targetResponse: `HTTP ${response.status}: ${errText.slice(0, 300)}`,
+        },
+      });
+      throw new BadRequestException(`Target CRM rejected lead retry (HTTP ${response.status}): ${errText}`);
+    } catch (err: any) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException(`Retry connection failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * List durable outbox leads for the organization.
+   */
+  @Get('/leads')
+  async listOutboxLeads(
+    @GetOrgFromRequest() org: Organization,
+    @Query('status') status?: string
+  ) {
+    const where: any = { organizationId: org.id };
+    if (status && status !== 'all') {
+      where.status = status;
+    }
+    return (this.prisma as any).socialLeadOutbox.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
   }
 
   /**
@@ -539,16 +709,17 @@ export class ActivityInboxController {
       const cap = PROVIDER_CAPABILITIES[key] || {
         provider: key,
         name: int.name,
-        readComments: false,
-        replyComments: false,
-        moderation: false,
-        mentions: false,
+        firstCommentPublishing: 'unsupported' as const,
+        inboundCommentSync: 'unsupported' as const,
+        commentModeration: 'unsupported' as const,
+        crmLeadBridge: 'available' as const,
         authTier: 'Standard Publishing Only',
         notes: 'Engagement/comment API not supported by this provider.',
       };
       return {
         integrationId: int.id,
         channelName: int.name,
+        channelStatus: 'connected',
         ...cap,
       };
     });
@@ -556,7 +727,8 @@ export class ActivityInboxController {
     return {
       connectedChannels: results,
       totalChannels: results.length,
-      supportedEngagementChannels: results.filter((c) => c.readComments || c.replyComments).length,
+      supportedOutboundCommentChannels: results.filter((c) => c.firstCommentPublishing === 'available').length,
+      crmLeadBridgeAvailable: true,
     };
   }
 }

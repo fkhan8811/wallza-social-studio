@@ -13,3 +13,4 @@ ALTER TABLE "Post" ADD COLUMN "approvedAt" TIMESTAMP(3);
 -- Create composite index for efficient approval-status and organization queries
 CREATE INDEX "Post_organizationId_requiresApproval_approvalStatus_idx"
   ON "Post"("organizationId", "requiresApproval", "approvalStatus");
+

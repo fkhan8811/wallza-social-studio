@@ -388,6 +388,18 @@ export class PostActivity {
       }
     }
 
+    // WallzaOS Approval Gate Enforcement: Immediately before platform dispatch
+    if (posts && posts.length > 0) {
+      const rootPost = posts[0];
+      const freshPost = await this._postService.getPostById(rootPost.id, integration.organizationId);
+      if (freshPost?.requiresApproval && freshPost.approvalStatus !== 'approved') {
+        throw ApplicationFailure.nonRetryable(
+          `Publishing blocked by approval gate: Post requires approval before platform dispatch. Current status: ${freshPost.approvalStatus || 'pending'}`,
+          'approval_required_stop'
+        );
+      }
+    }
+
     const getIntegration = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );

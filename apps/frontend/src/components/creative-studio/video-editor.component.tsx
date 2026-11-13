@@ -115,7 +115,7 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
     }
   };
 
-  const renderClientVideoDataUrl = async (): Promise<string> => {
+  const renderClientVideoDataUrl = async (): Promise<{ dataUrl: string; format: 'webm' | 'mp4' }> => {
     if (typeof window === 'undefined' || typeof document === 'undefined') {
       throw new Error('Canvas recording is only supported in browser environments.');
     }
@@ -130,7 +130,42 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
       throw new Error('Your browser does not support canvas video capture.');
     }
 
+    // Pre-load source assets (images / videos) for timeline clips that specify a source URL
+    const loadedElements = new Map<string, HTMLImageElement | HTMLVideoElement>();
+    await Promise.all(
+      videoClips
+        .filter((c) => !!c.src)
+        .map((c) => {
+          return new Promise<void>((resolve) => {
+            const isVideo = c.src!.match(/\.(mp4|webm|mov)(\?.*)?$/i);
+            if (isVideo) {
+              const videoEl = document.createElement('video');
+              videoEl.crossOrigin = 'anonymous';
+              videoEl.src = c.src!;
+              videoEl.muted = true;
+              videoEl.playsInline = true;
+              videoEl.onloadeddata = () => {
+                loadedElements.set(c.id, videoEl);
+                resolve();
+              };
+              videoEl.onerror = () => resolve();
+            } else {
+              const imgEl = new Image();
+              imgEl.crossOrigin = 'anonymous';
+              imgEl.src = c.src!;
+              imgEl.onload = () => {
+                loadedElements.set(c.id, imgEl);
+                resolve();
+              };
+              imgEl.onerror = () => resolve();
+            }
+          });
+        })
+    );
+
     const stream = (canvas as any).captureStream(30);
+
+    // Detect browser supported video recording MIME type
     let mimeType = 'video/webm;codecs=vp9';
     if (!MediaRecorder.isTypeSupported(mimeType)) {
       mimeType = MediaRecorder.isTypeSupported('video/webm') ? 'video/webm' : 'video/mp4';
@@ -142,13 +177,14 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
       if (e.data && e.data.size > 0) chunks.push(e.data);
     };
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ dataUrl: string; format: 'webm' | 'mp4' }>((resolve, reject) => {
       mediaRecorder.onstop = () => {
         const blob = new Blob(chunks, { type: mimeType });
+        const actualFormat = blob.type.toLowerCase().includes('mp4') ? 'mp4' : 'webm';
         const reader = new FileReader();
         reader.onloadend = () => {
           if (typeof reader.result === 'string') {
-            resolve(reader.result);
+            resolve({ dataUrl: reader.result, format: actualFormat });
           } else {
             reject(new Error('Failed to convert recorded video blob to dataUrl.'));
           }
@@ -180,23 +216,20 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
 
         const activeClip = videoClips.find((c) => sec >= c.startSec && sec <= c.endSec) || videoClips[0];
         if (activeClip) {
-          ctx.fillStyle = '#1e293b';
-          if (typeof ctx.roundRect === 'function') {
-            ctx.beginPath();
-            ctx.roundRect(40, 240, canvas.width - 80, 600, 24);
-            ctx.fill();
+          const mediaEl = loadedElements.get(activeClip.id);
+          if (mediaEl) {
+            try {
+              if (mediaEl instanceof HTMLVideoElement && !Number.isNaN(mediaEl.duration) && mediaEl.duration > 0) {
+                mediaEl.currentTime = Math.max(0, sec - activeClip.startSec) % mediaEl.duration;
+              }
+              ctx.drawImage(mediaEl, 0, 0, canvas.width, canvas.height);
+            } catch {
+              // Fallback to stylized clip card
+              drawClipCard(ctx, activeClip, sec, canvas);
+            }
           } else {
-            ctx.fillRect(40, 240, canvas.width - 80, 600);
+            drawClipCard(ctx, activeClip, sec, canvas);
           }
-
-          ctx.fillStyle = '#6366f1';
-          ctx.font = 'bold 36px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(activeClip.title, canvas.width / 2, 500);
-
-          ctx.fillStyle = '#94a3b8';
-          ctx.font = '22px sans-serif';
-          ctx.fillText(`Timeline: ${sec.toFixed(1)}s / ${totalDuration}s`, canvas.width / 2, 560);
         }
 
         textOverlays.forEach((overlay) => {
@@ -208,6 +241,7 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
           }
         });
 
+        // Timeline Progress Bar
         ctx.fillStyle = '#334155';
         ctx.fillRect(40, canvas.height - 100, canvas.width - 80, 10);
         ctx.fillStyle = '#6366f1';
@@ -225,6 +259,31 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
         }
       };
 
+      const drawClipCard = (
+        context: CanvasRenderingContext2D,
+        clip: VideoClip,
+        currentSec: number,
+        cvs: HTMLCanvasElement
+      ) => {
+        context.fillStyle = '#1e293b';
+        if (typeof context.roundRect === 'function') {
+          context.beginPath();
+          context.roundRect(40, 240, cvs.width - 80, 600, 24);
+          context.fill();
+        } else {
+          context.fillRect(40, 240, cvs.width - 80, 600);
+        }
+
+        context.fillStyle = '#6366f1';
+        context.font = 'bold 36px sans-serif';
+        context.textAlign = 'center';
+        context.fillText(clip.title, cvs.width / 2, 500);
+
+        context.fillStyle = '#94a3b8';
+        context.font = '22px sans-serif';
+        context.fillText(`Timeline: ${currentSec.toFixed(1)}s / ${totalDuration}s`, cvs.width / 2, 560);
+      };
+
       requestAnimationFrame(renderFrame);
     });
   };
@@ -233,9 +292,9 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
     setIsExporting(true);
     try {
       await handleSave();
-      let dataUrl: string | undefined;
+      let rendered: { dataUrl: string; format: 'webm' | 'mp4' } | undefined;
       try {
-        dataUrl = await renderClientVideoDataUrl();
+        rendered = await renderClientVideoDataUrl();
       } catch (renderErr: any) {
         console.warn('Client-side video capture note:', renderErr);
       }
@@ -243,11 +302,14 @@ export const VideoEditorComponent: FC<{ project: any; onProjectUpdated: () => vo
       const res = await fetch(`/creative-studio/projects/${project.id}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exportFormat: 'mp4', dataUrl }),
+        body: JSON.stringify({
+          exportFormat: rendered?.format || 'webm',
+          dataUrl: rendered?.dataUrl,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Export failed');
-      alert('Video export completed! Asset registered in your Media Library ready for publishing.');
+      alert(`Video export completed! Recorded in authentic ${rendered?.format.toUpperCase() || 'video'} format and registered in your Media Library.`);
       onProjectUpdated();
     } catch (err: any) {
       alert(`Export error: ${err.message}`);
