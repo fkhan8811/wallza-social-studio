@@ -30,7 +30,7 @@ type ActivityResponse = {
 const FILTERS: Array<{ id: 'all' | ActivityKind; label: string }> = [
   { id: 'all', label: 'All activity' },
   { id: 'notification', label: 'Alerts' },
-  { id: 'comment', label: 'Post comments' },
+  { id: 'comment', label: 'Recent post comments' },
   { id: 'review', label: 'Reviews' },
 ];
 
@@ -61,7 +61,7 @@ export const ActivityInboxComponent: FC = () => {
       const response = await fetch('/activity-inbox/mark-read', { method: 'POST' });
       if (!response.ok) throw new Error('Could not mark alerts as read.');
       await mutate();
-      setMessage('Publishing alerts marked as read.');
+      setMessage('Recent publishing alerts marked as read.');
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : 'Could not mark alerts as read.');
     }
@@ -108,10 +108,10 @@ export const ActivityInboxComponent: FC = () => {
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         {[
-          { label: 'Recent activity', value: data?.total ?? 0 },
+          { label: 'Loaded activity', value: data?.total ?? 0 },
           { label: 'Publishing alerts', value: data?.counts.notifications ?? 0 },
           { label: 'Post comments', value: data?.counts.comments ?? 0 },
-          { label: 'Review events', value: data?.counts.reviews ?? 0 },
+          { label: 'Recent review events', value: data?.counts.reviews ?? 0 },
         ].map((stat) => (
           <div key={stat.label} className="rounded-xl border border-blockSeparator bg-newBgColorInner p-3">
             <div className="text-2xl font-bold tabular-nums">{stat.value}</div>
