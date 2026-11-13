@@ -48,6 +48,14 @@ interface AutomationRule {
   lastExecutedAt: string | null;
 }
 
+interface QueueDraft {
+  id: string;
+  content: string;
+  publishDate: string;
+  integrationName: string;
+  platform: string;
+}
+
 const DAYS_OF_WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 export const AutomationComponent: FC = () => {
@@ -69,6 +77,12 @@ export const AutomationComponent: FC = () => {
   ]);
   const [selectedQueueForNextSlot, setSelectedQueueForNextSlot] = useState<string | null>(null);
   const [nextSlotInfo, setNextSlotInfo] = useState<any>(null);
+  const [enqueueQueue, setEnqueueQueue] = useState<PublishingQueue | null>(null);
+  const [queueDrafts, setQueueDrafts] = useState<QueueDraft[]>([]);
+  const [selectedDraftIds, setSelectedDraftIds] = useState<string[]>([]);
+  const [loadingQueueDrafts, setLoadingQueueDrafts] = useState(false);
+  const [submittingQueueDrafts, setSubmittingQueueDrafts] = useState(false);
+  const [queueDraftMessage, setQueueDraftMessage] = useState<string | null>(null);
 
   // Rule state
   const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
@@ -166,6 +180,74 @@ export const AutomationComponent: FC = () => {
       setNextSlotInfo(data);
     } catch (err: any) {
       alert(`Failed to calculate next slot: ${err.message}`);
+    }
+  };
+
+  const openEnqueueModal = async (queue: PublishingQueue) => {
+    setEnqueueQueue(queue);
+    setQueueDrafts([]);
+    setSelectedDraftIds([]);
+    setQueueDraftMessage(null);
+    setLoadingQueueDrafts(true);
+    try {
+      const response = await fetch('/posts/list?state=draft&limit=100&page=0');
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || 'Could not load draft posts.');
+      }
+
+      // Postiz minifies this endpoint's response to keep calendar/list payloads small.
+      const rows = payload.p || payload.posts || [];
+      const drafts = rows
+        .map((post: any) => ({
+          id: post.i || post.id,
+          content: post.c || post.content || '',
+          publishDate: post.d || post.publishDate || '',
+          integrationName: post.n?.n || post.integration?.name || 'Social account',
+          platform: post.n?.pi || post.integration?.providerIdentifier || '',
+        }))
+        .filter((post: QueueDraft) => Boolean(post.id));
+      setQueueDrafts(drafts);
+      setQueueDraftMessage(drafts.length ? null : 'No upcoming drafts are available to add to this queue.');
+    } catch (error) {
+      setQueueDraftMessage(error instanceof Error ? error.message : 'Could not load drafts.');
+    } finally {
+      setLoadingQueueDrafts(false);
+    }
+  };
+
+  const toggleDraftSelection = (draftId: string) => {
+    setSelectedDraftIds((current) =>
+      current.includes(draftId)
+        ? current.filter((id) => id !== draftId)
+        : [...current, draftId]
+    );
+  };
+
+  const submitQueueDrafts = async () => {
+    if (!enqueueQueue || !selectedDraftIds.length) return;
+    setSubmittingQueueDrafts(true);
+    setQueueDraftMessage(null);
+    try {
+      const response = await fetch(`/automation/queues/${enqueueQueue.id}/enqueue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ postIds: selectedDraftIds }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || 'Could not schedule the selected drafts.');
+      }
+      setQueueDraftMessage(`Scheduled ${payload.scheduled?.length || 0} draft(s) in ${enqueueQueue.name}.`);
+      setSelectedDraftIds([]);
+      await mutateQueues();
+      setQueueDrafts((current) =>
+        current.filter((draft) => !payload.scheduled?.some((item: any) => item.postId === draft.id))
+      );
+    } catch (error) {
+      setQueueDraftMessage(error instanceof Error ? error.message : 'Could not schedule drafts.');
+    } finally {
+      setSubmittingQueueDrafts(false);
     }
   };
 
@@ -335,12 +417,22 @@ export const AutomationComponent: FC = () => {
                     <span className="text-muted-foreground font-mono text-[11px]">
                       Spacing: {q.minSpacingMinutes}m
                     </span>
-                    <button
-                      onClick={() => checkNextSlot(q.id)}
-                      className="px-3 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 font-semibold transition"
-                    >
-                      Next Slot ➔
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => openEnqueueModal(q)}
+                        disabled={!q.isActive}
+                        className="px-3 py-1 rounded-lg border border-indigo-500/30 bg-indigo-600/10 hover:bg-indigo-600/25 text-indigo-300 font-semibold transition disabled:opacity-40"
+                      >
+                        Add drafts
+                      </button>
+                      <button
+                        onClick={() => checkNextSlot(q.id)}
+                        disabled={!q.isActive}
+                        className="px-3 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 font-semibold transition disabled:opacity-40"
+                      >
+                        Next Slot ➔
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -425,6 +517,82 @@ export const AutomationComponent: FC = () => {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Modal: Add drafts to a queue */}
+      {enqueueQueue && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-border/60 p-5">
+              <div>
+                <h3 className="text-base font-bold text-white">Add drafts to {enqueueQueue.name}</h3>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Select up to 50 upcoming drafts. Each draft is placed in the next free slot for its connected account.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEnqueueQueue(null)}
+                className="rounded-lg border border-border px-2.5 py-1.5 text-xs text-muted-foreground hover:text-white"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              {loadingQueueDrafts ? (
+                <div className="flex justify-center py-12"><LoadingComponent /></div>
+              ) : queueDrafts.length ? (
+                <div className="space-y-2">
+                  {queueDrafts.map((draft) => (
+                    <label key={draft.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/60 p-3 hover:border-indigo-500/40">
+                      <input
+                        type="checkbox"
+                        checked={selectedDraftIds.includes(draft.id)}
+                        onChange={() => toggleDraftSelection(draft.id)}
+                        className="mt-1"
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-center gap-2 text-xs font-semibold text-white">
+                          {draft.integrationName}
+                          {draft.platform && <span className="text-[10px] font-normal text-muted-foreground">{draft.platform}</span>}
+                        </span>
+                        <span className="mt-1 block break-words text-xs text-muted-foreground">
+                          {draft.content || 'Media-only draft'}
+                        </span>
+                        <span className="mt-1 block text-[10px] text-muted-foreground">
+                          {draft.publishDate ? new Date(draft.publishDate).toLocaleString() : 'No date'}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-12 text-center text-xs text-muted-foreground">
+                  No upcoming drafts are available. Create or save a draft in the composer first.
+                </div>
+              )}
+            </div>
+
+            {queueDraftMessage && (
+              <div role="status" className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground">
+                {queueDraftMessage}
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 p-4">
+              <span className="text-xs text-muted-foreground">{selectedDraftIds.length} selected (maximum 50)</span>
+              <button
+                type="button"
+                onClick={submitQueueDrafts}
+                disabled={!selectedDraftIds.length || selectedDraftIds.length > 50 || submittingQueueDrafts || loadingQueueDrafts}
+                className="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {submittingQueueDrafts ? 'Scheduling…' : 'Schedule selected drafts'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
