@@ -65,7 +65,7 @@ jobs:
         run: pnpm run prisma-generate
 
       - name: Deploy Prisma Migrations
-        run: pnpm dlx prisma migrate deploy --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
+        run: pnpm dlx prisma@6.5.0 migrate deploy --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
 
       - name: Run Prisma and Security Tests
         run: cd libraries/nestjs-libraries && npx vitest run --globals
