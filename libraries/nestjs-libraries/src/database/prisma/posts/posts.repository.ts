@@ -533,25 +533,31 @@ export class PostsRepository {
 
       // 1. Enqueue into durable PostgreSQL callback outbox table
       if (this._callbackOutbox) {
-        await this._callbackOutbox.enqueueCallback({
-          organizationId: post.organizationId,
-          postId: post.id,
-          integrationId: post.integrationId,
-          wallzaPostId,
-          wallzaOrgId,
-          platform,
-          platformPostId: post.releaseId || null,
-          status,
-          attemptId,
-          error: errorMsg,
-          releaseUrl,
-        });
+        try {
+          await this._callbackOutbox.enqueueCallback({
+            organizationId: post.organizationId,
+            postId: post.id,
+            integrationId: post.integrationId,
+            wallzaPostId,
+            wallzaOrgId,
+            platform,
+            platformPostId: post.releaseId || null,
+            status,
+            attemptId,
+            error: errorMsg,
+            releaseUrl,
+          });
 
-        // Trigger immediate delivery attempt
-        this._callbackOutbox.processCallbackQueue().catch((drainErr) => {
-          console.warn(`[PostsRepository] Callback outbox drain error: ${drainErr.message}`);
-        });
-        return;
+          // Trigger immediate delivery attempt asynchronously
+          this._callbackOutbox.processCallbackQueue().catch((drainErr: any) => {
+            console.warn(`[PostsRepository] Callback outbox drain error: ${drainErr.message}`);
+          });
+          return;
+        } catch (enqueueErr: any) {
+          console.error(
+            `[PostsRepository] Failed to enqueue status callback into durable outbox: ${enqueueErr.message}. Falling back to direct signed HTTP delivery.`
+          );
+        }
       }
 
       // 2. Direct Fallback if service not injected (e.g. standalone test)

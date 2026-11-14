@@ -138,8 +138,9 @@ export class PublishingCallbackOutboxService
   ): Promise<any> {
     const client = tx || this.prisma;
     if (!client?.publishingCallbackOutbox) {
-      this.logger.warn('[CallbackOutbox] publishingCallbackOutbox model unavailable; skipping queue insert');
-      return null;
+      throw new Error(
+        '[CallbackOutbox] publishingCallbackOutbox model is not available in Prisma client. Status callback cannot be persisted.'
+      );
     }
 
     const attemptId = data.attemptId || 'attempt_1';

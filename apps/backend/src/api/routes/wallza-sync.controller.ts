@@ -284,6 +284,7 @@ export class WallzaSyncController {
       caption: string;
       mediaUrls?: string[];
       platforms: string[];
+      integrationIds?: string[];
       type: 'now' | 'schedule';
       scheduledAt?: string;
       idempotencyKey?: string;
@@ -304,6 +305,7 @@ export class WallzaSyncController {
       caption,
       mediaUrls = [],
       platforms = [],
+      integrationIds = [],
       type = 'now',
       scheduledAt,
       idempotencyKey,
@@ -351,19 +353,26 @@ export class WallzaSyncController {
       throw new HttpException('Organization not found in Social Studio', HttpStatus.NOT_FOUND);
     }
 
-    // Match integrations for requested platforms
-    let targetIntegrations = org.Integration.filter((i) =>
-      platforms.some(
+    // Match integrations for requested platforms and/or specific integrationIds
+    let targetIntegrations = org.Integration.filter((i) => {
+      if (Array.isArray(integrationIds) && integrationIds.length > 0) {
+        return integrationIds.some(
+          (reqId) =>
+            reqId.toLowerCase() === i.id.toLowerCase() ||
+            reqId.toLowerCase() === i.internalId.toLowerCase()
+        );
+      }
+      return platforms.some(
         (p) =>
           p.toLowerCase() === i.providerIdentifier.toLowerCase() ||
           p.toLowerCase() === i.id.toLowerCase() ||
           p.toLowerCase() === i.internalId.toLowerCase()
-      )
-    );
+      );
+    });
 
     if (targetIntegrations.length === 0) {
       throw new HttpException(
-        `No connected and active channels found for platforms: ${platforms.join(', ')}`,
+        `No connected and active channels found for requested targets (platforms: ${platforms.join(', ')}, integrationIds: ${integrationIds.join(', ')})`,
         HttpStatus.BAD_REQUEST
       );
     }
@@ -702,6 +711,7 @@ export class WallzaSyncController {
           name: i.name,
           platform: i.providerIdentifier,
         })),
+        targetIntegrationIds: targetIntegrations.map((i) => i.id),
         idempotent: false,
       };
     } catch (err: any) {
