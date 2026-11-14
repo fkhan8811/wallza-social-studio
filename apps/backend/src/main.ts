@@ -61,6 +61,8 @@ async function start() {
 
   await startMcp(app);
 
+  app.enableShutdownHooks();
+
   app.useGlobalPipes(
     new ValidationPipe({
       transform: true,

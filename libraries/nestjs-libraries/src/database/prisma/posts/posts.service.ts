@@ -1302,6 +1302,7 @@ export class PostsService {
 
             // Persist durable workflow outbox record in the same transaction as Post creation
             if (tx.publishingWorkflowOutbox && createdPostState !== 'DRAFT') {
+              const integrationWorkflowId = `post_${createdPostId}_${post.integration.id}`;
               await tx.publishingWorkflowOutbox.upsert({
                 where: {
                   postId_integrationId: {
@@ -1314,13 +1315,14 @@ export class PostsService {
                   postId: createdPostId,
                   integrationId: post.integration.id,
                   provider: post.settings.__type.split('-')[0].toLowerCase(),
-                  workflowId: `post_${createdPostId}`,
+                  workflowId: integrationWorkflowId,
                   status: 'pending',
                   state: createdPostState,
                   retryCount: 0,
                   maxRetries: 10,
                 },
                 update: {
+                  workflowId: integrationWorkflowId,
                   status: 'pending',
                   state: createdPostState,
                   updatedAt: new Date(),

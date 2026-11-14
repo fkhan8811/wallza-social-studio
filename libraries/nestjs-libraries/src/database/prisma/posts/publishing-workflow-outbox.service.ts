@@ -312,6 +312,7 @@ export class PublishingWorkflowOutboxService
     const rawClient = this._temporalService?.client?.getRawClient?.();
 
     // 1. Reconcile existing workflow execution status in Temporal
+    let existingStatus: string | null = null;
     try {
       if (rawClient && this._temporalService?.client?.getWorkflowHandle) {
         try {
@@ -319,8 +320,9 @@ export class PublishingWorkflowOutboxService
           if (handle) {
             const desc = await handle.describe();
             const statusName = desc?.status?.name;
-
             const statusStr = String(statusName || '');
+            existingStatus = statusStr;
+
             if (statusStr === 'COMPLETED') {
               this.logger.log(`[WorkflowOutbox] Workflow ${workflowId} already COMPLETED successfully. Deduplicating without republishing.`);
               return { workflowId, status: 'COMPLETED' };
@@ -338,15 +340,22 @@ export class PublishingWorkflowOutboxService
               statusStr === 'CANCELED' ||
               statusStr === 'TERMINATED'
             ) {
-              this.logger.warn(`[WorkflowOutbox] Workflow ${workflowId} exists with terminal state ${statusStr}.`);
-              // Let Temporal start or conflict policy handle terminal retries if allowed, otherwise throw
+              this.logger.error(`[WorkflowOutbox] Workflow ${workflowId} in terminal failure status: ${statusStr}. Reusing workflow is rejected.`);
+              throw new Error(`Temporal workflow ${workflowId} ended with terminal failure: ${statusStr}`);
             }
           }
-        } catch {
+        } catch (err: any) {
+          // If the handle check specifically threw our terminal failure error, rethrow immediately!
+          if (err.message && err.message.includes('ended with terminal failure:')) {
+            throw err;
+          }
           // Handle does not exist or workflow not yet created, proceed to start
         }
       }
-    } catch {
+    } catch (err: any) {
+      if (err.message && err.message.includes('ended with terminal failure:')) {
+        throw err;
+      }
       // Describe check error, proceed to start with conflict check
     }
 
@@ -360,7 +369,7 @@ export class PublishingWorkflowOutboxService
         workflowId,
         taskQueue: 'main',
         workflowIdConflictPolicy: 'FAIL', // Never terminate active running workflows
-        workflowIdReusePolicy: 'REJECT_DUPLICATE', // Strictly reject restarting duplicate completed workflows
+        workflowIdReusePolicy: 'REJECT_DUPLICATE', // Strictly reject restarting duplicate completed/failed workflows
         args: [
           {
             taskQueue: provider,
@@ -383,35 +392,59 @@ export class PublishingWorkflowOutboxService
       this.logger.log(`[WorkflowOutbox] Started Temporal workflow ${workflowId} for post ${postId}`);
       return { workflowId, status: 'STARTED' };
     } catch (err: any) {
-      // 3. Handle duplicate/already-started as idempotent success
+      // 3. Narrow duplicate-error handling: only acknowledge as RUNNING if actually RUNNING or COMPLETED
       const msg = err?.message || String(err);
-      if (
+      const isAlreadyStarted =
         err?.name === 'WorkflowExecutionAlreadyStartedError' ||
         msg.includes('already started') ||
         msg.includes('Workflow execution already started') ||
-        msg.includes('ALREADY_EXISTS') ||
-        msg.includes('Workflow execution already completed') ||
-        msg.includes('WorkflowIdReusePolicy')
-      ) {
-        this.logger.log(`[WorkflowOutbox] Workflow ${workflowId} already exists in Temporal (${msg}). Idempotent acknowledgment.`);
+        msg.includes('ALREADY_EXISTS');
+
+      if (isAlreadyStarted) {
+        // Confirm if it is actually RUNNING or COMPLETED
+        try {
+          const handle = await this._temporalService?.client?.getWorkflowHandle?.(workflowId);
+          if (handle) {
+            const desc = await handle.describe();
+            const statusStr = String(desc?.status?.name || '');
+            if (statusStr === 'COMPLETED') {
+              return { workflowId, status: 'COMPLETED' };
+            }
+            if (statusStr === 'RUNNING') {
+              return { workflowId, status: 'RUNNING' };
+            }
+            // If it is in a terminal failure state, do NOT treat as success!
+            throw new Error(`Temporal workflow ${workflowId} already exists in terminal failure state: ${statusStr}`);
+          }
+        } catch (inspectErr: any) {
+          if (inspectErr.message && inspectErr.message.includes('terminal failure state:')) {
+            throw inspectErr;
+          }
+        }
+
+        // If describe was not possible or returned RUNNING by default
         return { workflowId, status: 'RUNNING' };
       }
 
-      // Re-throw genuine network/service/connection failures!
+      // Re-throw genuine network/service/connection/terminal failures!
       throw err;
     }
   }
 
   /**
    * Delivers a single claimed outbox event.
-   * Enforces that the claimToken matches the database state via conditional updateMany.
-   * If claimToken is stale or lost, acknowledgment is strictly rejected.
+   * Enforces that claimToken is mandatory, non-empty, and matches the database state via conditional updateMany.
+   * If claimToken is missing, stale, or lost, acknowledgment is strictly rejected.
    */
   async deliverEvent(
     event: any,
-    claimToken?: string
+    claimToken: string
   ): Promise<{ success: boolean; acknowledged: boolean; error?: string }> {
-    const token = claimToken || event.claimToken;
+    if (!claimToken || typeof claimToken !== 'string' || claimToken.trim() === '') {
+      const errText = `claimToken is mandatory and must be a non-empty string. Delivery rejected for event ${event?.id}`;
+      this.logger.error(`[WorkflowOutbox] ${errText}`);
+      return { success: false, acknowledged: false, error: errText };
+    }
 
     try {
       const dispatchRes = await this.startTemporalWorkflowIdempotent(
@@ -423,12 +456,12 @@ export class PublishingWorkflowOutboxService
         event.republishAttemptId
       );
 
-      // Acknowledge delivery conditionally based on matching id, status='processing', and claimToken
+      // Acknowledge delivery conditionally based on matching id, status='processing', and exact matching claimToken
       const updateRes = await this.prisma.publishingWorkflowOutbox.updateMany({
         where: {
           id: event.id,
           status: 'processing',
-          ...(token ? { claimToken: token } : {}),
+          claimToken: claimToken,
         },
         data: {
           status: 'delivered',
@@ -458,12 +491,12 @@ export class PublishingWorkflowOutboxService
         `[WorkflowOutbox] Delivery failed for event ${event.id} (postId: ${event.postId}, try: ${nextRetry}): ${errorMsg}`
       );
 
-      // Record failure conditionally based on claimToken
+      // Record failure conditionally based on exact matching claimToken
       const updateRes = await this.prisma.publishingWorkflowOutbox.updateMany({
         where: {
           id: event.id,
           status: 'processing',
-          ...(token ? { claimToken: token } : {}),
+          claimToken: claimToken,
         },
         data: {
           status: isExhausted ? 'failed' : 'pending',

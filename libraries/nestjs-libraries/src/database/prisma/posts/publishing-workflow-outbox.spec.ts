@@ -132,10 +132,11 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox &
                 err.name = 'WorkflowExecutionAlreadyStartedError';
                 throw err;
               }
-              if (existing && existing.status === 'COMPLETED') {
+              // With REJECT_DUPLICATE, Temporal rejects duplicate workflowId for ANY closed execution
+              if (existing && ['COMPLETED', 'FAILED', 'TIMED_OUT', 'CANCELLED', 'CANCELED', 'TERMINATED'].includes(existing.status)) {
                 if (options.workflowIdReusePolicy === 'REJECT_DUPLICATE') {
                   const err: any = new Error(
-                    `Workflow execution already completed and reuse policy rejects duplicates: ${wfId}`
+                    `Workflow execution closed with status ${existing.status} and workflowIdReusePolicy REJECT_DUPLICATE rejects duplicate: ${wfId}`
                   );
                   err.name = 'WorkflowExecutionAlreadyStartedError';
                   throw err;
@@ -379,5 +380,107 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox &
     const winners = claims.filter((c) => c.length > 0);
     expect(winners.length).toBe(1);
     expect(winners[0][0].claimToken).toBeDefined();
+  });
+
+  it('7. Terminal failure handling (FAILED, TIMED_OUT, CANCELLED, TERMINATED): never classified as RUNNING or delivered', async () => {
+    const terminalStatuses = ['FAILED', 'TIMED_OUT', 'CANCELLED', 'TERMINATED'];
+
+    for (const termStatus of terminalStatuses) {
+      const postId = `post_term_${termStatus.toLowerCase()}`;
+      const intId = `int_${termStatus.toLowerCase()}`;
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      const expectedWorkflowId = `post_${postId}_${intId}`;
+      temporalWorkflows.set(expectedWorkflowId, { status: termStatus, startCount: 1 });
+
+      // Claim specifically this event
+      const pendingEvents = await mockPrisma.publishingWorkflowOutbox.findMany({
+        where: { OR: [{ status: 'pending' }] },
+      });
+      const targetEvent = pendingEvents.find((e: any) => e.postId === postId);
+      expect(targetEvent).toBeDefined();
+
+      const workerToken = `token_${termStatus.toLowerCase()}`;
+      await mockPrisma.publishingWorkflowOutbox.updateMany({
+        where: { id: targetEvent.id },
+        data: {
+          status: 'processing',
+          leaseOwner: `worker_${termStatus.toLowerCase()}`,
+          claimToken: workerToken,
+          leaseExpiresAt: new Date(Date.now() + 60000),
+        },
+      });
+
+      const claimedEvent = {
+        ...targetEvent,
+        status: 'processing',
+        leaseOwner: `worker_${termStatus.toLowerCase()}`,
+        claimToken: workerToken,
+      };
+
+      // Delivery must fail and reject reuse
+      const deliveryRes = await outboxService.deliverEvent(claimedEvent, workerToken);
+      expect(deliveryRes.success).toBe(false);
+      expect(deliveryRes.error).toContain(`terminal failure: ${termStatus}`);
+
+      // Crucial: outbox record must NOT be marked delivered, and deliveredAt must NOT be set
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('pending'); // or 'failed' if retries exhausted, but NOT 'delivered'
+      expect(stored.deliveredAt).toBeUndefined();
+      expect(stored.lastError).toContain(`terminal failure: ${termStatus}`);
+      // Temporal startCount must NOT be incremented
+      expect(temporalWorkflows.get(expectedWorkflowId)?.startCount).toBe(1);
+    }
+  });
+
+  it('8. deliverEvent rejects delivery immediately if claimToken is missing or empty', async () => {
+    const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+      {
+        organizationId: 'org_1',
+        postId: 'post_no_token',
+        integrationId: 'int_no_token',
+        provider: 'twitter',
+        state: 'QUEUE',
+      },
+    ]);
+
+    // Claim the event
+    const [claimed] = await outboxService.claimPendingEvents('worker_token_test');
+
+    // Attempt delivery with empty string
+    const emptyRes = await outboxService.deliverEvent(claimed, '');
+    expect(emptyRes.success).toBe(false);
+    expect(emptyRes.acknowledged).toBe(false);
+    expect(emptyRes.error).toContain('claimToken is mandatory');
+
+    // Attempt delivery with whitespace string
+    const spaceRes = await outboxService.deliverEvent(claimed, '   ');
+    expect(spaceRes.success).toBe(false);
+    expect(spaceRes.acknowledged).toBe(false);
+    expect(spaceRes.error).toContain('claimToken is mandatory');
+
+    // Attempt delivery with undefined/null as any
+    const nullRes = await outboxService.deliverEvent(claimed, null as any);
+    expect(nullRes.success).toBe(false);
+    expect(nullRes.acknowledged).toBe(false);
+    expect(nullRes.error).toContain('claimToken is mandatory');
+
+    // Ensure Temporal was never invoked for invalid token calls
+    expect(temporalWorkflows.has(`post_post_no_token_int_no_token`)).toBe(false);
+
+    // Now deliver with the valid token -> success
+    const validRes = await outboxService.deliverEvent(claimed, claimed.claimToken);
+    expect(validRes.success).toBe(true);
+    expect(validRes.acknowledged).toBe(true);
   });
 });
