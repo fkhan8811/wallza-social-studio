@@ -16,6 +16,7 @@ import isSameOrAfter from 'dayjs/plugin/isSameOrAfter';
 import utc from 'dayjs/plugin/utc';
 import { v4 as uuidv4 } from 'uuid';
 import { CreateTagDto } from '@gitroom/nestjs-libraries/dtos/posts/create.tag.dto';
+import { signInternalRequest } from '@gitroom/nestjs-libraries/auth/internal-hmac.util';
 
 dayjs.extend(isoWeek);
 dayjs.extend(weekOfYear);
@@ -486,8 +487,79 @@ export class PostsRepository {
     });
   }
 
-  updatePost(id: string, postId: string, releaseURL: string) {
-    return this._post.model.post.update({
+  private async _notifyWallzaStatus(
+    post: any,
+    status: 'published' | 'failed',
+    options?: { releaseUrl?: string; error?: any }
+  ) {
+    try {
+      const idempotencyKey = post?.idempotencyKey || '';
+      let wallzaPostId = post?.releaseId || '';
+
+      // Check if this post was originated from WallzaOS dispatch
+      // In wallza-sync.controller, idempotencyKey = trackingKey and releaseId = trackingKey
+      // or wallzaPostId is passed in metadata
+      if (!wallzaPostId && !idempotencyKey) {
+        return;
+      }
+
+      // If releaseId is a UUID or integer, it represents the Wallza post id
+      // If releaseId was set to provider postId, check idempotencyKey pattern
+      const wallzaUrl =
+        process.env.WALLZAOS_INTERNAL_API_URL ||
+        process.env.WALLZAOS_API_URL ||
+        process.env.MAIN_URL ||
+        'http://localhost:5011';
+
+      const payload = {
+        organizationId: post.organizationId,
+        wallzaPostId: post.releaseId || post.idempotencyKey || post.id,
+        platform: post.integration?.providerIdentifier || 'unknown',
+        platformPostId: post.releaseId || null,
+        status,
+        error: options?.error
+          ? typeof options.error === 'string'
+            ? options.error
+            : JSON.stringify(options.error)
+          : null,
+        releaseUrl: options?.releaseUrl || post.releaseURL || null,
+        timestamp: new Date().toISOString(),
+      };
+
+      const signedHeaders = signInternalRequest({
+        method: 'POST',
+        path: '/api/social/status-callback',
+        audience: 'wallzaos',
+        body: payload,
+      });
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+      await fetch(`${wallzaUrl}/api/social/status-callback`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...signedHeaders,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).catch((fetchErr) => {
+        // Log callback delivery failure non-blockingly
+        console.warn(
+          `[PostsRepository] Failed to deliver Wallza status callback for post ${post.id}: ${fetchErr.message}`
+        );
+      });
+      clearTimeout(timeoutId);
+    } catch (err: any) {
+      console.warn(
+        `[PostsRepository] Internal error notifying Wallza status: ${err.message}`
+      );
+    }
+  }
+
+  async updatePost(id: string, postId: string, releaseURL: string) {
+    const updated = await this._post.model.post.update({
       where: {
         id,
       },
@@ -496,7 +568,19 @@ export class PostsRepository {
         releaseURL,
         releaseId: postId,
       },
+      include: {
+        integration: {
+          select: {
+            providerIdentifier: true,
+          },
+        },
+      },
     });
+
+    // Notify WallzaOS of successful publishing callback asynchronously
+    this._notifyWallzaStatus(updated, 'published', { releaseUrl: releaseURL });
+
+    return updated;
   }
 
   updateReleaseId(
@@ -568,6 +652,10 @@ export class PostsRepository {
           },
         });
       } catch (err) {}
+    }
+
+    if (state === 'ERROR') {
+      this._notifyWallzaStatus(update, 'failed', { error: err });
     }
 
     return update;
