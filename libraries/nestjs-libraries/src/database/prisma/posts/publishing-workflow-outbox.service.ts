@@ -343,17 +343,31 @@ export class PublishingWorkflowOutboxService
               this.logger.error(`[WorkflowOutbox] Workflow ${workflowId} in terminal failure status: ${statusStr}. Reusing workflow is rejected.`);
               throw new Error(`Temporal workflow ${workflowId} ended with terminal failure: ${statusStr}`);
             }
+
+            // Any other or unknown status must throw a retryable error
+            if (statusStr) {
+              this.logger.warn(`[WorkflowOutbox] Workflow ${workflowId} in unhandled status: ${statusStr}. Cannot establish active or completed state.`);
+              throw new Error(`Temporal workflow ${workflowId} in unknown or unhandled status: ${statusStr}`);
+            }
           }
         } catch (err: any) {
-          // If the handle check specifically threw our terminal failure error, rethrow immediately!
-          if (err.message && err.message.includes('ended with terminal failure:')) {
+          // If the handle check specifically threw our terminal failure or unhandled status error, rethrow immediately!
+          if (
+            err.message &&
+            (err.message.includes('ended with terminal failure:') ||
+              err.message.includes('in unknown or unhandled status:'))
+          ) {
             throw err;
           }
           // Handle does not exist or workflow not yet created, proceed to start
         }
       }
     } catch (err: any) {
-      if (err.message && err.message.includes('ended with terminal failure:')) {
+      if (
+        err.message &&
+        (err.message.includes('ended with terminal failure:') ||
+          err.message.includes('in unknown or unhandled status:'))
+      ) {
         throw err;
       }
       // Describe check error, proceed to start with conflict check
@@ -401,29 +415,62 @@ export class PublishingWorkflowOutboxService
         msg.includes('ALREADY_EXISTS');
 
       if (isAlreadyStarted) {
-        // Confirm if it is actually RUNNING or COMPLETED
-        try {
-          const handle = await this._temporalService?.client?.getWorkflowHandle?.(workflowId);
-          if (handle) {
-            const desc = await handle.describe();
-            const statusStr = String(desc?.status?.name || '');
-            if (statusStr === 'COMPLETED') {
-              return { workflowId, status: 'COMPLETED' };
-            }
-            if (statusStr === 'RUNNING') {
-              return { workflowId, status: 'RUNNING' };
-            }
-            // If it is in a terminal failure state, do NOT treat as success!
-            throw new Error(`Temporal workflow ${workflowId} already exists in terminal failure state: ${statusStr}`);
-          }
-        } catch (inspectErr: any) {
-          if (inspectErr.message && inspectErr.message.includes('terminal failure state:')) {
-            throw inspectErr;
-          }
+        // Positively inspect existing workflow state. Never guess RUNNING if state cannot be positively confirmed!
+        const getHandle = this._temporalService?.client?.getWorkflowHandle;
+        if (!getHandle) {
+          const errText = `Temporal workflow ${workflowId} already started, but getWorkflowHandle is unavailable to verify execution state`;
+          this.logger.error(`[WorkflowOutbox] ${errText}`);
+          throw new Error(errText);
         }
 
-        // If describe was not possible or returned RUNNING by default
-        return { workflowId, status: 'RUNNING' };
+        let handle: any;
+        try {
+          handle = await this._temporalService.client.getWorkflowHandle(workflowId);
+        } catch (handleErr: any) {
+          const errText = `Temporal workflow ${workflowId} already started, but failed to obtain workflow handle: ${handleErr?.message || handleErr}`;
+          this.logger.error(`[WorkflowOutbox] ${errText}`);
+          throw new Error(errText);
+        }
+
+        if (!handle || typeof handle.describe !== 'function') {
+          const errText = `Temporal workflow ${workflowId} already started, but workflow handle is unavailable or invalid`;
+          this.logger.error(`[WorkflowOutbox] ${errText}`);
+          throw new Error(errText);
+        }
+
+        let desc: any;
+        try {
+          desc = await handle.describe();
+        } catch (describeErr: any) {
+          const errText = `Temporal workflow ${workflowId} already started, but failed to describe workflow execution: ${describeErr?.message || describeErr}`;
+          this.logger.error(`[WorkflowOutbox] ${errText}`);
+          throw new Error(errText);
+        }
+
+        const statusStr = String(desc?.status?.name || '');
+        if (statusStr === 'COMPLETED') {
+          this.logger.log(`[WorkflowOutbox] Confirmed existing workflow ${workflowId} is COMPLETED.`);
+          return { workflowId, status: 'COMPLETED' };
+        }
+        if (statusStr === 'RUNNING') {
+          this.logger.log(`[WorkflowOutbox] Confirmed existing workflow ${workflowId} is RUNNING.`);
+          return { workflowId, status: 'RUNNING' };
+        }
+        if (
+          statusStr === 'FAILED' ||
+          statusStr === 'TIMED_OUT' ||
+          statusStr === 'CANCELLED' ||
+          statusStr === 'CANCELED' ||
+          statusStr === 'TERMINATED'
+        ) {
+          this.logger.error(`[WorkflowOutbox] Workflow ${workflowId} already exists in terminal failure status: ${statusStr}`);
+          throw new Error(`Temporal workflow ${workflowId} ended with terminal failure: ${statusStr}`);
+        }
+
+        // Unknown or blank status
+        const unhandledText = `Temporal workflow ${workflowId} in unknown or unverified status: ${statusStr || 'UNKNOWN'}`;
+        this.logger.error(`[WorkflowOutbox] ${unhandledText}`);
+        throw new Error(unhandledText);
       }
 
       // Re-throw genuine network/service/connection/terminal failures!

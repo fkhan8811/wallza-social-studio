@@ -8,6 +8,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@gitroom/nestjs-libraries': path.resolve(__dirname, './src'),
+      '@gitroom/helpers': path.resolve(__dirname, '../helpers/src'),
+      '@gitroom/backend': path.resolve(__dirname, '../../apps/backend/src'),
     },
   },
   test: {

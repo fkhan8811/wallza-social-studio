@@ -382,8 +382,8 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox &
     expect(winners[0][0].claimToken).toBeDefined();
   });
 
-  it('7. Terminal failure handling (FAILED, TIMED_OUT, CANCELLED, TERMINATED): never classified as RUNNING or delivered', async () => {
-    const terminalStatuses = ['FAILED', 'TIMED_OUT', 'CANCELLED', 'TERMINATED'];
+  it('7. Terminal failure handling (FAILED, TIMED_OUT, CANCELLED, CANCELED, TERMINATED): never classified as RUNNING or delivered', async () => {
+    const terminalStatuses = ['FAILED', 'TIMED_OUT', 'CANCELLED', 'CANCELED', 'TERMINATED'];
 
     for (const termStatus of terminalStatuses) {
       const postId = `post_term_${termStatus.toLowerCase()}`;
@@ -482,5 +482,254 @@ describe('PublishingWorkflowOutboxService — Durable Temporal Workflow Outbox &
     const validRes = await outboxService.deliverEvent(claimed, claimed.claimToken);
     expect(validRes.success).toBe(true);
     expect(validRes.acknowledged).toBe(true);
+  });
+
+  describe('9. Strict Temporal Duplicate & State Verification (No Unverified Acknowledgments)', () => {
+    it('Case 1: Duplicate error followed by successful RUNNING inspection -> returns RUNNING and marks delivered', async () => {
+      const postId = 'post_dup_running';
+      const intId = 'int_dup_running';
+      const wfId = `post_${postId}_${intId}`;
+
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      // Mock start() throwing duplicate error
+      mockTemporal.client.getRawClient.mockReturnValueOnce({
+        workflow: {
+          start: vi.fn().mockRejectedValue({
+            name: 'WorkflowExecutionAlreadyStartedError',
+            message: 'Workflow execution already started',
+          }),
+        },
+      });
+
+      // Mock getWorkflowHandle returning RUNNING
+      mockTemporal.client.getWorkflowHandle = vi.fn().mockResolvedValue({
+        describe: vi.fn().mockResolvedValue({ status: { name: 'RUNNING' } }),
+      });
+
+      const [claimed] = await outboxService.claimPendingEvents('worker_dup_1');
+      const res = await outboxService.deliverEvent(claimed, claimed.claimToken);
+
+      expect(res.success).toBe(true);
+      expect(res.acknowledged).toBe(true);
+
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('delivered');
+      expect(stored.deliveredAt).toBeDefined();
+    });
+
+    it('Case 2: Duplicate error followed by successful COMPLETED inspection -> returns COMPLETED and marks delivered', async () => {
+      const postId = 'post_dup_completed';
+      const intId = 'int_dup_completed';
+      const wfId = `post_${postId}_${intId}`;
+
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      // Mock start() throwing duplicate error
+      mockTemporal.client.getRawClient.mockReturnValueOnce({
+        workflow: {
+          start: vi.fn().mockRejectedValue({
+            name: 'WorkflowExecutionAlreadyStartedError',
+            message: 'Workflow execution already started',
+          }),
+        },
+      });
+
+      // Mock getWorkflowHandle returning COMPLETED
+      mockTemporal.client.getWorkflowHandle = vi.fn().mockResolvedValue({
+        describe: vi.fn().mockResolvedValue({ status: { name: 'COMPLETED' } }),
+      });
+
+      const [claimed] = await outboxService.claimPendingEvents('worker_dup_2');
+      const res = await outboxService.deliverEvent(claimed, claimed.claimToken);
+
+      expect(res.success).toBe(true);
+      expect(res.acknowledged).toBe(true);
+
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('delivered');
+      expect(stored.deliveredAt).toBeDefined();
+    });
+
+    it('Case 3: Duplicate error followed by FAILED inspection -> throws error and does NOT mark delivered', async () => {
+      const postId = 'post_dup_failed';
+      const intId = 'int_dup_failed';
+
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      mockTemporal.client.getRawClient.mockReturnValueOnce({
+        workflow: {
+          start: vi.fn().mockRejectedValue({
+            name: 'WorkflowExecutionAlreadyStartedError',
+            message: 'Workflow execution already started',
+          }),
+        },
+      });
+
+      mockTemporal.client.getWorkflowHandle = vi.fn().mockResolvedValue({
+        describe: vi.fn().mockResolvedValue({ status: { name: 'FAILED' } }),
+      });
+
+      const [claimed] = await outboxService.claimPendingEvents('worker_dup_3');
+      const res = await outboxService.deliverEvent(claimed, claimed.claimToken);
+
+      expect(res.success).toBe(false);
+      expect(res.error).toContain('ended with terminal failure: FAILED');
+
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('pending');
+      expect(stored.deliveredAt).toBeUndefined();
+    });
+
+    it('Case 4: Duplicate error followed by describe connection failure -> throws retryable error and does NOT mark delivered', async () => {
+      const postId = 'post_dup_describe_err';
+      const intId = 'int_dup_describe_err';
+
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      mockTemporal.client.getRawClient.mockReturnValueOnce({
+        workflow: {
+          start: vi.fn().mockRejectedValue({
+            name: 'WorkflowExecutionAlreadyStartedError',
+            message: 'Workflow execution already started',
+          }),
+        },
+      });
+
+      // describe() throws connection error
+      mockTemporal.client.getWorkflowHandle = vi.fn().mockResolvedValue({
+        describe: vi.fn().mockRejectedValue(new Error('Connection reset by peer on Temporal gRPC endpoint')),
+      });
+
+      const [claimed] = await outboxService.claimPendingEvents('worker_dup_4');
+      const res = await outboxService.deliverEvent(claimed, claimed.claimToken);
+
+      expect(res.success).toBe(false);
+      expect(res.error).toContain('failed to describe workflow execution');
+
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('pending');
+      expect(stored.deliveredAt).toBeUndefined();
+    });
+
+    it('Case 5: Duplicate error with unavailable workflow handle -> throws retryable error and does NOT mark delivered', async () => {
+      const postId = 'post_dup_no_handle';
+      const intId = 'int_dup_no_handle';
+
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      mockTemporal.client.getRawClient.mockReturnValueOnce({
+        workflow: {
+          start: vi.fn().mockRejectedValue({
+            name: 'WorkflowExecutionAlreadyStartedError',
+            message: 'Workflow execution already started',
+          }),
+        },
+      });
+
+      // getWorkflowHandle returns null or throws handle error
+      mockTemporal.client.getWorkflowHandle = vi.fn().mockResolvedValue(null);
+
+      const [claimed] = await outboxService.claimPendingEvents('worker_dup_5');
+      const res = await outboxService.deliverEvent(claimed, claimed.claimToken);
+
+      expect(res.success).toBe(false);
+      expect(res.error).toContain('workflow handle is unavailable or invalid');
+
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('pending');
+      expect(stored.deliveredAt).toBeUndefined();
+    });
+
+    it('Case 6: Unknown workflow status -> throws retryable error and does NOT mark delivered', async () => {
+      const postId = 'post_dup_unknown_status';
+      const intId = 'int_dup_unknown_status';
+
+      const [event] = await outboxService.insertEventsInTransaction(mockPrisma, [
+        {
+          organizationId: 'org_1',
+          postId,
+          integrationId: intId,
+          provider: 'twitter',
+          state: 'QUEUE',
+        },
+      ]);
+
+      mockTemporal.client.getRawClient.mockReturnValueOnce({
+        workflow: {
+          start: vi.fn().mockRejectedValue({
+            name: 'WorkflowExecutionAlreadyStartedError',
+            message: 'Workflow execution already started',
+          }),
+        },
+      });
+
+      // describe() returns unknown status name
+      mockTemporal.client.getWorkflowHandle = vi.fn().mockResolvedValue({
+        describe: vi.fn().mockResolvedValue({ status: { name: 'SOME_UNEXPECTED_STATUS_VALUE' } }),
+      });
+
+      const [claimed] = await outboxService.claimPendingEvents('worker_dup_6');
+      const res = await outboxService.deliverEvent(claimed, claimed.claimToken);
+
+      expect(res.success).toBe(false);
+      expect(res.error).toMatch(/unknown or (unhandled|unverified) status: SOME_UNEXPECTED_STATUS_VALUE/);
+
+      const stored = await mockPrisma.publishingWorkflowOutbox.findUnique({
+        where: { postId_integrationId: { postId, integrationId: intId } },
+      });
+      expect(stored.status).toBe('pending');
+      expect(stored.deliveredAt).toBeUndefined();
+    });
   });
 });
