@@ -1,4 +1,4 @@
-import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import { PrismaRepository, PrismaTransaction } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { Injectable, Optional } from '@nestjs/common';
 import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import {
@@ -33,6 +33,7 @@ export class PostsRepository {
     private _tags: PrismaRepository<'tags'>,
     private _tagsPosts: PrismaRepository<'tagsPosts'>,
     private _errors: PrismaRepository<'errors'>,
+    private _transaction: PrismaTransaction,
     @Optional() private _callbackOutbox?: PublishingCallbackOutboxService
   ) {}
 
@@ -492,8 +493,9 @@ export class PostsRepository {
   private async _notifyWallzaStatus(
     post: any,
     status: 'published' | 'failed',
-    options?: { releaseUrl?: string; error?: any }
-  ) {
+    options?: { releaseUrl?: string; error?: any },
+    tx?: any
+  ): Promise<{ delivered: boolean; error?: string }> {
     try {
       // Decode wallzaMetadata from post.settings if present
       let wallzaPostId: string | null = null;
@@ -520,7 +522,7 @@ export class PostsRepository {
 
       if (!wallzaPostId) {
         // Not a WallzaOS-originated post; do not deliver callback
-        return;
+        return { delivered: false, error: 'No wallzaPostId on post' };
       }
 
       const platform = post.integration?.providerIdentifier || 'unknown';
@@ -531,28 +533,31 @@ export class PostsRepository {
           : JSON.stringify(options.error)
         : null;
 
-      // 1. Enqueue into durable PostgreSQL callback outbox table
+      // 1. Enqueue into durable PostgreSQL callback outbox table (atomically with tx if provided)
       if (this._callbackOutbox) {
         try {
-          await this._callbackOutbox.enqueueCallback({
-            organizationId: post.organizationId,
-            postId: post.id,
-            integrationId: post.integrationId,
-            wallzaPostId,
-            wallzaOrgId,
-            platform,
-            platformPostId: post.releaseId || null,
-            status,
-            attemptId,
-            error: errorMsg,
-            releaseUrl,
-          });
+          await this._callbackOutbox.enqueueCallback(
+            {
+              organizationId: post.organizationId,
+              postId: post.id,
+              integrationId: post.integrationId,
+              wallzaPostId,
+              wallzaOrgId,
+              platform,
+              platformPostId: post.releaseId || null,
+              status,
+              attemptId,
+              error: errorMsg,
+              releaseUrl,
+            },
+            tx
+          );
 
           // Trigger immediate delivery attempt asynchronously
           this._callbackOutbox.processCallbackQueue().catch((drainErr: any) => {
             console.warn(`[PostsRepository] Callback outbox drain error: ${drainErr.message}`);
           });
-          return;
+          return { delivered: true };
         } catch (enqueueErr: any) {
           console.error(
             `[PostsRepository] Failed to enqueue status callback into durable outbox: ${enqueueErr.message}. Falling back to direct signed HTTP delivery.`
@@ -560,7 +565,7 @@ export class PostsRepository {
         }
       }
 
-      // 2. Direct Fallback if service not injected (e.g. standalone test)
+      // 2. Direct Fallback if outbox unavailable or enqueue failed
       const wallzaUrl =
         process.env.WALLZAOS_INTERNAL_API_URL ||
         process.env.WALLZAOS_API_URL ||
@@ -591,50 +596,65 @@ export class PostsRepository {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 6000);
 
-      await fetch(`${wallzaUrl}/api/social/status-callback`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...signedHeaders,
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      }).catch((fetchErr) => {
-        console.warn(
-          `[PostsRepository] Direct callback failed for post ${post.id}: ${fetchErr.message}`
-        );
-      });
-      clearTimeout(timeoutId);
+      try {
+        const response = await fetch(`${wallzaUrl}/api/social/status-callback`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...signedHeaders,
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const errBody = await response.text().catch(() => '');
+          const errorMsg = `HTTP ${response.status} ${response.statusText}${errBody ? `: ${errBody}` : ''}`;
+          console.warn(`[PostsRepository] Direct callback rejected for post ${post.id}: ${errorMsg}`);
+          return { delivered: false, error: errorMsg };
+        }
+
+        return { delivered: true };
+      } catch (fetchErr: any) {
+        const errorMsg = fetchErr.name === 'AbortError' ? 'Direct callback request timed out after 6000ms' : fetchErr.message;
+        console.warn(`[PostsRepository] Direct callback failed for post ${post.id}: ${errorMsg}`);
+        return { delivered: false, error: errorMsg };
+      } finally {
+        clearTimeout(timeoutId);
+      }
     } catch (err: any) {
       console.warn(
         `[PostsRepository] Error in _notifyWallzaStatus for post ${post?.id}: ${err.message}`
       );
+      return { delivered: false, error: err.message };
     }
   }
 
   async updatePost(id: string, postId: string, releaseURL: string) {
-    const updated = await this._post.model.post.update({
-      where: {
-        id,
-      },
-      data: {
-        state: 'PUBLISHED',
-        releaseURL,
-        releaseId: postId,
-      },
-      include: {
-        integration: {
-          select: {
-            providerIdentifier: true,
+    return (this._transaction.model.$transaction as any)(async (tx: any) => {
+      const updated = await tx.post.update({
+        where: {
+          id,
+        },
+        data: {
+          state: 'PUBLISHED',
+          releaseURL,
+          releaseId: postId,
+        },
+        include: {
+          integration: {
+            select: {
+              providerIdentifier: true,
+            },
           },
         },
-      },
+      });
+
+      // Atomically enqueue status callback inside the same Prisma transaction
+      await this._notifyWallzaStatus(updated, 'published', { releaseUrl: releaseURL }, tx);
+
+      return updated;
     });
-
-    // Notify WallzaOS of successful publishing callback asynchronously
-    this._notifyWallzaStatus(updated, 'published', { releaseUrl: releaseURL });
-
-    return updated;
   }
 
   updateReleaseId(
@@ -675,44 +695,47 @@ export class PostsRepository {
   }
 
   async changeState(id: string, state: State, err?: any, body?: any) {
-    const update = await this._post.model.post.update({
-      where: {
-        id,
-      },
-      data: {
-        state,
-        ...(err
-          ? { error: typeof err === 'string' ? err : JSON.stringify(err) }
-          : {}),
-      },
-      include: {
-        integration: {
-          select: {
-            providerIdentifier: true,
+    return (this._transaction.model.$transaction as any)(async (tx: any) => {
+      const update = await tx.post.update({
+        where: {
+          id,
+        },
+        data: {
+          state,
+          ...(err
+            ? { error: typeof err === 'string' ? err : JSON.stringify(err) }
+            : {}),
+        },
+        include: {
+          integration: {
+            select: {
+              providerIdentifier: true,
+            },
           },
         },
-      },
+      });
+
+      if (state === 'ERROR' && err && body) {
+        try {
+          await tx.errors.create({
+            data: {
+              message: typeof err === 'string' ? err : JSON.stringify(err),
+              organizationId: update.organizationId,
+              platform: update.integration.providerIdentifier,
+              postId: update.id,
+              body: typeof body === 'string' ? body : JSON.stringify(body),
+            },
+          });
+        } catch (err) {}
+      }
+
+      if (state === 'ERROR') {
+        // Atomically enqueue failed status callback inside the same Prisma transaction
+        await this._notifyWallzaStatus(update, 'failed', { error: err }, tx);
+      }
+
+      return update;
     });
-
-    if (state === 'ERROR' && err && body) {
-      try {
-        await this._errors.model.errors.create({
-          data: {
-            message: typeof err === 'string' ? err : JSON.stringify(err),
-            organizationId: update.organizationId,
-            platform: update.integration.providerIdentifier,
-            postId: update.id,
-            body: typeof body === 'string' ? body : JSON.stringify(body),
-          },
-        });
-      } catch (err) {}
-    }
-
-    if (state === 'ERROR') {
-      this._notifyWallzaStatus(update, 'failed', { error: err });
-    }
-
-    return update;
   }
 
   getErrorsByPostIds(postIds: string[]) {
