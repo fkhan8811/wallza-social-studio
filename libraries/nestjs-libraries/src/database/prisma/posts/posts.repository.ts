@@ -496,143 +496,148 @@ export class PostsRepository {
     options?: { releaseUrl?: string; error?: any },
     tx?: any
   ): Promise<{ delivered: boolean; error?: string }> {
+    // Decode wallzaMetadata from post.settings if present
+    let wallzaPostId: string | null = null;
+    let wallzaOrgId: string | null = null;
+    let attemptId: string = 'attempt_1';
+
+    if (post?.settings) {
+      try {
+        const parsed = typeof post.settings === 'string' ? JSON.parse(post.settings) : post.settings;
+        if (parsed?.__wallza) {
+          wallzaPostId = parsed.__wallza.wallzaPostId || null;
+          wallzaOrgId = parsed.__wallza.wallzaOrgId || null;
+          attemptId = parsed.__wallza.attemptId || 'attempt_1';
+        }
+      } catch (parseErr) {
+        // ignore
+      }
+    }
+
+    // If wallzaPostId was not explicitly in metadata, check if post itself has wallzaPostId or fallback
+    if (!wallzaPostId && (post as any)?.wallzaPostId) {
+      wallzaPostId = (post as any).wallzaPostId;
+    }
+
+    if (!wallzaPostId) {
+      // Not a WallzaOS-originated post; do not deliver callback
+      return { delivered: false, error: 'No wallzaPostId on post' };
+    }
+
+    const platform = post.integration?.providerIdentifier || 'unknown';
+    const releaseUrl = options?.releaseUrl || post.releaseURL || null;
+    const errorMsg = options?.error
+      ? typeof options.error === 'string'
+        ? options.error
+        : JSON.stringify(options.error)
+      : null;
+
+    // 1. Transactional Outbox Enlistment:
+    // When executing inside an active transaction (tx), outbox insertion is mandatory.
+    // Outbox errors MUST NOT be swallowed so the transaction will safely roll back.
+    if (this._callbackOutbox) {
+      await this._callbackOutbox.enqueueCallback(
+        {
+          organizationId: post.organizationId,
+          postId: post.id,
+          integrationId: post.integrationId,
+          wallzaPostId,
+          wallzaOrgId,
+          platform,
+          platformPostId: post.releaseId || null,
+          status,
+          attemptId,
+          error: errorMsg,
+          releaseUrl,
+        },
+        tx
+      );
+
+      // If tx is absent (standalone), drain asynchronously. If tx is present, drain after tx commits.
+      if (!tx) {
+        this._callbackOutbox.processCallbackQueue().catch((drainErr: any) => {
+          console.warn(`[PostsRepository] Callback outbox drain error: ${drainErr.message}`);
+        });
+      }
+      return { delivered: true };
+    }
+
+    // 2. Direct HTTP Fallback only when no outbox service is configured (e.g. standalone/test mode)
+    return this.deliverDirectCallback({
+      organizationId: wallzaOrgId || post.organizationId,
+      wallzaPostId,
+      socialPostId: post.id,
+      integrationId: post.integrationId,
+      platform,
+      platformPostId: post.releaseId || null,
+      status,
+      attemptId,
+      error: errorMsg,
+      releaseUrl,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  public async deliverDirectCallback(payload: {
+    organizationId: string;
+    wallzaPostId: string;
+    socialPostId: string;
+    integrationId: string;
+    platform: string;
+    platformPostId?: string | null;
+    status: 'published' | 'failed';
+    attemptId?: string | null;
+    error?: string | null;
+    releaseUrl?: string | null;
+    timestamp?: string;
+  }): Promise<{ delivered: boolean; error?: string }> {
+    const wallzaUrl =
+      process.env.WALLZAOS_INTERNAL_API_URL ||
+      process.env.WALLZAOS_API_URL ||
+      process.env.MAIN_URL ||
+      'http://localhost:5011';
+
+    const signedHeaders = signInternalRequest({
+      method: 'POST',
+      path: '/api/social/status-callback',
+      audience: 'wallzaos',
+      body: payload,
+    });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+
     try {
-      // Decode wallzaMetadata from post.settings if present
-      let wallzaPostId: string | null = null;
-      let wallzaOrgId: string | null = null;
-      let attemptId: string = 'attempt_1';
-
-      if (post?.settings) {
-        try {
-          const parsed = typeof post.settings === 'string' ? JSON.parse(post.settings) : post.settings;
-          if (parsed?.__wallza) {
-            wallzaPostId = parsed.__wallza.wallzaPostId || null;
-            wallzaOrgId = parsed.__wallza.wallzaOrgId || null;
-            attemptId = parsed.__wallza.attemptId || 'attempt_1';
-          }
-        } catch (parseErr) {
-          // ignore
-        }
-      }
-
-      // If wallzaPostId was not explicitly in metadata, check if post itself has wallzaPostId or fallback
-      if (!wallzaPostId && (post as any)?.wallzaPostId) {
-        wallzaPostId = (post as any).wallzaPostId;
-      }
-
-      if (!wallzaPostId) {
-        // Not a WallzaOS-originated post; do not deliver callback
-        return { delivered: false, error: 'No wallzaPostId on post' };
-      }
-
-      const platform = post.integration?.providerIdentifier || 'unknown';
-      const releaseUrl = options?.releaseUrl || post.releaseURL || null;
-      const errorMsg = options?.error
-        ? typeof options.error === 'string'
-          ? options.error
-          : JSON.stringify(options.error)
-        : null;
-
-      // 1. Enqueue into durable PostgreSQL callback outbox table (atomically with tx if provided)
-      if (this._callbackOutbox) {
-        try {
-          await this._callbackOutbox.enqueueCallback(
-            {
-              organizationId: post.organizationId,
-              postId: post.id,
-              integrationId: post.integrationId,
-              wallzaPostId,
-              wallzaOrgId,
-              platform,
-              platformPostId: post.releaseId || null,
-              status,
-              attemptId,
-              error: errorMsg,
-              releaseUrl,
-            },
-            tx
-          );
-
-          // Trigger immediate delivery attempt asynchronously
-          this._callbackOutbox.processCallbackQueue().catch((drainErr: any) => {
-            console.warn(`[PostsRepository] Callback outbox drain error: ${drainErr.message}`);
-          });
-          return { delivered: true };
-        } catch (enqueueErr: any) {
-          console.error(
-            `[PostsRepository] Failed to enqueue status callback into durable outbox: ${enqueueErr.message}. Falling back to direct signed HTTP delivery.`
-          );
-        }
-      }
-
-      // 2. Direct Fallback if outbox unavailable or enqueue failed
-      const wallzaUrl =
-        process.env.WALLZAOS_INTERNAL_API_URL ||
-        process.env.WALLZAOS_API_URL ||
-        process.env.MAIN_URL ||
-        'http://localhost:5011';
-
-      const payload = {
-        organizationId: wallzaOrgId || post.organizationId,
-        wallzaPostId,
-        socialPostId: post.id,
-        integrationId: post.integrationId,
-        platform,
-        platformPostId: post.releaseId || null,
-        status,
-        attemptId,
-        error: errorMsg,
-        releaseUrl,
-        timestamp: new Date().toISOString(),
-      };
-
-      const signedHeaders = signInternalRequest({
+      const response = await fetch(`${wallzaUrl}/api/social/status-callback`, {
         method: 'POST',
-        path: '/api/social/status-callback',
-        audience: 'wallzaos',
-        body: payload,
+        headers: {
+          'Content-Type': 'application/json',
+          ...signedHeaders,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
-
-      try {
-        const response = await fetch(`${wallzaUrl}/api/social/status-callback`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...signedHeaders,
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          const errBody = await response.text().catch(() => '');
-          const errorMsg = `HTTP ${response.status} ${response.statusText}${errBody ? `: ${errBody}` : ''}`;
-          console.warn(`[PostsRepository] Direct callback rejected for post ${post.id}: ${errorMsg}`);
-          return { delivered: false, error: errorMsg };
-        }
-
-        return { delivered: true };
-      } catch (fetchErr: any) {
-        const errorMsg = fetchErr.name === 'AbortError' ? 'Direct callback request timed out after 6000ms' : fetchErr.message;
-        console.warn(`[PostsRepository] Direct callback failed for post ${post.id}: ${errorMsg}`);
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => '');
+        const errorMsg = `HTTP ${response.status} ${response.statusText}${errBody ? `: ${errBody}` : ''}`;
+        console.warn(`[PostsRepository] Direct callback rejected for post ${payload.socialPostId}: ${errorMsg}`);
         return { delivered: false, error: errorMsg };
-      } finally {
-        clearTimeout(timeoutId);
       }
-    } catch (err: any) {
-      console.warn(
-        `[PostsRepository] Error in _notifyWallzaStatus for post ${post?.id}: ${err.message}`
-      );
-      return { delivered: false, error: err.message };
+
+      return { delivered: true };
+    } catch (fetchErr: any) {
+      const errorMsg = fetchErr.name === 'AbortError' ? 'Direct callback request timed out after 6000ms' : fetchErr.message;
+      console.warn(`[PostsRepository] Direct callback failed for post ${payload.socialPostId}: ${errorMsg}`);
+      return { delivered: false, error: errorMsg };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
   async updatePost(id: string, postId: string, releaseURL: string) {
-    return (this._transaction.model.$transaction as any)(async (tx: any) => {
-      const updated = await tx.post.update({
+    const updated = await (this._transaction.model.$transaction as any)(async (tx: any) => {
+      const res = await tx.post.update({
         where: {
           id,
         },
@@ -650,11 +655,21 @@ export class PostsRepository {
         },
       });
 
-      // Atomically enqueue status callback inside the same Prisma transaction
-      await this._notifyWallzaStatus(updated, 'published', { releaseUrl: releaseURL }, tx);
+      // Atomically enqueue status callback inside the same Prisma transaction.
+      // If this throws, the transaction rolls back cleanly.
+      await this._notifyWallzaStatus(res, 'published', { releaseUrl: releaseURL }, tx);
 
-      return updated;
+      return res;
     });
+
+    // Trigger outbox drain post-commit
+    if (this._callbackOutbox) {
+      this._callbackOutbox.processCallbackQueue().catch((drainErr: any) => {
+        console.warn(`[PostsRepository] Callback outbox post-commit drain error: ${drainErr.message}`);
+      });
+    }
+
+    return updated;
   }
 
   updateReleaseId(
@@ -695,8 +710,8 @@ export class PostsRepository {
   }
 
   async changeState(id: string, state: State, err?: any, body?: any) {
-    return (this._transaction.model.$transaction as any)(async (tx: any) => {
-      const update = await tx.post.update({
+    const update = await (this._transaction.model.$transaction as any)(async (tx: any) => {
+      const res = await tx.post.update({
         where: {
           id,
         },
@@ -720,9 +735,9 @@ export class PostsRepository {
           await tx.errors.create({
             data: {
               message: typeof err === 'string' ? err : JSON.stringify(err),
-              organizationId: update.organizationId,
-              platform: update.integration.providerIdentifier,
-              postId: update.id,
+              organizationId: res.organizationId,
+              platform: res.integration.providerIdentifier,
+              postId: res.id,
               body: typeof body === 'string' ? body : JSON.stringify(body),
             },
           });
@@ -730,12 +745,22 @@ export class PostsRepository {
       }
 
       if (state === 'ERROR') {
-        // Atomically enqueue failed status callback inside the same Prisma transaction
-        await this._notifyWallzaStatus(update, 'failed', { error: err }, tx);
+        // Atomically enqueue failed status callback inside the same Prisma transaction.
+        // If outbox insertion fails, the transaction rolls back cleanly.
+        await this._notifyWallzaStatus(res, 'failed', { error: err }, tx);
       }
 
-      return update;
+      return res;
     });
+
+    // Trigger outbox drain post-commit
+    if (this._callbackOutbox && state === 'ERROR') {
+      this._callbackOutbox.processCallbackQueue().catch((drainErr: any) => {
+        console.warn(`[PostsRepository] Callback outbox post-commit drain error: ${drainErr.message}`);
+      });
+    }
+
+    return update;
   }
 
   getErrorsByPostIds(postIds: string[]) {

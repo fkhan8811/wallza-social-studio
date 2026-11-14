@@ -22,7 +22,7 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd pg_isready
-          --health-cmd-interval 5s
+          --health-interval 5s
           --health-timeout 5s
           --health-retries 5
 
@@ -72,6 +72,9 @@ jobs:
 
       - name: Run PostgreSQL Fencing Concurrency Verification
         run: node scripts/test_postgres_fencing_concurrency.cjs
+
+      - name: Run PostgreSQL Outbox Transaction Safety Verification
+        run: node scripts/test_outbox_transaction_safety.cjs
 
       - name: Build
         run: pnpm run build
