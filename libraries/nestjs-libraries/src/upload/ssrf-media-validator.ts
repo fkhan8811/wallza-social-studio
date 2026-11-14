@@ -199,15 +199,18 @@ export async function validateMediaUrlComprehensive(
       throw new HttpException('Embedded credentials in media URL are prohibited.', HttpStatus.BAD_REQUEST);
     }
 
-    const hostname = parsed.hostname.toLowerCase();
+    const rawHostname = parsed.hostname.toLowerCase();
+    const cleanHostname = rawHostname.startsWith('[') && rawHostname.endsWith(']')
+      ? rawHostname.slice(1, -1)
+      : rawHostname;
 
     // 3. Resolve DNS and check all returned IPv4 and IPv6 addresses against private/reserved ranges
-    if (!options.skipDns && (isProd || !['localhost', '127.0.0.1', '::1'].includes(hostname))) {
+    if (!options.skipDns && (isProd || !['localhost', '127.0.0.1', '::1'].includes(cleanHostname))) {
       // Check direct IP hostname
-      if (ipaddr.isValid(hostname) || /^\d+$/.test(hostname) || /^0x[0-9a-f]+$/i.test(hostname)) {
-        if (isPrivateOrReservedIp(hostname)) {
+      if (ipaddr.isValid(cleanHostname) || /^\d+$/.test(cleanHostname) || /^0x[0-9a-f]+$/i.test(cleanHostname)) {
+        if (isPrivateOrReservedIp(cleanHostname)) {
           throw new HttpException(
-            `Media URL points to a prohibited or private IP address: ${hostname}`,
+            `Media URL points to a prohibited or private IP address: ${rawHostname}`,
             HttpStatus.BAD_REQUEST
           );
         }
@@ -215,22 +218,22 @@ export async function validateMediaUrlComprehensive(
         // Resolve DNS pre-check
         let addresses: dns.LookupAddress[] = [];
         try {
-          addresses = await dns.promises.lookup(hostname, { all: true });
+          addresses = await dns.promises.lookup(rawHostname, { all: true });
         } catch (err: any) {
           throw new HttpException(
-            `Unable to resolve media hostname '${hostname}': ${err.message}`,
+            `Unable to resolve media hostname '${rawHostname}': ${err.message}`,
             HttpStatus.BAD_REQUEST
           );
         }
 
         if (addresses.length === 0) {
-          throw new HttpException(`No DNS records found for media hostname '${hostname}'`, HttpStatus.BAD_REQUEST);
+          throw new HttpException(`No DNS records found for media hostname '${rawHostname}'`, HttpStatus.BAD_REQUEST);
         }
 
         for (const record of addresses) {
           if (isPrivateOrReservedIp(record.address)) {
             throw new HttpException(
-              `Media hostname '${hostname}' resolves to prohibited internal address: ${record.address}`,
+              `Media hostname '${rawHostname}' resolves to prohibited internal address: ${record.address}`,
               HttpStatus.BAD_REQUEST
             );
           }
