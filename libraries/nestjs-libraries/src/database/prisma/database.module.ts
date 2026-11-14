@@ -56,6 +56,7 @@ import { ErrorsService } from '@gitroom/nestjs-libraries/database/prisma/errors/
 import { AdminStatsRepository } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.repository';
 import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.service';
 import { PublishingWorkflowOutboxService } from '@gitroom/nestjs-libraries/database/prisma/posts/publishing-workflow-outbox.service';
+import { PublishingCallbackOutboxService } from '@gitroom/nestjs-libraries/database/prisma/posts/publishing-callback-outbox.service';
 
 @Global()
 @Module({
@@ -121,6 +122,7 @@ import { PublishingWorkflowOutboxService } from '@gitroom/nestjs-libraries/datab
     NonceCleanupService,
     SsrfMediaIngestionService,
     PublishingWorkflowOutboxService,
+    PublishingCallbackOutboxService,
   ],
   get exports() {
     return this.providers;

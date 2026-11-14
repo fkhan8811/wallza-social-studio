@@ -288,6 +288,7 @@ export class WallzaSyncController {
       scheduledAt?: string;
       idempotencyKey?: string;
       wallzaPostId?: string;
+      attemptId?: string;
     }
   ) {
     const auth = await verifyInternalRequestAsync(req, {
@@ -307,6 +308,7 @@ export class WallzaSyncController {
       scheduledAt,
       idempotencyKey,
       wallzaPostId,
+      attemptId,
     } = body || {};
 
     if (!organizationId) {
@@ -652,7 +654,14 @@ export class WallzaSyncController {
               image: ingestedMedia.map((m) => ({ url: m.url, path: m.path })),
             },
           ],
-          settings: {},
+          settings: {
+            __wallza: {
+              wallzaPostId: wallzaPostId || null,
+              wallzaOrgId: organizationId || null,
+              attemptId: attemptId || 'attempt_1',
+              idempotencyKey: trackingKey,
+            },
+          },
         })),
       };
 

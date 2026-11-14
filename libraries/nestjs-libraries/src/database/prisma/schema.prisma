@@ -61,6 +61,7 @@ model Organization {
   hashtagGroups      HashtagGroup[]
   publishingIdempotency PublishingIdempotency[]
   publishingWorkflowOutbox PublishingWorkflowOutbox[]
+  publishingCallbackOutbox PublishingCallbackOutbox[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -580,6 +581,7 @@ model Integration {
   plugs                 Plugs[]
   posts                 Post[]
   workflowOutbox        PublishingWorkflowOutbox[]
+  callbackOutbox        PublishingCallbackOutbox[]
 
   @@unique([organizationId, internalId])
   @@index([rootInternalId])
@@ -685,6 +687,7 @@ model Post {
   submittedForOrganization   Organization?             @relation("submittedForOrg", fields: [submittedForOrganizationId], references: [id])
   tags                       TagsPosts[]
   workflowOutbox             PublishingWorkflowOutbox[]
+  callbackOutbox             PublishingCallbackOutbox[]
 
   @@index([group])
   @@index([batchId])
@@ -2251,5 +2254,39 @@ model PublishingWorkflowOutbox {
   @@index([status, leaseExpiresAt])
   @@index([organizationId, status])
   @@index([workflowId])
+}
+
+model PublishingCallbackOutbox {
+  id                  String       @id @default(cuid())
+  organizationId      String
+  postId              String
+  integrationId       String
+  wallzaPostId        String
+  wallzaOrgId         String?
+  platform            String
+  platformPostId      String?
+  status              String       // "published" | "failed"
+  attemptId           String?      // Publishing attempt identity
+  error               String?
+  releaseUrl          String?
+  deliveryStatus      String       @default("pending") // "pending" | "processing" | "delivered" | "failed"
+  leaseOwner          String?
+  claimToken          String?
+  leaseExpiresAt      DateTime?
+  retryCount          Int          @default(0)
+  maxRetries          Int          @default(10)
+  lastError           String?
+  deliveredAt         DateTime?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  post                Post         @relation(fields: [postId], references: [id], onDelete: Cascade)
+  integration         Integration  @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, integrationId, status, attemptId])
+  @@index([deliveryStatus, leaseExpiresAt])
+  @@index([organizationId, deliveryStatus])
+  @@index([wallzaPostId])
 }
 

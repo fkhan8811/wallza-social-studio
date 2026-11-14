@@ -1,5 +1,5 @@
 import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import {
   APPROVED_SUBMIT_FOR_ORDER,
@@ -17,6 +17,7 @@ import utc from 'dayjs/plugin/utc';
 import { v4 as uuidv4 } from 'uuid';
 import { CreateTagDto } from '@gitroom/nestjs-libraries/dtos/posts/create.tag.dto';
 import { signInternalRequest } from '@gitroom/nestjs-libraries/auth/internal-hmac.util';
+import { PublishingCallbackOutboxService } from './publishing-callback-outbox.service';
 
 dayjs.extend(isoWeek);
 dayjs.extend(weekOfYear);
@@ -31,7 +32,8 @@ export class PostsRepository {
     private _comments: PrismaRepository<'comments'>,
     private _tags: PrismaRepository<'tags'>,
     private _tagsPosts: PrismaRepository<'tagsPosts'>,
-    private _errors: PrismaRepository<'errors'>
+    private _errors: PrismaRepository<'errors'>,
+    @Optional() private _callbackOutbox?: PublishingCallbackOutboxService
   ) {}
 
   get model(): any {
@@ -493,18 +495,66 @@ export class PostsRepository {
     options?: { releaseUrl?: string; error?: any }
   ) {
     try {
-      const idempotencyKey = post?.idempotencyKey || '';
-      let wallzaPostId = post?.releaseId || '';
+      // Decode wallzaMetadata from post.settings if present
+      let wallzaPostId: string | null = null;
+      let wallzaOrgId: string | null = null;
+      let attemptId: string = 'attempt_1';
 
-      // Check if this post was originated from WallzaOS dispatch
-      // In wallza-sync.controller, idempotencyKey = trackingKey and releaseId = trackingKey
-      // or wallzaPostId is passed in metadata
-      if (!wallzaPostId && !idempotencyKey) {
+      if (post?.settings) {
+        try {
+          const parsed = typeof post.settings === 'string' ? JSON.parse(post.settings) : post.settings;
+          if (parsed?.__wallza) {
+            wallzaPostId = parsed.__wallza.wallzaPostId || null;
+            wallzaOrgId = parsed.__wallza.wallzaOrgId || null;
+            attemptId = parsed.__wallza.attemptId || 'attempt_1';
+          }
+        } catch (parseErr) {
+          // ignore
+        }
+      }
+
+      // If wallzaPostId was not explicitly in metadata, check if post itself has wallzaPostId or fallback
+      if (!wallzaPostId && (post as any)?.wallzaPostId) {
+        wallzaPostId = (post as any).wallzaPostId;
+      }
+
+      if (!wallzaPostId) {
+        // Not a WallzaOS-originated post; do not deliver callback
         return;
       }
 
-      // If releaseId is a UUID or integer, it represents the Wallza post id
-      // If releaseId was set to provider postId, check idempotencyKey pattern
+      const platform = post.integration?.providerIdentifier || 'unknown';
+      const releaseUrl = options?.releaseUrl || post.releaseURL || null;
+      const errorMsg = options?.error
+        ? typeof options.error === 'string'
+          ? options.error
+          : JSON.stringify(options.error)
+        : null;
+
+      // 1. Enqueue into durable PostgreSQL callback outbox table
+      if (this._callbackOutbox) {
+        await this._callbackOutbox.enqueueCallback({
+          organizationId: post.organizationId,
+          postId: post.id,
+          integrationId: post.integrationId,
+          wallzaPostId,
+          wallzaOrgId,
+          platform,
+          platformPostId: post.releaseId || null,
+          status,
+          attemptId,
+          error: errorMsg,
+          releaseUrl,
+        });
+
+        // Trigger immediate delivery attempt
+        this._callbackOutbox.processCallbackQueue().catch((drainErr) => {
+          console.warn(`[PostsRepository] Callback outbox drain error: ${drainErr.message}`);
+        });
+        return;
+      }
+
+      // 2. Direct Fallback if service not injected (e.g. standalone test)
       const wallzaUrl =
         process.env.WALLZAOS_INTERNAL_API_URL ||
         process.env.WALLZAOS_API_URL ||
@@ -512,17 +562,16 @@ export class PostsRepository {
         'http://localhost:5011';
 
       const payload = {
-        organizationId: post.organizationId,
-        wallzaPostId: post.releaseId || post.idempotencyKey || post.id,
-        platform: post.integration?.providerIdentifier || 'unknown',
+        organizationId: wallzaOrgId || post.organizationId,
+        wallzaPostId,
+        socialPostId: post.id,
+        integrationId: post.integrationId,
+        platform,
         platformPostId: post.releaseId || null,
         status,
-        error: options?.error
-          ? typeof options.error === 'string'
-            ? options.error
-            : JSON.stringify(options.error)
-          : null,
-        releaseUrl: options?.releaseUrl || post.releaseURL || null,
+        attemptId,
+        error: errorMsg,
+        releaseUrl,
         timestamp: new Date().toISOString(),
       };
 
@@ -545,15 +594,14 @@ export class PostsRepository {
         body: JSON.stringify(payload),
         signal: controller.signal,
       }).catch((fetchErr) => {
-        // Log callback delivery failure non-blockingly
         console.warn(
-          `[PostsRepository] Failed to deliver Wallza status callback for post ${post.id}: ${fetchErr.message}`
+          `[PostsRepository] Direct callback failed for post ${post.id}: ${fetchErr.message}`
         );
       });
       clearTimeout(timeoutId);
     } catch (err: any) {
       console.warn(
-        `[PostsRepository] Internal error notifying Wallza status: ${err.message}`
+        `[PostsRepository] Error in _notifyWallzaStatus for post ${post?.id}: ${err.message}`
       );
     }
   }
