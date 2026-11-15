@@ -142,7 +142,14 @@ export async function verifyWallzaInternalRequest(
     const bodySource = (req as any).rawBody !== undefined ? (req as any).rawBody : req.body;
     const bodyHash = computeBodySha256(bodySource);
 
-    const pathsToCheck = Array.from(new Set([rawPath, req.path])).filter(Boolean);
+    const pathsToCheck = Array.from(new Set([
+      rawPath,
+      req.path,
+      rawPath.replace(/^\/api/, ''),
+      '/api' + rawPath,
+      req.path ? req.path.replace(/^\/api/, '') : '',
+      req.path ? '/api' + req.path : '',
+    ])).filter(Boolean);
 
     let verified = false;
     for (const p of pathsToCheck) {
