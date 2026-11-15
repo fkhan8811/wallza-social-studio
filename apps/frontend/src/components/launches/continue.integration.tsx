@@ -56,13 +56,20 @@ export const ContinueIntegration: FC<{
     [logged, push]
   );
   const modifiedParams = useMemo(() => {
+    const hash =
+      typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
+    const hashParams = new URLSearchParams(hash);
+    const fragmentCredentials = hashParams.get('credentials');
+    const fragmentState = hashParams.get('state');
+
     if (provider === 'mewe') {
       return {
-        state: searchParams.state || '',
-        code: searchParams.loginRequestToken || '',
+        state: fragmentState || searchParams.state || '',
+        code: hashParams.get('loginRequestToken') || searchParams.loginRequestToken || '',
         refresh: searchParams.refresh || '',
       };
     }
+
     if (provider === 'x') {
       return {
         state: searchParams.oauth_token || '',
@@ -72,7 +79,6 @@ export const ContinueIntegration: FC<{
     }
 
     if (provider === 'tiktok-business') {
-      // The TikTok Business API redirects back with `auth_code` instead of `code`
       return {
         state: searchParams.state || '',
         code: searchParams.auth_code || searchParams.code || '',
@@ -88,14 +94,11 @@ export const ContinueIntegration: FC<{
       };
     }
 
-    if (provider === 'mewe') {
-      const hash =
-        typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
-      const hashParams = new URLSearchParams(hash);
+    if (fragmentCredentials || fragmentState) {
       return {
-        state: hashParams.get('state') || searchParams.state || '',
-        code: hashParams.get('loginRequestToken') || '',
-        refresh: searchParams.refresh || '',
+        ...searchParams,
+        ...(fragmentState ? { state: fragmentState } : {}),
+        ...(fragmentCredentials ? { code: fragmentCredentials } : {}),
       };
     }
 
@@ -103,6 +106,49 @@ export const ContinueIntegration: FC<{
   }, []);
 
   useEffect(() => {
+    // OAuth credentials and callback codes are consumed from the initial URL
+    // into modifiedParams above. Remove them from browser history immediately.
+    if (typeof window !== 'undefined') {
+      const cleanedUrl = new URL(window.location.href);
+      [
+        'code',
+        'auth_code',
+        'oauth_verifier',
+        'loginRequestToken',
+        'oauth_token',
+        'access_token',
+        'refresh_token',
+        'refresh',
+        'state',
+        'device_id',
+      ].forEach((key) => cleanedUrl.searchParams.delete(key));
+
+      if (cleanedUrl.hash) {
+        const hashParams = new URLSearchParams(cleanedUrl.hash.slice(1));
+        [
+          'code',
+          'auth_code',
+          'oauth_verifier',
+          'loginRequestToken',
+          'oauth_token',
+          'access_token',
+          'refresh_token',
+          'refresh',
+          'state',
+          'device_id',
+          'credentials',
+        ].forEach((key) => hashParams.delete(key));
+        const remainingHash = hashParams.toString();
+        cleanedUrl.hash = remainingHash ? `#${remainingHash}` : '';
+      }
+
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+    }
+
     (async () => {
       const timezone = String(newDayjs().utcOffset());
 
