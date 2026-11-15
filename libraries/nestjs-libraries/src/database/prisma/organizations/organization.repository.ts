@@ -714,12 +714,22 @@ export class OrganizationRepository {
   async findByWallzaOrgId(wallzaOrgId: string) {
     return this._organization.model.organization.findFirst({
       where: {
-        description: `wallza_org:${wallzaOrgId}`,
+        OR: [
+          { wallzaOrgId },
+          { description: `wallza_org:${wallzaOrgId}` },
+        ],
         deletedAt: null,
       },
       include: {
         subscription: true,
       },
+    });
+  }
+
+  async setWallzaOrgId(organizationId: string, wallzaOrgId: string) {
+    return this._organization.model.organization.update({
+      where: { id: organizationId },
+      data: { wallzaOrgId },
     });
   }
 
@@ -731,6 +741,7 @@ export class OrganizationRepository {
       data: {
         name: name ? `${name} (WallzaOS)` : `Wallza Organization ${wallzaOrgId.slice(0, 8)}`,
         description: `wallza_org:${wallzaOrgId}`,
+        wallzaOrgId,
         apiKey: AuthService.fixedEncryption(makeSecureId(20)),
         isTrailing: false,
         subscription: {
