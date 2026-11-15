@@ -791,23 +791,6 @@ export const LaunchesComponent = () => {
           }
 
           await startOAuth();
-          if (!authResponse.ok) {
-            toast.show(
-              t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
-              'warning'
-            );
-            return;
-          }
-          const auth = await authResponse.json();
-          if (auth?.err || !auth?.url) {
-            toast.show(
-              t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
-              'warning'
-            );
-            return;
-          }
-
-          window.location.href = auth.url;
         } catch {
           toast.show(
             t('could_not_connect_to_platform', 'Could not initiate connection to platform'),

@@ -7,7 +7,7 @@ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { PlugDto } from '@gitroom/nestjs-libraries/dtos/plugs/plug.dto';
-import { decideSocialSyncGeneration } from './social.sync.generation.policy';
+import { decideSocialSyncGeneration, SocialSyncGenerationDecision } from './social.sync.generation.policy';
 
 @Injectable()
 export class IntegrationRepository {
@@ -344,10 +344,10 @@ export class IntegrationRepository {
           };
           const current = await tx.socialSyncGeneration.findUnique({ where: key });
 
-          const decision = decideSocialSyncGeneration(current, generation, action);
-          if (!decision.allowed) {
+          const decision: SocialSyncGenerationDecision = decideSocialSyncGeneration(current, generation, action);
+          if (decision.allowed === false) {
             return {
-              allowed: false,
+              allowed: false as const,
               currentGeneration: decision.currentGeneration,
               reason: decision.reason,
             };
