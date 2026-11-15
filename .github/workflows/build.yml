@@ -9,7 +9,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postiz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postiz"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postiz?schema=public
 
     strategy:
       matrix:
@@ -51,9 +68,10 @@ jobs:
         run: pnpm install
 
       - name: Validate Prisma schema
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postiz?schema=public
         run: pnpm exec prisma validate --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
+
+      - name: Push Prisma schema to disposable CI database
+        run: pnpm run prisma-db-push
 
       - name: Test Wallza/Postiz release policies
         run: pnpm run test:wallza-postiz
