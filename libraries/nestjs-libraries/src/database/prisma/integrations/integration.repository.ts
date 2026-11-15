@@ -309,10 +309,9 @@ export class IntegrationRepository {
   }
 
   /**
-   * Serializes the generation decision and the Integration row mutation in
-   * the SAME PostgreSQL transaction. This is the actual stale-write fence:
-   * a lower generation cannot pass a check and then mutate after a newer
-   * disconnect/reconnect has committed.
+   * Applies the generation check and the Integration row write in one
+   * serializable PostgreSQL transaction. The write cannot commit after a
+   * newer disconnect/reconnect has advanced the same account generation.
    */
   private async withGenerationFence<T>(
     organizationId: string,
@@ -382,8 +381,8 @@ export class IntegrationRepository {
             });
           }
 
-          // Same-generation/same-action replays run the operation again. This
-          // makes failed writes retryable without allowing an opposite action.
+          // Replaying the same generation/action repeats the idempotent
+          // upsert or disconnect while a conflicting action remains rejected.
           const result = await operation(tx);
           return {
             allowed: true,
@@ -420,7 +419,12 @@ export class IntegrationRepository {
       generation,
       'disconnect',
       (tx) => tx.integration.updateMany({
-        where: { organizationId, internalId, providerIdentifier: provider.trim().toLowerCase(), deletedAt: null },
+        where: {
+          organizationId,
+          internalId,
+          providerIdentifier: provider.trim().toLowerCase(),
+          deletedAt: null,
+        },
         data: { deletedAt: new Date() },
       })
     );
@@ -498,16 +502,11 @@ export class IntegrationRepository {
             : {}),
           ...(customInstanceDetails ? { customInstanceDetails } : {}),
           type: type as any,
-          ...(!refresh
-            ? {
-                inBetweenSteps: isBetweenSteps,
-              }
-            : {}),
+          ...(!refresh ? { inBetweenSteps: isBetweenSteps } : {}),
           ...(picture ? { picture } : {}),
           profile: username,
           providerIdentifier: provider,
           token,
-          // never wipe a stored refresh token with an empty one
           ...(refreshToken ? { refreshToken } : {}),
           ...(expiresIn
             ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
@@ -523,20 +522,12 @@ export class IntegrationRepository {
         const rootId =
           (
             await db.integration.findFirst({
-              where: {
-                organizationId: org,
-                internalId: internalId,
-              },
+              where: { organizationId: org, internalId },
             })
           )?.rootInternalId || internalId;
 
         await db.integration.updateMany({
-          where: {
-            id: {
-              not: upsert.id,
-            },
-            rootInternalId: rootId,
-          },
+          where: { id: { not: upsert.id }, rootInternalId: rootId },
           data: {
             token,
             refreshToken,
@@ -563,5 +554,597 @@ export class IntegrationRepository {
     }
 
     return persist(this._integration.model);
+  }
+
+  needsToBeRefreshed() {
+    return this._integration.model.integration.findMany({
+      where: {
+        tokenExpiration: {
+          lte: dayjs().add(1, 'day').toDate(),
+        },
+        inBetweenSteps: false,
+        deletedAt: null,
+        refreshNeeded: false,
+      },
+    });
+  }
+
+  async setBetweenRefreshSteps(id: string) {
+    return this._integration.model.integration.update({
+      where: {
+        id,
+      },
+      data: {
+        inBetweenSteps: true,
+      },
+    });
+  }
+  // Only the attempt that flips the flag reports it, so parallel failed
+  // refreshes of an already flagged channel do not notify again
+  async refreshNeeded(org: string, id: string) {
+    const { count } = await this._integration.model.integration.updateMany({
+      where: {
+        id,
+        organizationId: org,
+        refreshNeeded: false,
+      },
+      data: {
+        refreshNeeded: true,
+      },
+    });
+
+    return count === 1;
+  }
+
+  updateNameAndUrl(id: string, name: string, url: string) {
+    return this._integration.model.integration.update({
+      select: {
+        id: true,
+      },
+      where: {
+        id,
+      },
+      data: {
+        ...(name ? { name } : {}),
+        ...(url ? { picture: url } : {}),
+      },
+    });
+  }
+
+  getIntegrationById(org: string, id: string) {
+    return this._integration.model.integration.findFirst({
+      where: {
+        organizationId: org,
+        id,
+      },
+    });
+  }
+
+  async getIntegrationForOrder(
+    id: string,
+    order: string,
+    user: string,
+    org: string
+  ) {
+    const integration = await this._posts.model.post.findFirst({
+      where: {
+        integrationId: id,
+        submittedForOrder: {
+          id: order,
+          messageGroup: {
+            OR: [
+              { sellerId: user },
+              { buyerId: user },
+              { buyerOrganizationId: org },
+            ],
+          },
+        },
+      },
+      select: {
+        integration: {
+          select: {
+            id: true,
+            name: true,
+            picture: true,
+            inBetweenSteps: true,
+            providerIdentifier: true,
+          },
+        },
+      },
+    });
+
+    return integration?.integration;
+  }
+
+  async updateOnCustomerName(org: string, id: string, name: string) {
+    const customer = !name
+      ? undefined
+      : (await this._customers.model.customer.findFirst({
+          where: {
+            orgId: org,
+            name,
+          },
+        })) ||
+        (await this._customers.model.customer.create({
+          data: {
+            name,
+            orgId: org,
+          },
+        }));
+
+    return this._integration.model.integration.update({
+      select: {
+        id: true,
+      },
+      where: {
+        id,
+        organizationId: org,
+      },
+      data: {
+        customer: !customer
+          ? { disconnect: true }
+          : {
+              connect: {
+                id: customer.id,
+              },
+            },
+      },
+    });
+  }
+
+  updateIntegrationGroup(org: string, id: string, group: string) {
+    return this._integration.model.integration.update({
+      select: {
+        id: true,
+      },
+      where: {
+        id,
+        organizationId: org,
+      },
+      data: !group
+        ? {
+            customer: {
+              disconnect: true,
+            },
+          }
+        : {
+            customer: {
+              connect: {
+                id: group,
+              },
+            },
+          },
+    });
+  }
+
+  getCustomerByName(orgId: string, name: string) {
+    return this._customers.model.customer.findFirst({
+      where: {
+        orgId,
+        name,
+        deletedAt: null,
+      },
+    });
+  }
+
+  updateCustomerName(orgId: string, id: string, name: string) {
+    return this._customers.model.customer.update({
+      where: {
+        id,
+        orgId,
+      },
+      data: {
+        name,
+      },
+    });
+  }
+
+  customers(orgId: string) {
+    return this._customers.model.customer.findMany({
+      where: {
+        orgId,
+        deletedAt: null,
+      },
+    });
+  }
+
+  getIntegrationsList(org: string) {
+    return this._integration.model.integration.findMany({
+      where: {
+        organizationId: org,
+        deletedAt: null,
+      },
+      include: {
+        customer: true,
+      },
+    });
+  }
+
+  private async latestPostsFor(
+    org: string,
+    state: 'PUBLISHED' | 'ERROR',
+    field: 'publishDate' | 'updatedAt',
+    options: { topLevelOnly: boolean; includeDeleted: boolean },
+    groups: { integrationId: string; date: Date | null }[]
+  ) {
+    const matches = groups.filter((group) => group.date);
+
+    if (!matches.length) {
+      return [];
+    }
+
+    return this._posts.model.post.findMany({
+      where: {
+        organizationId: org,
+        state,
+        ...(options.includeDeleted ? {} : { deletedAt: null }),
+        ...(options.topLevelOnly ? { parentPostId: null } : {}),
+        OR: matches.map(
+          (group) =>
+            ({
+              integrationId: group.integrationId,
+              [field]: group.date,
+            } as Prisma.PostWhereInput)
+        ),
+      },
+      orderBy: {
+        id: 'asc',
+      },
+      select: {
+        id: true,
+        integrationId: true,
+        publishDate: true,
+        updatedAt: true,
+        releaseURL: true,
+        error: true,
+      },
+    });
+  }
+
+  private firstPerIntegration<T extends { integrationId: string }>(posts: T[]) {
+    const byIntegration = new Map<string, T>();
+
+    for (const post of posts) {
+      if (!byIntegration.has(post.integrationId)) {
+        byIntegration.set(post.integrationId, post);
+      }
+    }
+
+    return byIntegration;
+  }
+
+  async getChannelHealth(org: string, includeDeleted = false) {
+    const [integrations, lastPublished, lastErrored] = await Promise.all([
+      this._integration.model.integration.findMany({
+        where: {
+          organizationId: org,
+        },
+        orderBy: {
+          createdAt: 'asc',
+        },
+        select: {
+          id: true,
+          internalId: true,
+          name: true,
+          providerIdentifier: true,
+          type: true,
+          disabled: true,
+          refreshNeeded: true,
+          inBetweenSteps: true,
+          tokenExpiration: true,
+          deletedAt: true,
+          createdAt: true,
+          updatedAt: true,
+          customer: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+        },
+      }),
+      this._posts.model.post.groupBy({
+        by: ['integrationId'],
+        where: {
+          organizationId: org,
+          state: 'PUBLISHED',
+          ...(includeDeleted ? {} : { deletedAt: null }),
+          parentPostId: null,
+        },
+        _max: { publishDate: true },
+      }),
+      this._posts.model.post.groupBy({
+        by: ['integrationId'],
+        where: {
+          organizationId: org,
+          state: 'ERROR',
+          ...(includeDeleted ? {} : { deletedAt: null }),
+        },
+        _max: { updatedAt: true },
+      }),
+    ]);
+
+    const [publishedPosts, erroredPosts] = await Promise.all([
+      this.latestPostsFor(
+        org,
+        'PUBLISHED',
+        'publishDate',
+        { topLevelOnly: true, includeDeleted },
+        lastPublished.map((group) => ({
+          integrationId: group.integrationId,
+          date: group._max.publishDate,
+        }))
+      ),
+      this.latestPostsFor(
+        org,
+        'ERROR',
+        'updatedAt',
+        { topLevelOnly: false, includeDeleted },
+        lastErrored.map((group) => ({
+          integrationId: group.integrationId,
+          date: group._max.updatedAt,
+        }))
+      ),
+    ]);
+
+    const publishedByIntegration = this.firstPerIntegration(publishedPosts);
+    const erroredByIntegration = this.firstPerIntegration(erroredPosts);
+
+    return integrations.map((integration) => {
+      const published = publishedByIntegration.get(integration.id);
+      const errored = erroredByIntegration.get(integration.id);
+
+      return {
+        ...integration,
+        lastPublishedAt: published?.publishDate || null,
+        lastPublishedPostId: published?.id || null,
+        lastPublishedUrl: published?.releaseURL || null,
+        lastErrorAt: errored?.updatedAt || null,
+        lastErrorPostId: errored?.id || null,
+        lastError: errored?.error || null,
+      };
+    });
+  }
+
+  async disableChannel(org: string, id: string) {
+    await this._integration.model.integration.update({
+      where: {
+        id,
+        organizationId: org,
+      },
+      data: {
+        disabled: true,
+      },
+    });
+  }
+
+  async enableChannel(org: string, id: string) {
+    await this._integration.model.integration.update({
+      where: {
+        id,
+        organizationId: org,
+      },
+      data: {
+        disabled: false,
+      },
+    });
+  }
+
+  getPostsForChannel(org: string, id: string) {
+    return this._posts.model.post.groupBy({
+      by: ['group'],
+      where: {
+        organizationId: org,
+        integrationId: id,
+        deletedAt: null,
+      },
+    });
+  }
+
+  deleteChannel(org: string, id: string) {
+    return this._integration.model.integration.update({
+      select: {
+        id: true,
+      },
+      where: {
+        id,
+        organizationId: org,
+      },
+      data: {
+        deletedAt: new Date(),
+      },
+    });
+  }
+
+  async deleteIntegrationsForAccount(org: string) {
+    const hash = (value: string) =>
+      createHash('md5').update(value).digest('hex');
+
+    await this._posts.model.post.updateMany({
+      where: {
+        organizationId: org,
+        deletedAt: null,
+      },
+      data: {
+        deletedAt: new Date(),
+      },
+    });
+
+    const integrations = await this._integration.model.integration.findMany({
+      where: {
+        organizationId: org,
+      },
+    });
+
+    // md5 is deterministic, so a hashed rootInternalId can still be matched
+    // by checkPreviousConnections when the same channel is connected again
+    // from a new account.
+    for (const integration of integrations) {
+      await this._integration.model.integration.update({
+        where: {
+          id: integration.id,
+        },
+        data: {
+          name: hash(integration.name),
+          internalId: hash(integration.internalId),
+          rootInternalId: integration.rootInternalId
+            ? hash(integration.rootInternalId)
+            : null,
+          token: hash(integration.token),
+          refreshToken: integration.refreshToken
+            ? hash(integration.refreshToken)
+            : null,
+          profile: integration.profile ? hash(integration.profile) : null,
+          customInstanceDetails: integration.customInstanceDetails
+            ? hash(integration.customInstanceDetails)
+            : null,
+          picture: null,
+          deletedAt: integration.deletedAt || new Date(),
+        },
+      });
+    }
+  }
+
+  async checkForDeletedOnceAndUpdate(org: string, page: string) {
+    return this._integration.model.integration.updateMany({
+      where: {
+        organizationId: org,
+        internalId: page,
+        deletedAt: {
+          not: null,
+        },
+      },
+      data: {
+        internalId: makeId(10),
+      },
+    });
+  }
+
+  async disableIntegrations(org: string, totalChannels: number) {
+    const getChannels = await this._integration.model.integration.findMany({
+      where: {
+        organizationId: org,
+        disabled: false,
+        deletedAt: null,
+      },
+      take: totalChannels,
+      select: {
+        id: true,
+      },
+    });
+
+    for (const channel of getChannels) {
+      await this._integration.model.integration.update({
+        where: {
+          id: channel.id,
+        },
+        data: {
+          disabled: true,
+        },
+      });
+    }
+  }
+
+  enableAllIntegrations(org: string) {
+    return this._integration.model.integration.updateMany({
+      where: {
+        organizationId: org,
+        disabled: true,
+        deletedAt: null,
+      },
+      data: {
+        disabled: false,
+      },
+    });
+  }
+
+  getPlugsByIntegrationId(org: string, id: string) {
+    return this._plugs.model.plugs.findMany({
+      where: {
+        organizationId: org,
+        integrationId: id,
+      },
+    });
+  }
+
+  createOrUpdatePlug(org: string, integrationId: string, body: PlugDto) {
+    return this._plugs.model.plugs.upsert({
+      where: {
+        organizationId: org,
+        plugFunction_integrationId: {
+          integrationId,
+          plugFunction: body.func,
+        },
+      },
+      create: {
+        integrationId,
+        organizationId: org,
+        plugFunction: body.func,
+        data: JSON.stringify(body.fields),
+        activated: true,
+      },
+      update: {
+        data: JSON.stringify(body.fields),
+      },
+      select: {
+        activated: true,
+      },
+    });
+  }
+
+  changePlugActivation(orgId: string, plugId: string, status: boolean) {
+    return this._plugs.model.plugs.update({
+      where: {
+        organizationId: orgId,
+        id: plugId,
+      },
+      data: {
+        activated: !!status,
+      },
+    });
+  }
+
+  async loadExisingData(
+    methodName: string,
+    integrationId: string,
+    id: string[]
+  ) {
+    return this._exisingPlugData.model.exisingPlugData.findMany({
+      where: {
+        integrationId,
+        methodName,
+        value: {
+          in: id,
+        },
+      },
+    });
+  }
+
+  async saveExisingData(
+    methodName: string,
+    integrationId: string,
+    value: string[]
+  ) {
+    return this._exisingPlugData.model.exisingPlugData.createMany({
+      data: value.map((p) => ({
+        integrationId,
+        methodName,
+        value: p,
+      })),
+    });
+  }
+
+  async getPostingTimes(orgId: string, integrationsId?: string) {
+    return this._integration.model.integration.findMany({
+      where: {
+        ...(integrationsId ? { id: integrationsId } : {}),
+        organizationId: orgId,
+        disabled: false,
+        deletedAt: null,
+      },
+      select: {
+        postingTimes: true,
+      },
+    });
   }
 }
