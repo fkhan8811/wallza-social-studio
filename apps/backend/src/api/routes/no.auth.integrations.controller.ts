@@ -600,7 +600,7 @@ export class NoAuthIntegrationsController {
     const seenAccounts = new Set<string>();
     for (const conn of connections) {
       const provider = String(conn.provider || '').toLowerCase().trim();
-      const internalId = String(conn.internalId || '');
+      const internalId = String(conn.internalId || '').trim();
       const accountKey = `${provider}\u0000${internalId}`;
 
       if (!provider || !internalId.trim()) {
