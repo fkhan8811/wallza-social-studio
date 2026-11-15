@@ -38,7 +38,7 @@
     "docker-create": "./var/docker/docker-create.sh",
     "postinstall": "pnpm run prisma-generate",
     "test": "jest --coverage --detectOpenHandles --reporters=default --reporters=jest-junit",
-    "test:wallza-postiz": "vitest run libraries/nestjs-libraries/src/database/prisma/integrations/social.sync.generation.policy.spec.ts libraries/nestjs-libraries/src/database/prisma/integrations/oauth.callback.retry.policy.spec.ts libraries/helpers/src/utils/safe.return.url.spec.ts"
+    "test:wallza-postiz": "vitest run --config vitest.wallza.config.ts"
   },
   "dependencies": {
     "@ag-ui/mastra": "^1.1.4",
