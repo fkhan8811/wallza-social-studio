@@ -364,8 +364,8 @@ export class NoAuthIntegrationsController {
           await ioRedis.del(`wallza:oauth_org:${body.state}`);
           await this._oAuthCallbackRetryRepository.markCompletedByState(body.state);
         } else {
-          const errBody = await syncRes.text().catch(() => '');
-          console.warn(`[WallzaBridge] Failed to sync to WallzaOS (status ${syncRes.status}): ${errBody}. Enqueuing durable Postgres retry event.`);
+          // Never log or persist remote response bodies: providers may echo secrets.
+          console.warn(`[WallzaBridge] WallzaOS account sync returned HTTP ${syncRes.status}; enqueuing durable retry event.`);
           await this._oAuthCallbackRetryRepository.enqueueOrUpdate({
             state: body.state,
             organizationId: org.id,
@@ -378,11 +378,11 @@ export class NoAuthIntegrationsController {
             grantedScopes: integrationProvider.scopes || [],
             tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
             category: 'major',
-            error: `HTTP ${syncRes.status}: ${errBody}`,
+            error: `HTTP ${syncRes.status}`,
           });
         }
       } catch (bridgeErr: any) {
-        console.warn('[WallzaBridge] Network/runtime error during WallzaOS bridge dispatch:', bridgeErr.message);
+        console.warn('[WallzaBridge] Network/runtime error during WallzaOS bridge dispatch; enqueueing sanitized retry event.');
         await this._oAuthCallbackRetryRepository.enqueueOrUpdate({
           state: body.state,
           organizationId: org.id,
@@ -395,7 +395,7 @@ export class NoAuthIntegrationsController {
           grantedScopes: integrationProvider.scopes || [],
           tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
           category: 'major',
-          error: bridgeErr.message,
+          error: 'Network/runtime error',
         });
       }
     }
