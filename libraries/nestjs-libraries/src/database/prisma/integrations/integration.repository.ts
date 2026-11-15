@@ -420,7 +420,7 @@ export class IntegrationRepository {
       generation,
       'disconnect',
       (tx) => tx.integration.updateMany({
-        where: { organizationId, internalId, deletedAt: null },
+        where: { organizationId, internalId, providerIdentifier: provider.trim().toLowerCase(), deletedAt: null },
         data: { deletedAt: new Date() },
       })
     );
