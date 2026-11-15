@@ -25,14 +25,30 @@ function startOAuthCallbackRetryWorker(app: any, intervalMs = 15000) {
   try {
     const retryRepo = app.get(OAuthCallbackRetryRepository);
     if (!retryRepo) return;
+
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const result = await retryRepo.processPendingRetries(10);
+        if (result.processed > 0) {
+          Logger.log(`[OAuthCallbackRetry] processed=${result.processed} succeeded=${result.succeeded} failed=${result.failed}`);
+        }
+      } catch (err: any) {
+        // The repository sanitizes event errors; keep worker logs generic too.
+        Logger.warn(`[OAuthCallbackRetry] Worker iteration failed: ${err?.name || 'Error'}`);
+      } finally {
+        running = false;
+      }
+    };
+
     Logger.log(`[OAuthCallbackRetry] Worker initialized (polling every ${intervalMs}ms)`);
-    setInterval(() => {
-      retryRepo.processPendingRetries(10).catch((err: any) => {
-        Logger.warn(`[OAuthCallbackRetry] Worker iteration error: ${err?.message || err}`);
-      });
-    }, intervalMs);
+    void run();
+    const timer = setInterval(() => void run(), intervalMs);
+    timer.unref?.();
   } catch (err: any) {
-    Logger.warn(`[OAuthCallbackRetry] Worker could not be started: ${err?.message || err}`);
+    Logger.warn(`[OAuthCallbackRetry] Worker could not be started: ${err?.name || 'Error'}`);
   }
 }
 
