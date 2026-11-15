@@ -241,7 +241,7 @@ export class OrganizationService {
       if (
         cachedOrg &&
         !cachedOrg.deletedAt &&
-        (cachedOrg.wallzaOrgId === normalizedId || cachedOrg.description === legacyDescription)
+        (cachedOrg.wallzaOrgId ? cachedOrg.wallzaOrgId === normalizedId : cachedOrg.description === legacyDescription)
       ) {
         if (!cachedOrg.wallzaOrgId) {
           try {
