@@ -133,6 +133,18 @@ export class UsersRepository {
     });
   }
 
+  createUserForSso(input: { email: string; name?: string; provider: Provider }) {
+    return this._user.model.user.create({
+      data: {
+        email: input.email,
+        name: input.name || null,
+        providerName: input.provider,
+        timezone: 0,
+        activated: true,
+      },
+    });
+  }
+
   getUserWithActiveSubscriptionByEmail(email: string, excludeUserId: string) {
     return this._user.model.user.findFirst({
       where: {
