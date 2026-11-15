@@ -299,10 +299,7 @@ export class WordpressProvider
 
     let mediaId = '';
     if (postDetails?.[0]?.settings?.main_image?.path) {
-      console.log(
-        'Uploading image to WordPress',
-        postDetails[0].settings.main_image.path
-      );
+      // Do not log user media URLs; they may contain signed access parameters.
 
       const blob = await this.fetch(
         postDetails[0].settings.main_image.path
