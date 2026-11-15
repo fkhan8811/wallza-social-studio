@@ -25,7 +25,6 @@ import {
 } from '@gitroom/backend/services/auth/permissions/permission.exception.class';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
-import { SocialSyncGenerationRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/social.sync.generation.repository';
 import { OAuthCallbackRetryRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/oauth.callback.retry.repository';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import { verifyWallzaInternalRequest, signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
@@ -39,7 +38,6 @@ export class NoAuthIntegrationsController {
     private _integrationService: IntegrationService,
     private _refreshIntegrationService: RefreshIntegrationService,
     private _organizationService: OrganizationService,
-    private _socialSyncGenerationRepository: SocialSyncGenerationRepository,
     private _oAuthCallbackRetryRepository: OAuthCallbackRetryRepository
   ) {}
 
@@ -590,59 +588,65 @@ export class NoAuthIntegrationsController {
       });
     }
 
+    if (action !== 'upsert' && action !== 'disconnect') {
+      return res.status(400).json({ success: false, error: 'Unsupported sync action' });
+    }
+
+    const seenAccounts = new Set<string>();
     for (const conn of connections) {
-      const provider = String(conn.provider || '').toLowerCase();
+      const provider = String(conn.provider || '').toLowerCase().trim();
       const internalId = String(conn.internalId || '');
+      const accountKey = `${provider}\u0000${internalId}`;
 
-      // Fencing check strictly against PostgreSQL SocialSyncGeneration repository (PostgreSQL is sole authority)
-      let genCheck: { allowed: boolean; currentGeneration: number; reason?: string };
-
-      try {
-        genCheck = await this._socialSyncGenerationRepository.checkAndAdvanceGeneration(
-          targetOrg.id,
-          provider,
-          internalId,
-          incomingGen,
-          action
-        );
-      } catch (genDbErr: any) {
-        // Strict fail-closed: do not fallback to permissive Redis on PostgreSQL failure
-        results.push({
-          provider,
-          internalId,
-          status: 'error',
-          error: `Durable generation repository check failed: ${genDbErr.message}`,
-        });
+      if (!provider || !internalId.trim()) {
+        results.push({ provider, internalId, status: 'error', error: 'Provider and internal account ID are required' });
         continue;
       }
-
-      if (!genCheck.allowed) {
-        results.push({
-          provider,
-          internalId,
-          status: genCheck.reason === 'conflict' || genCheck.reason === 'invalid_generation' ? 'error' : 'superseded',
-          error: genCheck.reason === 'conflict'
-            ? 'Same-generation conflicting action rejected'
-            : genCheck.reason === 'invalid_generation'
-            ? 'Generation must be a positive safe integer'
-            : undefined,
-          currentGeneration: genCheck.currentGeneration,
-          incomingGeneration: incomingGen,
-        });
+      if (seenAccounts.has(accountKey)) {
+        results.push({ provider, internalId, status: 'error', error: 'Duplicate account in sync batch' });
         continue;
       }
+      seenAccounts.add(accountKey);
 
       if (action === 'disconnect') {
-        const existing = await this._integrationService.getIntegrationByInternalId(
-          targetOrg.id,
-          internalId
-        );
+        try {
+          const outcome = await this._integrationService.deleteChannelWithGeneration(
+            targetOrg.id,
+            provider,
+            internalId,
+            incomingGen
+          );
 
-        if (existing) {
-          await this._integrationService.deleteChannel(targetOrg.id, existing.id);
+          if (!outcome.allowed) {
+            results.push({
+              provider,
+              internalId,
+              status: outcome.reason === 'superseded' ? 'superseded' : 'error',
+              error: outcome.reason === 'conflict'
+                ? 'Same-generation conflicting action rejected'
+                : outcome.reason === 'invalid_generation'
+                ? 'Generation must be a positive safe integer'
+                : undefined,
+              currentGeneration: outcome.currentGeneration,
+              incomingGeneration: incomingGen,
+            });
+          } else {
+            results.push({
+              provider,
+              internalId,
+              status: 'disconnected',
+              generation: incomingGen,
+              affected: outcome.result?.count || 0,
+            });
+          }
+        } catch (disconnectErr: any) {
+          results.push({
+            provider,
+            internalId,
+            status: 'error',
+            error: 'Transactional disconnect failed',
+          });
         }
-
-        results.push({ provider, internalId, status: 'disconnected', generation: incomingGen });
         continue;
       }
 
@@ -782,14 +786,31 @@ export class NoAuthIntegrationsController {
           false,
           undefined,
           0,
-          customDetails
+          customDetails,
+          incomingGen
         );
+
+        if (!saved.allowed) {
+          results.push({
+            provider,
+            internalId,
+            status: saved.reason === 'superseded' ? 'superseded' : 'error',
+            error: saved.reason === 'conflict'
+              ? 'Same-generation conflicting action rejected'
+              : saved.reason === 'invalid_generation'
+              ? 'Generation must be a positive safe integer'
+              : undefined,
+            currentGeneration: saved.currentGeneration,
+            incomingGeneration: incomingGen,
+          });
+          continue;
+        }
 
         results.push({
           provider,
           internalId,
           status: 'synced',
-          integrationId: saved.id,
+          integrationId: saved.result?.id,
           generation: incomingGen,
         });
       } catch (upsertErr: any) {
