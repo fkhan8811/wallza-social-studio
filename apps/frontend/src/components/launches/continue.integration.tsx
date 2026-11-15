@@ -99,12 +99,18 @@ export const ContinueIntegration: FC<{
       };
     }
 
-    return searchParams;
+    const hash =
+      typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
+    const hashParams = new URLSearchParams(hash);
+    const fragmentCredentials = hashParams.get('credentials');
+    return fragmentCredentials
+      ? { ...searchParams, code: fragmentCredentials }
+      : searchParams;
   }, []);
 
   useEffect(() => {
     // OAuth codes, provider verifiers and base64-encoded custom credentials
-    // arrive as query parameters in this legacy continuation route. The
+    // arrive as OAuth query parameters or a custom-credential URL fragment. The
     // request payload has already been captured in modifiedParams above; scrub
     // them from browser history before the network request starts.
     if (typeof window !== 'undefined') {
@@ -142,10 +148,11 @@ export const ContinueIntegration: FC<{
         cleanedUrl.hash = remainingHash ? `#${remainingHash}` : '';
       }
 
+      cleanedUrl.hash = '';
       window.history.replaceState(
         window.history.state,
         '',
-        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+        `${cleanedUrl.pathname}${cleanedUrl.search}`
       );
     }
 
