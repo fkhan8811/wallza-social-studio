@@ -19,6 +19,38 @@ import { PostValidationExceptionFilter } from '@gitroom/backend/api/routes/posts
 import { HttpExceptionFilter } from '@gitroom/nestjs-libraries/services/exception.filter';
 import { ConfigurationChecker } from '@gitroom/helpers/configuration/configuration.checker';
 import { startMcp } from '@gitroom/nestjs-libraries/chat/start.mcp';
+import { OAuthCallbackRetryRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/oauth.callback.retry.repository';
+
+function startOAuthCallbackRetryWorker(app: any, intervalMs = 15000) {
+  try {
+    const retryRepo = app.get(OAuthCallbackRetryRepository);
+    if (!retryRepo) return;
+
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const result = await retryRepo.processPendingRetries(10);
+        if (result.processed > 0) {
+          Logger.log(`[OAuthCallbackRetry] processed=${result.processed} succeeded=${result.succeeded} failed=${result.failed}`);
+        }
+      } catch (err: any) {
+        // The repository sanitizes event errors; keep worker logs generic too.
+        Logger.warn(`[OAuthCallbackRetry] Worker iteration failed: ${err?.name || 'Error'}`);
+      } finally {
+        running = false;
+      }
+    };
+
+    Logger.log(`[OAuthCallbackRetry] Worker initialized (polling every ${intervalMs}ms)`);
+    void run();
+    const timer = setInterval(() => void run(), intervalMs);
+    timer.unref?.();
+  } catch (err: any) {
+    Logger.warn(`[OAuthCallbackRetry] Worker could not be started: ${err?.name || 'Error'}`);
+  }
+}
 
 async function start() {
   const app = await NestFactory.create(AppModule, {
@@ -92,6 +124,8 @@ async function start() {
     server.headersTimeout = 906_000;
 
     console.log('Backend started successfully on port ' + port);
+
+    startOAuthCallbackRetryWorker(app);
 
     checkConfiguration(); // Do this last, so that users will see obvious issues at the end of the startup log without having to scroll up.
 
