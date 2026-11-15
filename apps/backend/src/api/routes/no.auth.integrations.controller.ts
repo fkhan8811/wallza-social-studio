@@ -685,13 +685,13 @@ export class NoAuthIntegrationsController {
           authCodePayload = {
             service: creds.service || 'https://bsky.social',
             identifier: creds.identifier || internalId,
-            password: creds.appPassword || conn.token,
+            password: creds.password || creds.appPassword || conn.token,
           };
         } else if (provider === 'wordpress') {
           authCodePayload = {
-            domain: creds.siteUrl || creds.domain,
+            domain: creds.domain || creds.siteUrl,
             username: creds.username,
-            password: creds.applicationPassword || conn.token,
+            password: creds.password || creds.applicationPassword || conn.token,
           };
         } else if (provider === 'devto') {
           authCodePayload = { apiKey: creds.apiKey || conn.token };
@@ -712,8 +712,8 @@ export class NoAuthIntegrationsController {
           };
         } else if (provider === 'lemmy') {
           authCodePayload = {
-            instance: creds.instance,
-            username: creds.username,
+            service: creds.service || creds.instance || 'https://lemmy.world',
+            identifier: creds.identifier || creds.username || internalId,
             password: creds.password || conn.token,
           };
         }
