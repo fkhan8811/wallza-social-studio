@@ -4,7 +4,7 @@ import {
   AddProviderButton,
   CustomVariables,
 } from '@gitroom/frontend/components/launches/add.provider.component';
-import { FC, useCallback, useEffect, useMemo, useState } from 'react';
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import SafeImage from '@gitroom/react/helpers/safe.image';
 import { capitalize, groupBy, orderBy } from 'lodash';
 import { CalendarWeekProvider } from '@gitroom/frontend/components/launches/calendar.context';
@@ -588,10 +588,75 @@ export const LaunchesComponent = () => {
       },
     []
   );
+  const connectHandledRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
+
+    const connectProvider = search.get('connect')?.toLowerCase()?.trim();
+    if (connectProvider && connectHandledRef.current !== connectProvider) {
+      connectHandledRef.current = connectProvider;
+
+      // Start automatic provider connect flow using existing Postiz authenticated route
+      (async () => {
+        try {
+          const availRes = await fetch('/integrations');
+          if (!availRes.ok) return;
+
+          const availData = await availRes.json();
+          const socialList: Array<any> = availData?.social || [];
+          const matched = socialList.find(
+            (p: any) => p.identifier.toLowerCase() === connectProvider
+          );
+
+          if (!matched) {
+            toast.show(
+              t('unsupported_provider', `Provider '${connectProvider}' is not supported or enabled.`),
+              'warning'
+            );
+            return;
+          }
+
+          // If provider requires custom fields (e.g. Bluesky, WordPress), open custom variables modal
+          if (matched.customFields && matched.customFields.length > 0) {
+            modal.openModal({
+              title: t('custom_url', 'Custom URL / Credentials'),
+              withCloseButton: true,
+              classNames: { modal: 'md' },
+              children: (
+                <CustomVariables
+                  identifier={matched.identifier}
+                  gotoUrl={(url: string) => router.push(url)}
+                  variables={matched.customFields}
+                />
+              ),
+            });
+            return;
+          }
+
+          // Standard OAuth flow: call backend /integrations/social/:provider to bind state and generate auth url
+          const authRes = await fetch(`/integrations/social/${matched.identifier}`);
+          if (!authRes.ok) {
+            toast.show(t('could_not_connect_to_platform', 'Could not initiate connection to platform'), 'warning');
+            return;
+          }
+
+          const { url, err } = await authRes.json();
+          if (err || !url) {
+            toast.show(t('could_not_connect_to_platform', 'Could not initiate connection to platform'), 'warning');
+            return;
+          }
+
+          // Navigate to provider OAuth login
+          window.location.href = url;
+        } catch (err: any) {
+          console.error('[AutoConnect] Error starting provider OAuth:', err);
+        }
+      })();
+    }
+
     if (search.get('msg')) {
       toast.show(search.get('msg')!, 'success');
       window?.opener?.postMessage(

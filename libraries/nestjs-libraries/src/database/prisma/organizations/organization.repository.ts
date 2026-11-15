@@ -724,6 +724,9 @@ export class OrganizationRepository {
   }
 
   async createForWallzaOrg(wallzaOrgId: string, name?: string) {
+    const tier = (process.env.WALLZAOS_DEFAULT_SUBSCRIPTION_TIER || 'PRO') as any;
+    const channels = Number(process.env.WALLZAOS_DEFAULT_CHANNELS || 50);
+
     return this._organization.model.organization.create({
       data: {
         name: name ? `${name} (WallzaOS)` : `Wallza Organization ${wallzaOrgId.slice(0, 8)}`,
@@ -732,10 +735,10 @@ export class OrganizationRepository {
         isTrailing: false,
         subscription: {
           create: {
-            totalChannels: 1000000,
-            subscriptionTier: 'ULTIMATE',
-            isLifetime: true,
-            period: 'YEARLY',
+            totalChannels: Number.isSafeInteger(channels) && channels > 0 ? channels : 50,
+            subscriptionTier: ['STANDARD', 'PRO', 'TEAM', 'ULTIMATE'].includes(tier) ? tier : 'PRO',
+            isLifetime: false,
+            period: 'MONTHLY',
           },
         },
       },

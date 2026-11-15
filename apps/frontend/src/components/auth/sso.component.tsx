@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
+import { sanitizeReturnUrl } from '@gitroom/helpers/utils/safe.return.url';
 import Link from 'next/link';
 
 export function SsoComponent() {
@@ -52,7 +53,8 @@ export function SsoComponent() {
 
         const data = await res.json();
         if (isSubscribed) {
-          const dest = data.returnUrl || returnUrl || '/launches';
+          const rawDest = data.returnUrl || returnUrl || '/launches';
+          const dest = sanitizeReturnUrl(rawDest, '/launches');
           window.location.href = dest;
         }
       } catch (err: any) {

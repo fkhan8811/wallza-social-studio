@@ -34,6 +34,7 @@ import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/o
 import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
 import { AuthService as AuthChecker } from '@gitroom/helpers/auth/auth.service';
 import { signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
+import { sanitizeReturnUrl } from '@gitroom/helpers/utils/safe.return.url';
 
 @ApiTags('Auth')
 @Controller('/auth')
@@ -555,6 +556,8 @@ export class AuthController {
         response.header('showorg', org.id);
       }
 
+      const safeUrl = sanitizeReturnUrl(body.returnUrl, '/launches');
+
       return response.status(200).json({
         success: true,
         user: {
@@ -562,7 +565,7 @@ export class AuthController {
           email: user.email,
         },
         organizationId: org.id,
-        returnUrl: body.returnUrl || '/launches',
+        returnUrl: safeUrl,
       });
     } catch (err: any) {
       console.error('[SSOExchange] Failed:', err?.message || err);

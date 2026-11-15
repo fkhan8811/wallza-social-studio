@@ -19,6 +19,22 @@ import { PostValidationExceptionFilter } from '@gitroom/backend/api/routes/posts
 import { HttpExceptionFilter } from '@gitroom/nestjs-libraries/services/exception.filter';
 import { ConfigurationChecker } from '@gitroom/helpers/configuration/configuration.checker';
 import { startMcp } from '@gitroom/nestjs-libraries/chat/start.mcp';
+import { OAuthCallbackRetryRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/oauth.callback.retry.repository';
+
+function startOAuthCallbackRetryWorker(app: any, intervalMs = 15000) {
+  try {
+    const retryRepo = app.get(OAuthCallbackRetryRepository);
+    if (!retryRepo) return;
+    Logger.log(`[OAuthCallbackRetry] Worker initialized (polling every ${intervalMs}ms)`);
+    setInterval(() => {
+      retryRepo.processPendingRetries(10).catch((err: any) => {
+        Logger.warn(`[OAuthCallbackRetry] Worker iteration error: ${err?.message || err}`);
+      });
+    }, intervalMs);
+  } catch (err: any) {
+    Logger.warn(`[OAuthCallbackRetry] Worker could not be started: ${err?.message || err}`);
+  }
+}
 
 async function start() {
   const app = await NestFactory.create(AppModule, {
@@ -92,6 +108,8 @@ async function start() {
     server.headersTimeout = 906_000;
 
     console.log('Backend started successfully on port ' + port);
+
+    startOAuthCallbackRetryWorker(app);
 
     checkConfiguration(); // Do this last, so that users will see obvious issues at the end of the startup log without having to scroll up.
 

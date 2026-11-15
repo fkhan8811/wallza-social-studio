@@ -51,7 +51,9 @@ model Organization {
   socialSyncGenerations SocialSyncGeneration[]
   contentCampaigns   ContentCampaign[]
   contentReviews     ContentReview[]
+  oauthCallbackRetries OAuthCallbackRetry[]
 
+  @@unique([description])
   @@index([apiKey])
   @@index([streakSince])
   @@index([paymentId])
@@ -2025,4 +2027,29 @@ model SocialSyncGeneration {
 
   @@unique([organizationId, provider, internalId])
   @@index([organizationId, provider, internalId])
+}
+
+model OAuthCallbackRetry {
+  id                        String       @id @default(uuid())
+  state                     String       @unique
+  organizationId            String
+  wallzaOrgId               String
+  platform                  String
+  accountName               String
+  accountId                 String
+  avatarUrl                 String?
+  socialStudioIntegrationId String
+  grantedScopes             String[]     @default([])
+  tokenExpiresAt            DateTime?
+  category                  String       @default("major")
+  status                    String       @default("pending") // 'pending', 'processing', 'completed', 'dead'
+  attempts                  Int          @default(0)
+  lastError                 String?
+  lockedAt                  DateTime?
+  createdAt                 DateTime     @default(now())
+  updatedAt                 DateTime     @updatedAt
+  organization              Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([status, attempts])
+  @@index([wallzaOrgId, platform, accountId])
 }
