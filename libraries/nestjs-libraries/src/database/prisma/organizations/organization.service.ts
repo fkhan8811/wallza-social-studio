@@ -288,4 +288,9 @@ export class OrganizationService {
     return org;
   }
 
+
+  async linkUserToOrg(userId: string, orgId: string, role: 'USER' | 'ADMIN') {
+    return this._organizationRepository.linkUserToOrg(userId, orgId, role);
+  }
+
 }
