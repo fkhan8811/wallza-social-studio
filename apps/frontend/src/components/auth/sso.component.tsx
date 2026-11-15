@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import { sanitizeReturnUrl } from '@gitroom/helpers/utils/safe.return.url';
@@ -13,6 +13,7 @@ export function SsoComponent() {
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const exchangeStartedRef = useRef(false);
 
   const code = searchParams.get('code');
   const state = searchParams.get('state');
@@ -20,6 +21,12 @@ export function SsoComponent() {
 
   useEffect(() => {
     let isSubscribed = true;
+    if (exchangeStartedRef.current) {
+      return () => {
+        isSubscribed = false;
+      };
+    }
+    exchangeStartedRef.current = true;
 
     // The SSO ticket is a short-lived bearer credential. Preserve it in
     // component state for the exchange, but remove it from browser history.
