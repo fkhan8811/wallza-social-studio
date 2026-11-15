@@ -13,7 +13,7 @@ export function SsoComponent() {
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const exchangeStartedRef = useRef(false);
+  const exchangePromiseRef = useRef<Promise<{ success: boolean; returnUrl?: string; error?: string }> | null>(null);
 
   const code = searchParams.get('code');
   const state = searchParams.get('state');
@@ -21,12 +21,6 @@ export function SsoComponent() {
 
   useEffect(() => {
     let isSubscribed = true;
-    if (exchangeStartedRef.current) {
-      return () => {
-        isSubscribed = false;
-      };
-    }
-    exchangeStartedRef.current = true;
 
     // The SSO ticket is a short-lived bearer credential. Preserve it in
     // component state for the exchange, but remove it from browser history.
@@ -51,32 +45,50 @@ export function SsoComponent() {
       }
 
       try {
-        const redirectUri = `${window.location.origin}/auth/sso`;
-        const res = await fetchClient('/auth/sso/exchange', {
-          method: 'POST',
-          body: JSON.stringify({
-            code,
-            state,
-            redirectUri,
-            returnUrl,
-          }),
-        });
+        // React Strict Mode can replay mount effects in development. Share the
+        // same one-time ticket request across effect instances rather than
+        // sending two competing exchanges or dropping the active result.
+        if (!exchangePromiseRef.current) {
+          exchangePromiseRef.current = (async () => {
+            const redirectUri = `${window.location.origin}/auth/sso`;
+            const res = await fetchClient('/auth/sso/exchange', {
+              method: 'POST',
+              body: JSON.stringify({
+                code,
+                state,
+                redirectUri,
+                returnUrl,
+              }),
+            });
 
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({ error: 'SSO exchange failed' }));
-          if (isSubscribed) {
-            setError(errData.error || 'Authentication with WallzaOS failed.');
-            setLoading(false);
-          }
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({ error: 'SSO exchange failed' }));
+              return {
+                success: false,
+                error: errData.error || 'Authentication with WallzaOS failed.',
+              };
+            }
+
+            const data = await res.json();
+            return {
+              success: true,
+              returnUrl: data.returnUrl,
+            };
+          })();
+        }
+
+        const result = await exchangePromiseRef.current;
+        if (!isSubscribed) return;
+
+        if (!result.success) {
+          setError(result.error || 'SSO exchange failed.');
+          setLoading(false);
           return;
         }
 
-        const data = await res.json();
-        if (isSubscribed) {
-          const rawDest = data.returnUrl || returnUrl || '/launches';
-          const dest = sanitizeReturnUrl(rawDest, '/launches');
-          window.location.href = dest;
-        }
+        const rawDest = result.returnUrl || returnUrl || '/launches';
+        const dest = sanitizeReturnUrl(rawDest, '/launches');
+        window.location.href = dest;
       } catch (err: any) {
         if (isSubscribed) {
           setError(err?.message || 'An unexpected error occurred during SSO authentication.');
@@ -85,12 +97,12 @@ export function SsoComponent() {
       }
     }
 
-    exchange();
+    void exchange();
 
     return () => {
       isSubscribed = false;
     };
-  }, [code, state, returnUrl, fetchClient, router]);
+  }, [code, state, returnUrl, fetchClient]);
 
   if (loading) {
     return (
