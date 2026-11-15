@@ -737,12 +737,17 @@ export class NoAuthIntegrationsController {
           });
           continue;
         }
-      } else if (integrationProvider.isChromeExtension || integrationProvider.extensionCookies) {
+      } else if (
+        integrationProvider.isChromeExtension ||
+        integrationProvider.extensionCookies ||
+        integrationProvider.isWeb3 ||
+        integrationProvider.externalUrl
+      ) {
         results.push({
           provider,
           internalId,
           status: 'error',
-          error: 'This provider requires the Postiz browser extension and cannot be linked with a bearer token',
+          error: 'This provider requires an interactive extension, wallet, or instance-specific OAuth flow and cannot be linked with a bearer token',
         });
         continue;
       } else if (provider === 'telegram') {
