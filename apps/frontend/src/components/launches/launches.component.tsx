@@ -599,6 +599,16 @@ export const LaunchesComponent = () => {
     if (connectProvider && connectHandledRef.current !== connectProvider) {
       connectHandledRef.current = connectProvider;
 
+      // Consume the one-shot query before starting async work. This prevents a
+      // page refresh during provider discovery from launching OAuth twice.
+      const cleanedUrl = new URL(window.location.href);
+      cleanedUrl.searchParams.delete('connect');
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+
       // Start automatic provider connect flow using existing Postiz authenticated route
       (async () => {
         try {
