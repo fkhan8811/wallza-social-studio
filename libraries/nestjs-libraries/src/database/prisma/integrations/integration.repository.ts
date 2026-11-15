@@ -1,4 +1,4 @@
-import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import { PrismaRepository, PrismaTransaction } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { Injectable } from '@nestjs/common';
 import { createHash } from 'crypto';
 import dayjs from 'dayjs';
@@ -7,6 +7,7 @@ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { PlugDto } from '@gitroom/nestjs-libraries/dtos/plugs/plug.dto';
+import { decideSocialSyncGeneration } from './social.sync.generation.policy';
 
 @Injectable()
 export class IntegrationRepository {
@@ -17,7 +18,8 @@ export class IntegrationRepository {
     private _plugs: PrismaRepository<'plugs'>,
     private _exisingPlugData: PrismaRepository<'exisingPlugData'>,
     private _customers: PrismaRepository<'customer'>,
-    private _mentions: PrismaRepository<'mentions'>
+    private _mentions: PrismaRepository<'mentions'>,
+    private _transaction: PrismaTransaction
   ) {}
 
   getMentions(platform: string, q: string) {
@@ -307,6 +309,114 @@ export class IntegrationRepository {
     });
   }
 
+  private async withGenerationFence<T>(
+    organizationId: string,
+    provider: string,
+    internalId: string,
+    generation: number,
+    action: 'upsert' | 'disconnect',
+    operation: (tx: Prisma.TransactionClient) => Promise<T>
+  ): Promise<{
+    allowed: boolean;
+    currentGeneration: number;
+    reason?: 'superseded' | 'replayed' | 'conflict' | 'invalid_generation';
+    result?: T;
+  }> {
+    if (!Number.isSafeInteger(generation) || generation <= 0) {
+      return { allowed: false, currentGeneration: 0, reason: 'invalid_generation' };
+    }
+
+    const normalizedProvider = provider.trim().toLowerCase();
+    if (!normalizedProvider || !internalId.trim()) {
+      throw new Error('A provider and internal account ID are required for generation fencing');
+    }
+
+    const maxAttempts = 5;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await this._transaction.model.$transaction(async (tx) => {
+          const key = {
+            organizationId_provider_internalId: {
+              organizationId,
+              provider: normalizedProvider,
+              internalId,
+            },
+          };
+          const current = await tx.socialSyncGeneration.findUnique({ where: key });
+
+          const decision = decideSocialSyncGeneration(current, generation, action);
+          if (!decision.allowed) {
+            return {
+              allowed: false,
+              currentGeneration: decision.currentGeneration,
+              reason: decision.reason,
+            };
+          }
+
+          if (decision.shouldInsert) {
+            await tx.socialSyncGeneration.create({
+              data: {
+                organizationId,
+                provider: normalizedProvider,
+                internalId,
+                generation,
+                lastAction: action,
+              },
+            });
+          } else if (decision.shouldAdvance && current) {
+            await tx.socialSyncGeneration.update({
+              where: { id: current.id },
+              data: { generation, lastAction: action },
+            });
+          }
+
+          // Replaying the same generation/action repeats the idempotent
+          // upsert or disconnect while a conflicting action remains rejected.
+          const result = await operation(tx);
+          return {
+            allowed: true,
+            currentGeneration: generation,
+            ...(decision.replayed ? { reason: 'replayed' as const } : {}),
+            result,
+          };
+        }, { isolationLevel: 'Serializable' });
+      } catch (error: any) {
+        const retryable = error?.code === 'P2034' || error?.code === 'P2002';
+        if (!retryable || attempt === maxAttempts - 1) {
+          throw error;
+        }
+        const delay = Math.min(400, 25 * (2 ** attempt)) + Math.floor(Math.random() * 30);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+
+    throw new Error('Generation-fenced operation exhausted its transaction retries');
+  }
+
+  async deleteChannelWithGeneration(
+    organizationId: string,
+    provider: string,
+    internalId: string,
+    generation: number
+  ) {
+    return this.withGenerationFence(
+      organizationId,
+      provider,
+      internalId,
+      generation,
+      'disconnect',
+      (tx) => tx.integration.updateMany({
+        where: {
+          organizationId,
+          internalId,
+          providerIdentifier: provider.trim().toLowerCase(),
+          deletedAt: null,
+        },
+        data: { deletedAt: new Date() },
+      })
+    );
+  }
+
   async createOrUpdateIntegration(
     additionalSettings:
       | {
@@ -331,105 +441,107 @@ export class IntegrationRepository {
     isBetweenSteps = false,
     refresh?: string,
     timezone?: number,
-    customInstanceDetails?: string
+    customInstanceDetails?: string,
+    generation?: number
   ) {
-    const postTimes = timezone
-      ? {
-          postingTimes: JSON.stringify([
-            { time: 560 - timezone },
-            { time: 850 - timezone },
-            { time: 1140 - timezone },
-          ]),
-        }
-      : {};
-    const upsert = await this._integration.model.integration.upsert({
-      where: {
-        organizationId_internalId: {
-          internalId,
-          organizationId: org,
-        },
-      },
-      create: {
-        type: type as any,
-        name,
-        providerIdentifier: provider,
-        token,
-        profile: username,
-        ...(picture ? { picture } : {}),
-        inBetweenSteps: isBetweenSteps,
-        refreshToken,
-        ...(expiresIn
-          ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
-          : {}),
-        internalId,
-        ...postTimes,
-        organizationId: org,
-        refreshNeeded: false,
-        rootInternalId: internalId,
-        ...(customInstanceDetails ? { customInstanceDetails } : {}),
-        additionalSettings: additionalSettings
-          ? JSON.stringify(additionalSettings)
-          : '[]',
-      },
-      update: {
-        ...(additionalSettings
-          ? { additionalSettings: JSON.stringify(additionalSettings) }
-          : {}),
-        ...(customInstanceDetails ? { customInstanceDetails } : {}),
-        type: type as any,
-        ...(!refresh
-          ? {
-              inBetweenSteps: isBetweenSteps,
-            }
-          : {}),
-        ...(picture ? { picture } : {}),
-        profile: username,
-        providerIdentifier: provider,
-        token,
-        // never wipe a stored refresh token with an empty one
-        ...(refreshToken ? { refreshToken } : {}),
-        ...(expiresIn
-          ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
-          : {}),
-        internalId,
-        organizationId: org,
-        deletedAt: null,
-        refreshNeeded: false,
-      },
-    });
-
-    if (oneTimeToken) {
-      const rootId =
-        (
-          await this._integration.model.integration.findFirst({
-            where: {
-              organizationId: org,
-              internalId: internalId,
-            },
-          })
-        )?.rootInternalId || internalId;
-
-      await this._integration.model.integration.updateMany({
+    const persist = async (db: any) => {
+      const postTimes = timezone
+        ? {
+            postingTimes: JSON.stringify([
+              { time: 560 - timezone },
+              { time: 850 - timezone },
+              { time: 1140 - timezone },
+            ]),
+          }
+        : {};
+      const upsert = await db.integration.upsert({
         where: {
-          id: {
-            not: upsert.id,
+          organizationId_internalId: {
+            internalId,
+            organizationId: org,
           },
-          rootInternalId: rootId,
         },
-        data: {
+        create: {
+          type: type as any,
+          name,
+          providerIdentifier: provider,
           token,
+          profile: username,
+          ...(picture ? { picture } : {}),
+          inBetweenSteps: isBetweenSteps,
           refreshToken,
-          refreshNeeded: false,
           ...(expiresIn
             ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
             : {}),
+          internalId,
+          ...postTimes,
+          organizationId: org,
+          refreshNeeded: false,
+          rootInternalId: internalId,
+          ...(customInstanceDetails ? { customInstanceDetails } : {}),
+          additionalSettings: additionalSettings
+            ? JSON.stringify(additionalSettings)
+            : '[]',
+        },
+        update: {
+          ...(additionalSettings
+            ? { additionalSettings: JSON.stringify(additionalSettings) }
+            : {}),
+          ...(customInstanceDetails ? { customInstanceDetails } : {}),
+          type: type as any,
+          ...(!refresh ? { inBetweenSteps: isBetweenSteps } : {}),
+          ...(picture ? { picture } : {}),
+          profile: username,
+          providerIdentifier: provider,
+          token,
+          ...(refreshToken ? { refreshToken } : {}),
+          ...(expiresIn
+            ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
+            : {}),
+          internalId,
+          organizationId: org,
+          deletedAt: null,
+          refreshNeeded: false,
         },
       });
+
+      if (oneTimeToken) {
+        const rootId =
+          (
+            await db.integration.findFirst({
+              where: { organizationId: org, internalId },
+            })
+          )?.rootInternalId || internalId;
+
+        await db.integration.updateMany({
+          where: { organizationId: org, id: { not: upsert.id }, rootInternalId: rootId },
+          data: {
+            token,
+            refreshToken,
+            refreshNeeded: false,
+            ...(expiresIn
+              ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
+              : {}),
+          },
+        });
+      }
+
+      return upsert;
+    };
+
+    if (generation !== undefined) {
+      return this.withGenerationFence(
+        org,
+        provider,
+        internalId,
+        generation,
+        'upsert',
+        (tx) => persist(tx)
+      );
     }
 
-    return upsert;
+    return persist(this._integration.model);
   }
-
   needsToBeRefreshed() {
     return this._integration.model.integration.findMany({
       where: {
