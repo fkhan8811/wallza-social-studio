@@ -26,6 +26,7 @@ import {
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { OAuthCallbackRetryRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/oauth.callback.retry.repository';
+import { mapWallzaProviderCredentials } from '@gitroom/nestjs-libraries/database/prisma/integrations/wallza.provider.credentials';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import { verifyWallzaInternalRequest, signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
 import { Request, Response } from 'express';
@@ -677,46 +678,12 @@ export class NoAuthIntegrationsController {
 
       // Real provider authentication / adaptation
       if (integrationProvider.customFields) {
-        // Direct credential providers: bluesky, wordpress, devto, hashnode, medium, nostr, lemmy, listmonk
-        let authCodePayload: any = null;
-        const creds = conn.credentials || {};
-
-        if (provider === 'bluesky') {
-          authCodePayload = {
-            service: creds.service || 'https://bsky.social',
-            identifier: creds.identifier || internalId,
-            password: creds.password || creds.appPassword || conn.token,
-          };
-        } else if (provider === 'wordpress') {
-          authCodePayload = {
-            domain: creds.domain || creds.siteUrl,
-            username: creds.username,
-            password: creds.password || creds.applicationPassword || conn.token,
-          };
-        } else if (provider === 'devto') {
-          authCodePayload = { apiKey: creds.apiKey || conn.token };
-        } else if (provider === 'hashnode') {
-          authCodePayload = {
-            apiKey: creds.personalAccessToken || creds.apiKey || conn.token,
-            publicationId: creds.publicationId,
-          };
-        } else if (provider === 'medium') {
-          authCodePayload = { apiKey: creds.apiKey || conn.token };
-        } else if (provider === 'nostr') {
-          authCodePayload = { password: creds.privateKey || conn.token };
-        } else if (provider === 'listmonk') {
-          authCodePayload = {
-            url: creds.url,
-            username: creds.username,
-            password: creds.password || conn.token,
-          };
-        } else if (provider === 'lemmy') {
-          authCodePayload = {
-            service: creds.service || creds.instance || 'https://lemmy.world',
-            identifier: creds.identifier || creds.username || internalId,
-            password: creds.password || conn.token,
-          };
-        }
+        const authCodePayload = mapWallzaProviderCredentials(
+          provider,
+          conn.credentials || {},
+          internalId,
+          conn.token
+        );
 
         if (!authCodePayload) {
           results.push({
@@ -728,40 +695,38 @@ export class NoAuthIntegrationsController {
           continue;
         }
 
-        if (authCodePayload) {
-          const base64Code = Buffer.from(JSON.stringify(authCodePayload)).toString('base64');
-          try {
-            const authResult = await integrationProvider.authenticate({
-              code: base64Code,
-              codeVerifier: '',
-            });
+        const base64Code = Buffer.from(JSON.stringify(authCodePayload)).toString('base64');
+        try {
+          const authResult = await integrationProvider.authenticate({
+            code: base64Code,
+            codeVerifier: '',
+          });
 
-            if (typeof authResult === 'string') {
-              results.push({
-                provider,
-                internalId,
-                status: 'error',
-                error: 'Provider authentication failed',
-              });
-              continue;
-            }
-
-            accessToken = authResult.accessToken;
-            refreshToken = authResult.refreshToken || '';
-            expiresIn = authResult.expiresIn || expiresIn;
-            name = authResult.name || name;
-            picture = authResult.picture || picture;
-            username = authResult.username || '';
-            customDetails = AuthService.fixedEncryption(JSON.stringify(authCodePayload));
-          } catch (authErr: any) {
+          if (typeof authResult === 'string') {
             results.push({
               provider,
               internalId,
               status: 'error',
-              error: 'Provider authentication request failed',
+              error: 'Provider authentication failed',
             });
             continue;
           }
+
+          accessToken = authResult.accessToken;
+          refreshToken = authResult.refreshToken || '';
+          expiresIn = authResult.expiresIn || expiresIn;
+          name = authResult.name || name;
+          picture = authResult.picture || picture;
+          username = authResult.username || '';
+          customDetails = AuthService.fixedEncryption(JSON.stringify(authCodePayload));
+        } catch (authErr: any) {
+          results.push({
+            provider,
+            internalId,
+            status: 'error',
+            error: 'Provider authentication request failed',
+          });
+          continue;
         }
       } else if (provider === 'telegram') {
         // Telegram in Postiz uses server-configured TELEGRAM_TOKEN bot.
