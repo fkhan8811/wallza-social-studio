@@ -710,4 +710,63 @@ export class OrganizationRepository {
       },
     });
   }
+
+  async findByWallzaOrgId(wallzaOrgId: string) {
+    const mapped = await this._organization.model.organization.findUnique({
+      where: { wallzaOrgId },
+      include: { subscription: true },
+    });
+
+    if (mapped) {
+      // A soft-deleted canonical mapping still owns the unique tenant ID.
+      // Never fall back to a legacy row and accidentally attach another org.
+      return mapped.deletedAt ? null : mapped;
+    }
+
+    // Legacy rows used a description marker before the dedicated unique key
+    // existed. Only select unclaimed legacy rows so they cannot shadow a
+    // different tenant's canonical wallzaOrgId mapping.
+    return this._organization.model.organization.findFirst({
+      where: {
+        wallzaOrgId: null,
+        description: `wallza_org:${wallzaOrgId}`,
+        deletedAt: null,
+      },
+      include: { subscription: true },
+    });
+  }
+
+  async setWallzaOrgId(organizationId: string, wallzaOrgId: string) {
+    return this._organization.model.organization.update({
+      where: { id: organizationId },
+      data: { wallzaOrgId },
+    });
+  }
+
+  async createForWallzaOrg(wallzaOrgId: string, name?: string) {
+    const tier = (process.env.WALLZAOS_DEFAULT_SUBSCRIPTION_TIER || 'PRO') as any;
+    const channels = Number(process.env.WALLZAOS_DEFAULT_CHANNELS || 50);
+
+    return this._organization.model.organization.create({
+      data: {
+        name: name ? `${name} (WallzaOS)` : `Wallza Organization ${wallzaOrgId.slice(0, 8)}`,
+        description: `wallza_org:${wallzaOrgId}`,
+        wallzaOrgId,
+        apiKey: AuthService.fixedEncryption(makeSecureId(20)),
+        isTrailing: false,
+        subscription: {
+          create: {
+            totalChannels: Number.isSafeInteger(channels) && channels > 0 ? channels : 50,
+            subscriptionTier: ['STANDARD', 'PRO', 'TEAM', 'ULTIMATE'].includes(tier) ? tier : 'PRO',
+            isLifetime: false,
+            period: 'MONTHLY',
+          },
+        },
+      },
+      include: {
+        subscription: true,
+      },
+    });
+  }
+
 }
