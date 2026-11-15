@@ -87,7 +87,7 @@ export class ListmonkProvider extends SocialAbstract implements SocialProvider {
     const body: { url: string; username: string; password: string } =
       JSON.parse(Buffer.from(params.code, 'base64').toString());
 
-    console.log(body);
+    // Do not log user-supplied Listmonk URL or Basic Auth credentials.
     try {
       const basic = Buffer.from(body.username + ':' + body.password).toString(
         'base64'
@@ -113,7 +113,7 @@ export class ListmonkProvider extends SocialAbstract implements SocialProvider {
         username: data['app.site_name'],
       };
     } catch (e) {
-      console.log(e);
+      // Keep remote errors and credentials out of application logs.
       return 'Invalid credentials';
     }
   }
