@@ -4,7 +4,7 @@ import {
   AddProviderButton,
   CustomVariables,
 } from '@gitroom/frontend/components/launches/add.provider.component';
-import { FC, useCallback, useEffect, useMemo, useState } from 'react';
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import SafeImage from '@gitroom/react/helpers/safe.image';
 import { capitalize, groupBy, orderBy } from 'lodash';
 import { CalendarWeekProvider } from '@gitroom/frontend/components/launches/calendar.context';
@@ -588,10 +588,91 @@ export const LaunchesComponent = () => {
       },
     []
   );
+  const connectHandledRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
+
+    const connectProvider = search.get('connect')?.toLowerCase()?.trim();
+    if (connectProvider && connectHandledRef.current !== connectProvider) {
+      connectHandledRef.current = connectProvider;
+
+      // Consume the one-shot connect request before async provider discovery.
+      const cleanedUrl = new URL(window.location.href);
+      cleanedUrl.searchParams.delete('connect');
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+
+      void (async () => {
+        try {
+          const availableResponse = await fetch('/integrations');
+          if (!availableResponse.ok) {
+            toast.show('Could not load available social providers.', 'warning');
+            return;
+          }
+
+          const available = await availableResponse.json();
+          const providers: Array<any> = available?.social || [];
+          const matched = providers.find(
+            (item) => String(item.identifier || '').toLowerCase() === connectProvider
+          );
+
+          if (!matched) {
+            toast.show(
+              t('unsupported_provider', `Provider '${connectProvider}' is not supported or enabled.`),
+              'warning'
+            );
+            return;
+          }
+
+          if (matched.customFields && matched.customFields.length > 0) {
+            modal.openModal({
+              title: t('custom_url', 'Custom URL / Credentials'),
+              withCloseButton: true,
+              classNames: { modal: 'md' },
+              children: (
+                <CustomVariables
+                  identifier={matched.identifier}
+                  gotoUrl={(url: string) => router.push(url)}
+                  variables={matched.customFields}
+                />
+              ),
+            });
+            return;
+          }
+
+          const authResponse = await fetch(`/integrations/social/${matched.identifier}`);
+          if (!authResponse.ok) {
+            toast.show(
+              t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+              'warning'
+            );
+            return;
+          }
+          const auth = await authResponse.json();
+          if (auth?.err || !auth?.url) {
+            toast.show(
+              t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+              'warning'
+            );
+            return;
+          }
+
+          window.location.href = auth.url;
+        } catch {
+          toast.show(
+            t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+            'warning'
+          );
+        }
+      })();
+    }
+
     if (search.get('msg')) {
       toast.show(search.get('msg')!, 'success');
       window?.opener?.postMessage(
