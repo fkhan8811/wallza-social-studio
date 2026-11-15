@@ -444,6 +444,24 @@ export class AuthController {
         return response.status(400).json({ error: 'Missing code, state, or redirectUri' });
       }
 
+      // Only accept the exact configured Postiz SSO callback origin and path.
+      let callbackUrl: URL;
+      let frontendUrl: URL;
+      try {
+        callbackUrl = new URL(redirectUri);
+        frontendUrl = new URL(process.env.FRONTEND_URL || '');
+      } catch {
+        return response.status(400).json({ error: 'Invalid SSO redirect URI' });
+      }
+      if (
+        callbackUrl.origin !== frontendUrl.origin ||
+        callbackUrl.pathname !== '/auth/sso' ||
+        callbackUrl.search ||
+        callbackUrl.hash
+      ) {
+        return response.status(400).json({ error: 'Invalid SSO redirect URI' });
+      }
+
       const wallzaApiUrl = (
         process.env.WALLZAOS_INTERNAL_API_URL ||
         process.env.WALLZAOS_API_URL ||
@@ -471,12 +489,12 @@ export class AuthController {
           ...hmacHeaders,
         },
         body: JSON.stringify(verifyPayload),
+        signal: AbortSignal.timeout(10000),
       });
 
       if (!verifyRes.ok) {
-        const errorText = await verifyRes.text();
-        return response.status(400).json({
-          error: `WallzaOS SSO verification rejected: ${errorText || verifyRes.statusText}`,
+        return response.status(401).json({
+          error: 'WallzaOS rejected the SSO ticket',
         });
       }
 
@@ -498,7 +516,7 @@ export class AuthController {
 
       if (!verifyJson.valid || !verifyJson.user || !verifyJson.organization) {
         return response.status(400).json({
-          error: verifyJson.error || 'Invalid WallzaOS SSO ticket',
+          error: 'Invalid or expired WallzaOS SSO ticket',
         });
       }
 
@@ -568,9 +586,9 @@ export class AuthController {
         returnUrl: safeUrl,
       });
     } catch (err: any) {
-      console.error('[SSOExchange] Failed:', err?.message || err);
+      console.error('[SSOExchange] Failed:', err?.name || 'Error');
       return response.status(400).json({
-        error: err?.message || 'SSO exchange failure',
+        error: 'SSO exchange failed',
       });
     }
   }
