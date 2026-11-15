@@ -542,6 +542,26 @@ export class NoAuthIntegrationsController {
     return { success: true };
   }
 
+  @Get('/wallza-status')
+  async wallzaStatus(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      service: 'wallza-social-engine',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   @Post('/sync-from-wallza')
   async syncFromWallza(@Req() req: Request, @Res() res: Response) {
     const authResult = await verifyWallzaInternalRequest(req as any, {
