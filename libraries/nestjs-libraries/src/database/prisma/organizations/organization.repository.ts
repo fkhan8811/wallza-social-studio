@@ -769,4 +769,36 @@ export class OrganizationRepository {
     });
   }
 
+
+  async linkUserToOrg(
+    userId: string,
+    orgId: string,
+    role: 'USER' | 'ADMIN'
+  ) {
+    const existing = await this._userOrg.model.userOrganization.findFirst({
+      where: {
+        userId,
+        organizationId: orgId,
+      },
+    });
+
+    if (existing) {
+      if (existing.role !== role) {
+        await this._userOrg.model.userOrganization.update({
+          where: { id: existing.id },
+          data: { role },
+        });
+      }
+      return existing;
+    }
+
+    return this._userOrg.model.userOrganization.create({
+      data: {
+        userId,
+        organizationId: orgId,
+        role,
+      },
+    });
+  }
+
 }
