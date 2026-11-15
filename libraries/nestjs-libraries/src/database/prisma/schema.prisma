@@ -2051,6 +2051,6 @@ model OAuthCallbackRetry {
   updatedAt                 DateTime     @updatedAt
   organization              Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
-  @@index([status, attempts])
+  @@index([status, nextAttemptAt, lockedAt])
   @@index([wallzaOrgId, platform, accountId])
 }
