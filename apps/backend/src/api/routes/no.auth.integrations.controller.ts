@@ -713,6 +713,16 @@ export class NoAuthIntegrationsController {
           };
         }
 
+        if (!authCodePayload) {
+          results.push({
+            provider,
+            internalId,
+            status: 'error',
+            error: `Direct credential mapping is not implemented for provider ${provider}`,
+          });
+          continue;
+        }
+
         if (authCodePayload) {
           const base64Code = Buffer.from(JSON.stringify(authCodePayload)).toString('base64');
           try {
