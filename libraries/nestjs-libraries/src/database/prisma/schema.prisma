@@ -12,6 +12,7 @@ model Organization {
   id                  String               @id @default(uuid())
   name                String
   description         String?
+  wallzaOrgId         String?              @unique
   apiKey              String?
   paymentId           String?
   streakSince         DateTime?
@@ -53,7 +54,6 @@ model Organization {
   contentReviews     ContentReview[]
   oauthCallbackRetries OAuthCallbackRetry[]
 
-  @@unique([description])
   @@index([apiKey])
   @@index([streakSince])
   @@index([paymentId])
@@ -2044,6 +2044,7 @@ model OAuthCallbackRetry {
   category                  String       @default("major")
   status                    String       @default("pending") // 'pending', 'processing', 'completed', 'dead'
   attempts                  Int          @default(0)
+  nextAttemptAt             DateTime     @default(now())
   lastError                 String?
   lockedAt                  DateTime?
   createdAt                 DateTime     @default(now())
