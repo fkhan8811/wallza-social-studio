@@ -113,7 +113,7 @@ export class IntegrationService {
     timezone?: number,
     customInstanceDetails?: string,
     generation?: number
-  ) {
+  ): Promise<any> {
     const uploadedPicture = picture
       ? picture?.indexOf('imagedelivery.net') > -1
         ? picture
