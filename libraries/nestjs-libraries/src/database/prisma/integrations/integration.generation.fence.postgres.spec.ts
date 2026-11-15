@@ -9,6 +9,7 @@ const prisma = databaseConfigured ? new PrismaClient() : null;
 const organizationId = randomUUID();
 const otherOrganizationId = randomUUID();
 const wallzaOrganizationId = randomUUID();
+const wallzaTestOrganizationIds: string[] = [];
 
 describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration mutations', () => {
   const repository: any = Object.create(IntegrationRepository.prototype);
@@ -42,7 +43,7 @@ describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration m
       where: { organizationId: { in: [organizationId, otherOrganizationId] } },
     });
     await prisma.organization.deleteMany({
-      where: { id: { in: [organizationId, otherOrganizationId] } },
+      where: { id: { in: [organizationId, otherOrganizationId, ...wallzaTestOrganizationIds] } },
     });
     await prisma.$disconnect();
   });
@@ -245,12 +246,14 @@ describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration m
         wallzaOrgId: wallzaOrganizationId,
       },
     });
-    await prisma.organization.create({
+    wallzaTestOrganizationIds.push(canonical.id);
+    const legacy = await prisma.organization.create({
       data: {
         name: 'Legacy description collision',
         description: `wallza_org:${wallzaOrganizationId}`,
       },
     });
+    wallzaTestOrganizationIds.push(legacy.id);
 
     const organizationRepository: any = Object.create(OrganizationRepository.prototype);
     organizationRepository._organization = { model: prisma };
