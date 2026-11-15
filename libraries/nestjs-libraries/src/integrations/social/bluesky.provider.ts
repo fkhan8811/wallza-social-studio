@@ -353,7 +353,7 @@ export class BlueskyProvider extends SocialAbstract implements SocialProvider {
         username: profile.data.handle!,
       };
     } catch (e: any) {
-      console.log(e);
+      // Authentication errors can include provider details; do not log them.
       switch (e?.error) {
         case 'RateLimitExceeded':
           return 'Bluesky is temporarily refusing logins for this account, please try again later';
