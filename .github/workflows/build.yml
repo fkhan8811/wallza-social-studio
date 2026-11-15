@@ -5,10 +5,14 @@ on:
   push:
   merge_group:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
 
     services:
       postgres:
