@@ -181,8 +181,8 @@ export class OAuthCallbackRetryRepository {
         });
 
         if (response.ok) {
-          await this._prisma.model.oAuthCallbackRetry.update({
-            where: { id: record.id },
+          await this._prisma.model.oAuthCallbackRetry.updateMany({
+            where: { id: record.id, status: 'processing', lockedAt: record.lockedAt },
             data: {
               status: 'completed',
               lastError: null,
@@ -194,10 +194,10 @@ export class OAuthCallbackRetryRepository {
         }
 
         // Do not persist arbitrary response bodies; they may contain secrets.
-        await this.scheduleFailure(record.id, record.attempts, `WallzaOS returned HTTP ${response.status}`);
+        await this.scheduleFailure(record.id, record.attempts, record.lockedAt, `WallzaOS returned HTTP ${response.status}`);
         failed++;
       } catch (error: any) {
-        await this.scheduleFailure(record.id, record.attempts, error?.message || 'Network error');
+        await this.scheduleFailure(record.id, record.attempts, record.lockedAt, error?.message || 'Network error');
         failed++;
       }
     }
@@ -205,13 +205,21 @@ export class OAuthCallbackRetryRepository {
     return { processed: claimedRecords.length, succeeded, failed };
   }
 
-  private async scheduleFailure(id: string, attempts: number, reason: unknown) {
+  private async scheduleFailure(
+    id: string,
+    attempts: number,
+    claimedAt: Date | null,
+    reason: unknown
+  ) {
+    if (!claimedAt) return;
     const terminal = attempts >= MAX_ATTEMPTS;
     const exponentialDelay = Math.min(30 * 60 * 1000, 5000 * (2 ** Math.max(0, attempts - 1)));
     const jitter = Math.floor(Math.random() * Math.max(1, exponentialDelay * 0.2));
 
-    await this._prisma.model.oAuthCallbackRetry.update({
-      where: { id },
+    // The claim timestamp is a lease token. A stale worker cannot overwrite
+    // a later worker's result after its lease has expired and been reclaimed.
+    const update = await this._prisma.model.oAuthCallbackRetry.updateMany({
+      where: { id, status: 'processing', lockedAt: claimedAt },
       data: {
         status: terminal ? 'dead' : 'pending',
         lockedAt: null,
@@ -220,7 +228,7 @@ export class OAuthCallbackRetryRepository {
       },
     });
 
-    if (terminal) {
+    if (terminal && update.count > 0) {
       this._logger.warn(`OAuth callback retry exhausted for event ${id}`);
     }
   }
