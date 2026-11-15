@@ -12,6 +12,7 @@ model Organization {
   id                  String               @id @default(uuid())
   name                String
   description         String?
+  wallzaOrgId         String?              @unique
   apiKey              String?
   paymentId           String?
   streakSince         DateTime?
@@ -35,6 +36,8 @@ model Organization {
   buyerOrganization   MessagesGroup[]
   notifications       Notifications[]
   socialLeadOutbox    SocialLeadOutbox[]
+  socialSyncGenerations SocialSyncGeneration[]
+  oauthCallbackRetries OAuthCallbackRetry[]
   plugs               Plugs[]
   post                Post[]               @relation("organization")
   submittedPost       Post[]               @relation("submittedForOrg")
@@ -2186,4 +2189,46 @@ model SocialLeadOutbox {
 
   @@index([organizationId, status])
   @@index([organizationId, platform, commentId])
+}
+
+
+model SocialSyncGeneration {
+  id             String       @id @default(uuid())
+  organizationId String
+  provider       String
+  internalId     String
+  generation     Int          @default(1)
+  lastAction     String       @default("upsert")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, provider, internalId])
+  @@index([organizationId, provider, internalId])
+}
+
+model OAuthCallbackRetry {
+  id                        String       @id @default(uuid())
+  state                     String       @unique
+  organizationId            String
+  wallzaOrgId               String
+  platform                  String
+  accountName               String
+  accountId                 String
+  avatarUrl                 String?
+  socialStudioIntegrationId String
+  grantedScopes             String[]     @default([])
+  tokenExpiresAt            DateTime?
+  category                  String       @default("major")
+  status                    String       @default("pending") // 'pending', 'processing', 'completed', 'dead'
+  attempts                  Int          @default(0)
+  nextAttemptAt             DateTime     @default(now())
+  lastError                 String?
+  lockedAt                  DateTime?
+  createdAt                 DateTime     @default(now())
+  updatedAt                 DateTime     @updatedAt
+  organization              Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt, lockedAt])
+  @@index([wallzaOrgId, platform, accountId])
 }
