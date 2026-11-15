@@ -111,7 +111,8 @@ export class IntegrationService {
     isBetweenSteps = false,
     refresh?: string,
     timezone?: number,
-    customInstanceDetails?: string
+    customInstanceDetails?: string,
+    generation?: number
   ) {
     const uploadedPicture = picture
       ? picture?.indexOf('imagedelivery.net') > -1
@@ -138,7 +139,8 @@ export class IntegrationService {
       isBetweenSteps,
       refresh,
       timezone,
-      customInstanceDetails
+      customInstanceDetails,
+      generation
     );
   }
 
@@ -401,6 +403,20 @@ export class IntegrationService {
 
   async deleteChannel(org: string, id: string) {
     return this._integrationRepository.deleteChannel(org, id);
+  }
+
+  async deleteChannelWithGeneration(
+    org: string,
+    provider: string,
+    internalId: string,
+    generation: number
+  ) {
+    return this._integrationRepository.deleteChannelWithGeneration(
+      org,
+      provider,
+      internalId,
+      generation
+    );
   }
 
   async disableIntegrations(org: string, totalChannels: number) {
