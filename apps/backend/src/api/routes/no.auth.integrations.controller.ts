@@ -570,6 +570,12 @@ export class NoAuthIntegrationsController {
         error: 'Connections array must not be empty',
       });
     }
+    if (connections.length > 100) {
+      return res.status(413).json({
+        success: false,
+        error: 'A sync batch cannot contain more than 100 accounts',
+      });
+    }
 
     // Resolve or provision Postiz Organization for WallzaOS tenant
     let targetOrg: any;
@@ -603,12 +609,20 @@ export class NoAuthIntegrationsController {
     }
 
     const seenAccounts = new Set<string>();
-    for (const conn of connections) {
-      const provider = String(conn.provider || '').toLowerCase().trim();
-      const internalId = String(conn.internalId || '').trim();
+    for (const incoming of connections) {
+      const conn =
+        incoming && typeof incoming === 'object' && !Array.isArray(incoming)
+          ? incoming
+          : {};
+      const provider = typeof conn.provider === 'string'
+        ? conn.provider.toLowerCase().trim().slice(0, 64)
+        : '';
+      const internalId = typeof conn.internalId === 'string'
+        ? conn.internalId.trim().slice(0, 255)
+        : '';
       const accountKey = `${provider}\u0000${internalId}`;
 
-      if (!provider || !internalId.trim()) {
+      if (!/^[a-z0-9_-]+$/.test(provider) || !internalId) {
         results.push({ provider, internalId, status: 'error', error: 'Provider and internal account ID are required' });
         continue;
       }
@@ -681,7 +695,9 @@ export class NoAuthIntegrationsController {
       let name = typeof conn.name === 'string' && conn.name.trim()
         ? conn.name.trim().slice(0, 200)
         : `${provider} Account`;
-      let picture = typeof conn.picture === 'string' ? conn.picture : '';
+      let picture = typeof conn.picture === 'string'
+        ? conn.picture.trim().slice(0, 2048)
+        : '';
       let username = typeof conn.username === 'string' ? conn.username.slice(0, 200) : '';
       let customDetails: string | undefined = undefined;
 
