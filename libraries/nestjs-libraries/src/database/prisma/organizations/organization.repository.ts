@@ -717,8 +717,10 @@ export class OrganizationRepository {
       include: { subscription: true },
     });
 
-    if (mapped && !mapped.deletedAt) {
-      return mapped;
+    if (mapped) {
+      // A soft-deleted canonical mapping still owns the unique tenant ID.
+      // Never fall back to a legacy row and accidentally attach another org.
+      return mapped.deletedAt ? null : mapped;
     }
 
     // Legacy rows used a description marker before the dedicated unique key
