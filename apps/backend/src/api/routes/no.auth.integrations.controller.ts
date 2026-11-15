@@ -568,7 +568,7 @@ export class NoAuthIntegrationsController {
     } catch (err: any) {
       return res.status(500).json({
         success: false,
-        error: `Failed to resolve organization: ${err.message}`,
+        error: 'Unable to resolve Wallza organization',
       });
     }
 
@@ -736,7 +736,7 @@ export class NoAuthIntegrationsController {
                 provider,
                 internalId,
                 status: 'error',
-                error: `Authentication failed: ${authResult}`,
+                error: 'Provider authentication failed',
               });
               continue;
             }
@@ -753,7 +753,7 @@ export class NoAuthIntegrationsController {
               provider,
               internalId,
               status: 'error',
-              error: `Provider authenticate thrown: ${authErr.message}`,
+              error: 'Provider authentication request failed',
             });
             continue;
           }
@@ -828,7 +828,7 @@ export class NoAuthIntegrationsController {
           provider,
           internalId,
           status: 'error',
-          error: `Prisma upsert failed: ${upsertErr.message}`,
+          error: 'Integration persistence failed',
         });
       }
     }
