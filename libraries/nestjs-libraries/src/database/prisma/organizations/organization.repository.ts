@@ -710,4 +710,38 @@ export class OrganizationRepository {
       },
     });
   }
+
+  async findByWallzaOrgId(wallzaOrgId: string) {
+    return this._organization.model.organization.findFirst({
+      where: {
+        description: `wallza_org:${wallzaOrgId}`,
+        deletedAt: null,
+      },
+      include: {
+        subscription: true,
+      },
+    });
+  }
+
+  async createForWallzaOrg(wallzaOrgId: string, name?: string) {
+    return this._organization.model.organization.create({
+      data: {
+        name: name ? `${name} (WallzaOS)` : `Wallza Organization ${wallzaOrgId.slice(0, 8)}`,
+        description: `wallza_org:${wallzaOrgId}`,
+        apiKey: AuthService.fixedEncryption(makeSecureId(20)),
+        isTrailing: false,
+        subscription: {
+          create: {
+            totalChannels: 1000000,
+            subscriptionTier: 'ULTIMATE',
+            isLifetime: true,
+            period: 'YEARLY',
+          },
+        },
+      },
+      include: {
+        subscription: true,
+      },
+    });
+  }
 }

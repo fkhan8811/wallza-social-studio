@@ -5,6 +5,8 @@ import {
   HttpException,
   Param,
   Post,
+  Req,
+  Res,
   UseFilters,
 } from '@nestjs/common';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
@@ -24,6 +26,8 @@ import {
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
+import { verifyWallzaInternalRequest, signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
+import { Request, Response } from 'express';
 
 @ApiTags('Integrations')
 @Controller('/integrations')
@@ -321,6 +325,45 @@ export class NoAuthIntegrationsController {
       await ioRedis.del(`redirect:${body.state}`);
     }
 
+    // Bridge OAuth callback to WallzaOS internal sync if initiated from WallzaOS
+    const wallzaOrgState = await ioRedis.get(`wallza:oauth_org:${body.state}`);
+    if (wallzaOrgState) {
+      try {
+        const wallzaApiUrl = process.env.WALLZAOS_INTERNAL_API_URL || process.env.WALLZA_BACKEND_URL || 'http://127.0.0.1:5001';
+        const syncPayload = {
+          organizationId: wallzaOrgState,
+          platform: integration,
+          accountName: validName.trim(),
+          accountId: String(id),
+          avatarUrl: picture || null,
+          socialStudioIntegrationId: createUpdate.id,
+          grantedScopes: integrationProvider.scopes || [],
+          tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
+          category: 'major',
+        };
+
+        const signed = signInternalRequest({
+          method: 'POST',
+          path: '/api/social/accounts/sync-internal',
+          audience: 'wallzaos',
+          body: syncPayload,
+        });
+
+        await fetch(`${wallzaApiUrl}/api/social/accounts/sync-internal`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...signed,
+          },
+          body: JSON.stringify(syncPayload),
+        });
+      } catch (bridgeErr: any) {
+        console.warn('Failed to bridge OAuth completion to WallzaOS:', bridgeErr.message);
+      } finally {
+        await ioRedis.del(`wallza:oauth_org:${body.state}`);
+      }
+    }
+
     const extensionToken = integrationProvider.isChromeExtension
       ? AuthService.signJWT({
           integrationId: createUpdate.id,
@@ -451,5 +494,247 @@ export class NoAuthIntegrationsController {
     );
 
     return { success: true };
+  }
+
+  @Post('/sync-from-wallza')
+  async syncFromWallza(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, action, connections, generation } = req.body || {};
+
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing or invalid organizationId',
+      });
+    }
+
+    if (!Array.isArray(connections) || connections.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Connections array must not be empty',
+      });
+    }
+
+    // Resolve or provision Postiz Organization for WallzaOS tenant
+    let targetOrg: any;
+    try {
+      targetOrg = await this._organizationService.resolveWallzaOrganization(organizationId);
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: `Failed to resolve organization: ${err.message}`,
+      });
+    }
+
+    const results: any[] = [];
+    const incomingGen = Number(generation || 1);
+
+    for (const conn of connections) {
+      const provider = String(conn.provider || '').toLowerCase();
+      const internalId = String(conn.internalId || '');
+      const genKey = `wallza:generation:${targetOrg.id}:${provider}:${internalId}`;
+
+      // Fencing check against Redis persistent generation tracker
+      const currentGenStr = await ioRedis.get(genKey);
+      const currentGen = currentGenStr ? Number(currentGenStr) : 0;
+
+      if (incomingGen < currentGen) {
+        results.push({
+          provider,
+          internalId,
+          status: 'superseded',
+          currentGeneration: currentGen,
+          incomingGeneration: incomingGen,
+        });
+        continue;
+      }
+
+      if (action === 'disconnect') {
+        const existing = await this._integrationService.getIntegrationByInternalId(
+          targetOrg.id,
+          internalId
+        );
+
+        if (existing) {
+          await this._integrationService.deleteChannel(targetOrg.id, existing.id);
+        }
+
+        await ioRedis.set(genKey, String(incomingGen));
+        results.push({ provider, internalId, status: 'disconnected', generation: incomingGen });
+        continue;
+      }
+
+      // Action === 'upsert'
+      const integrationProvider = this._integrationManager.getSocialIntegration(provider);
+      if (!integrationProvider) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: `Provider ${provider} is not supported by Social Studio`,
+        });
+        continue;
+      }
+
+      let accessToken = conn.token || '';
+      let refreshToken = '';
+      let expiresIn = conn.expiresIn || 0;
+      let name = conn.name || `${provider} Account`;
+      let picture = conn.picture || '';
+      let username = '';
+      let customDetails: string | undefined = undefined;
+
+      // Real provider authentication / adaptation
+      if (integrationProvider.customFields) {
+        // Direct credential providers: bluesky, wordpress, devto, hashnode, medium, nostr, lemmy, listmonk
+        let authCodePayload: any = null;
+        const creds = conn.credentials || {};
+
+        if (provider === 'bluesky') {
+          authCodePayload = {
+            service: creds.service || 'https://bsky.social',
+            identifier: creds.identifier || internalId,
+            password: creds.appPassword || conn.token,
+          };
+        } else if (provider === 'wordpress') {
+          authCodePayload = {
+            domain: creds.siteUrl || creds.domain,
+            username: creds.username,
+            password: creds.applicationPassword || conn.token,
+          };
+        } else if (provider === 'devto') {
+          authCodePayload = { apiKey: creds.apiKey || conn.token };
+        } else if (provider === 'hashnode') {
+          authCodePayload = {
+            apiKey: creds.personalAccessToken || creds.apiKey || conn.token,
+            publicationId: creds.publicationId,
+          };
+        } else if (provider === 'medium') {
+          authCodePayload = { apiKey: creds.apiKey || conn.token };
+        } else if (provider === 'nostr') {
+          authCodePayload = { password: creds.privateKey || conn.token };
+        } else if (provider === 'listmonk') {
+          authCodePayload = {
+            url: creds.url,
+            username: creds.username,
+            password: creds.password || conn.token,
+          };
+        } else if (provider === 'lemmy') {
+          authCodePayload = {
+            instance: creds.instance,
+            username: creds.username,
+            password: creds.password || conn.token,
+          };
+        }
+
+        if (authCodePayload) {
+          const base64Code = Buffer.from(JSON.stringify(authCodePayload)).toString('base64');
+          try {
+            const authResult = await integrationProvider.authenticate({
+              code: base64Code,
+              codeVerifier: '',
+            });
+
+            if (typeof authResult === 'string') {
+              results.push({
+                provider,
+                internalId,
+                status: 'error',
+                error: `Authentication failed: ${authResult}`,
+              });
+              continue;
+            }
+
+            accessToken = authResult.accessToken;
+            refreshToken = authResult.refreshToken || '';
+            expiresIn = authResult.expiresIn || expiresIn;
+            name = authResult.name || name;
+            picture = authResult.picture || picture;
+            username = authResult.username || '';
+            customDetails = AuthService.fixedEncryption(JSON.stringify(authCodePayload));
+          } catch (authErr: any) {
+            results.push({
+              provider,
+              internalId,
+              status: 'error',
+              error: `Provider authenticate thrown: ${authErr.message}`,
+            });
+            continue;
+          }
+        }
+      } else if (provider === 'telegram') {
+        // Telegram in Postiz uses server-configured TELEGRAM_TOKEN bot.
+        // Direct bot-token credentials from user are not supported without dedicated bot instance.
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'Telegram requires platform bot setup and is unsupported for user direct tokens',
+        });
+        continue;
+      } else if (provider === 'discord' && !conn.token) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'Discord requires OAuth authorization. Webhook URLs are not supported as OAuth tokens.',
+        });
+        continue;
+      }
+
+      // Upsert into Postiz Prisma Integrations
+      try {
+        const saved = await this._integrationService.createOrUpdateIntegration(
+          undefined,
+          !!integrationProvider.oneTimeToken,
+          targetOrg.id,
+          name,
+          picture,
+          'social',
+          internalId,
+          provider,
+          accessToken,
+          refreshToken,
+          expiresIn,
+          username,
+          false,
+          undefined,
+          0,
+          customDetails
+        );
+
+        await ioRedis.set(genKey, String(incomingGen));
+        results.push({
+          provider,
+          internalId,
+          status: 'synced',
+          integrationId: saved.id,
+          generation: incomingGen,
+        });
+      } catch (upsertErr: any) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: `Prisma upsert failed: ${upsertErr.message}`,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      synchronized: results.filter((r) => r.status === 'synced' || r.status === 'disconnected').length,
+      results,
+    });
   }
 }

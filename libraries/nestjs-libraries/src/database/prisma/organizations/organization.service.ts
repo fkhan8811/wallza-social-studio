@@ -10,6 +10,7 @@ import dayjs from 'dayjs';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { Organization, ShortLinkPreference, User } from '@prisma/client';
 import { AutopostService } from '@gitroom/nestjs-libraries/database/prisma/autopost/autopost.service';
+import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 
 @Injectable()
 export class OrganizationService {
@@ -218,5 +219,28 @@ export class OrganizationService {
       orgId,
       shortlink
     );
+  }
+
+  async resolveWallzaOrganization(wallzaOrgId: string, name?: string) {
+    if (!wallzaOrgId || typeof wallzaOrgId !== 'string') {
+      throw new Error('Invalid Wallza organization ID');
+    }
+
+    // Check Redis mapping cache first
+    const cachedOrgId = await ioRedis.get(`wallza:org_map:${wallzaOrgId}`);
+    if (cachedOrgId) {
+      const org = await this._organizationRepository.getOrgById(cachedOrgId);
+      if (org) return org;
+    }
+
+    // Check database by tagged description
+    let org = await this._organizationRepository.findByWallzaOrgId(wallzaOrgId);
+    if (!org) {
+      org = await this._organizationRepository.createForWallzaOrg(wallzaOrgId, name);
+    }
+
+    // Cache mapping in Redis for 24 hours
+    await ioRedis.set(`wallza:org_map:${wallzaOrgId}`, org.id, 'EX', 86400);
+    return org;
   }
 }
