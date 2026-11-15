@@ -277,7 +277,7 @@ export const CustomVariables: FC<{
     </div>
   );
 };
-const ExtensionNotFound: FC = () => {
+export const ExtensionNotFound: FC = () => {
   const modals = useModals();
   const t = useT();
   return (
@@ -314,7 +314,7 @@ const ExtensionNotFound: FC = () => {
   );
 };
 
-const ChromeExtensionWarning: FC<{
+export const ChromeExtensionWarning: FC<{
   onConfirm: () => void;
   onCancel: () => void;
 }> = ({ onConfirm, onCancel }) => {
