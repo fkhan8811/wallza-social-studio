@@ -4,6 +4,8 @@ import {
   AddProviderButton,
   CustomVariables,
   UrlModal,
+  ExtensionNotFound,
+  ChromeExtensionWarning,
 } from '@gitroom/frontend/components/launches/add.provider.component';
 import { FC, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import SafeImage from '@gitroom/react/helpers/safe.image';
