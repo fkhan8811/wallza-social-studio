@@ -290,4 +290,5 @@ export class OrganizationService {
 
     await ioRedis.set(`wallza:org_map:${normalizedId}`, org.id, 'EX', 86400);
     return org;
-  }}
+  }
+}
