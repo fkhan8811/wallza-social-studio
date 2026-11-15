@@ -56,10 +56,14 @@ export const ContinueIntegration: FC<{
     [logged, push]
   );
   const modifiedParams = useMemo(() => {
+    const hash =
+      typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
+    const hashParams = new URLSearchParams(hash);
+
     if (provider === 'mewe') {
       return {
-        state: searchParams.state || '',
-        code: searchParams.loginRequestToken || '',
+        state: hashParams.get('state') || searchParams.state || '',
+        code: hashParams.get('loginRequestToken') || searchParams.loginRequestToken || '',
         refresh: searchParams.refresh || '',
       };
     }
@@ -88,20 +92,6 @@ export const ContinueIntegration: FC<{
       };
     }
 
-    if (provider === 'mewe') {
-      const hash =
-        typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
-      const hashParams = new URLSearchParams(hash);
-      return {
-        state: hashParams.get('state') || searchParams.state || '',
-        code: hashParams.get('loginRequestToken') || '',
-        refresh: searchParams.refresh || '',
-      };
-    }
-
-    const hash =
-      typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
-    const hashParams = new URLSearchParams(hash);
     const fragmentCredentials = hashParams.get('credentials');
     const fragmentState = hashParams.get('state');
     return fragmentCredentials || fragmentState
