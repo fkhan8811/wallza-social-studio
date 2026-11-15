@@ -103,8 +103,13 @@ export const ContinueIntegration: FC<{
       typeof window !== 'undefined' ? window.location.hash.substring(1) : '';
     const hashParams = new URLSearchParams(hash);
     const fragmentCredentials = hashParams.get('credentials');
-    return fragmentCredentials
-      ? { ...searchParams, code: fragmentCredentials }
+    const fragmentState = hashParams.get('state');
+    return fragmentCredentials || fragmentState
+      ? {
+          ...searchParams,
+          ...(fragmentState ? { state: fragmentState } : {}),
+          ...(fragmentCredentials ? { code: fragmentCredentials } : {}),
+        }
       : searchParams;
   }, []);
 
