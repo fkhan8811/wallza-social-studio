@@ -143,6 +143,7 @@ export const ContinueIntegration: FC<{
           'refresh',
           'state',
           'device_id',
+          'credentials',
         ].forEach((key) => hashParams.delete(key));
         const remainingHash = hashParams.toString();
         cleanedUrl.hash = remainingHash ? `#${remainingHash}` : '';
