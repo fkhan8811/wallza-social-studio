@@ -712,17 +712,25 @@ export class OrganizationRepository {
   }
 
   async findByWallzaOrgId(wallzaOrgId: string) {
+    const mapped = await this._organization.model.organization.findUnique({
+      where: { wallzaOrgId },
+      include: { subscription: true },
+    });
+
+    if (mapped && !mapped.deletedAt) {
+      return mapped;
+    }
+
+    // Legacy rows used a description marker before the dedicated unique key
+    // existed. Only select unclaimed legacy rows so they cannot shadow a
+    // different tenant's canonical wallzaOrgId mapping.
     return this._organization.model.organization.findFirst({
       where: {
-        OR: [
-          { wallzaOrgId },
-          { description: `wallza_org:${wallzaOrgId}` },
-        ],
+        wallzaOrgId: null,
+        description: `wallza_org:${wallzaOrgId}`,
         deletedAt: null,
       },
-      include: {
-        subscription: true,
-      },
+      include: { subscription: true },
     });
   }
 
