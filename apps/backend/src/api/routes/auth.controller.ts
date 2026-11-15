@@ -29,6 +29,12 @@ import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id'
 import * as Sentry from '@sentry/nestjs';
 import { FarcasterProvider } from '@gitroom/nestjs-libraries/integrations/social/farcaster.provider';
 import { AttributionService } from '@gitroom/nestjs-libraries/services/attribution/attribution.service';
+import { SsoExchangeDto } from '@gitroom/nestjs-libraries/dtos/auth/sso.exchange.dto';
+import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
+import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
+import { AuthService as AuthChecker } from '@gitroom/helpers/auth/auth.service';
+import { signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
+import { sanitizeReturnUrl } from '@gitroom/helpers/utils/safe.return.url';
 
 @ApiTags('Auth')
 @Controller('/auth')
@@ -36,7 +42,9 @@ export class AuthController {
   constructor(
     private _authService: AuthService,
     private _emailService: EmailService,
-    private _attributionService: AttributionService
+    private _attributionService: AttributionService,
+    private _organizationService: OrganizationService,
+    private _usersService: UsersService
   ) {}
 
   @Get('/can-register')
@@ -421,4 +429,168 @@ export class AuthController {
       login: true,
     });
   }
+
+  @Post('/sso/exchange')
+  async ssoExchange(
+    @Body() body: SsoExchangeDto,
+    @Res({ passthrough: false }) response: Response
+  ) {
+    try {
+      const code = String(body.code || '').trim();
+      const state = String(body.state || '').trim();
+      const redirectUri = String(body.redirectUri || '').trim();
+
+      if (!code || !state || !redirectUri) {
+        return response.status(400).json({ error: 'Missing code, state, or redirectUri' });
+      }
+
+      // Only accept the exact configured Postiz SSO callback origin and path.
+      let callbackUrl: URL;
+      let frontendUrl: URL;
+      try {
+        callbackUrl = new URL(redirectUri);
+        frontendUrl = new URL(process.env.FRONTEND_URL || '');
+      } catch {
+        return response.status(400).json({ error: 'Invalid SSO redirect URI' });
+      }
+      if (
+        callbackUrl.origin !== frontendUrl.origin ||
+        callbackUrl.pathname !== '/auth/sso' ||
+        callbackUrl.search ||
+        callbackUrl.hash
+      ) {
+        return response.status(400).json({ error: 'Invalid SSO redirect URI' });
+      }
+
+      const wallzaApiUrl = (
+        process.env.WALLZAOS_INTERNAL_API_URL ||
+        process.env.WALLZAOS_API_URL ||
+        'http://127.0.0.1:5001'
+      ).replace(/\/$/, '');
+
+      const verifyPath = '/api/social-studio/sso/verify';
+      const verifyPayload = {
+        code,
+        state,
+        redirect_uri: redirectUri,
+      };
+
+      const hmacHeaders = signInternalRequest({
+        method: 'POST',
+        path: verifyPath,
+        audience: 'wallzaos-api',
+        body: verifyPayload,
+      });
+
+      const verifyRes = await fetch(`${wallzaApiUrl}${verifyPath}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...hmacHeaders,
+        },
+        body: JSON.stringify(verifyPayload),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!verifyRes.ok) {
+        return response.status(401).json({
+          error: 'WallzaOS rejected the SSO ticket',
+        });
+      }
+
+      const verifyJson = (await verifyRes.json()) as {
+        valid: boolean;
+        user?: {
+          id: string;
+          email: string;
+          firstName: string;
+          lastName: string;
+          role: string;
+        };
+        organization?: {
+          id: string;
+          name: string;
+        };
+        error?: string;
+      };
+
+      if (!verifyJson.valid || !verifyJson.user || !verifyJson.organization) {
+        return response.status(400).json({
+          error: 'Invalid or expired WallzaOS SSO ticket',
+        });
+      }
+
+      // 1. Resolve Wallza Organization in Postiz
+      const org = await this._organizationService.resolveWallzaOrganization(
+        verifyJson.organization.id,
+        verifyJson.organization.name
+      );
+
+      // 2. Find or create user in Postiz
+      const fullName = `${verifyJson.user.firstName || ''} ${verifyJson.user.lastName || ''}`.trim() || verifyJson.user.email;
+      const user = await this._usersService.findOrCreateUserByEmail({
+        email: verifyJson.user.email,
+        name: fullName,
+        provider: Provider.LOCAL,
+      });
+
+      // 3. Link user to organization
+      const orgRole = String(verifyJson.user.role || '').toUpperCase() === 'ADMIN' ? 'ADMIN' : 'USER';
+      await this._organizationService.linkUserToOrg(user.id, org.id, orgRole);
+
+      // 4. Issue authenticated session cookies
+      const userWithoutPassword = { ...user };
+      if ((userWithoutPassword as any).password) {
+        delete (userWithoutPassword as any).password;
+      }
+      const jwt = AuthChecker.signJWT(userWithoutPassword);
+
+      response.cookie('auth', jwt, {
+        domain: getCookieUrlFromDomain(process.env.FRONTEND_URL!),
+        ...(!process.env.NOT_SECURED
+          ? {
+              secure: true,
+              httpOnly: true,
+              sameSite: 'none',
+            }
+          : {}),
+        expires: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365),
+      });
+
+      response.cookie('showorg', org.id, {
+        domain: getCookieUrlFromDomain(process.env.FRONTEND_URL!),
+        ...(!process.env.NOT_SECURED
+          ? {
+              secure: true,
+              httpOnly: true,
+              sameSite: 'none',
+            }
+          : {}),
+        expires: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365),
+      });
+
+      if (process.env.NOT_SECURED) {
+        response.header('auth', jwt);
+        response.header('showorg', org.id);
+      }
+
+      const safeUrl = sanitizeReturnUrl(body.returnUrl, '/launches');
+
+      return response.status(200).json({
+        success: true,
+        user: {
+          id: user.id,
+          email: user.email,
+        },
+        organizationId: org.id,
+        returnUrl: safeUrl,
+      });
+    } catch (err: any) {
+      console.error('[SSOExchange] Failed:', err?.name || 'Error');
+      return response.status(400).json({
+        error: 'SSO exchange failed',
+      });
+    }
+  }
+
 }
