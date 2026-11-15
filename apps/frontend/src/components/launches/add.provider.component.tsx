@@ -224,8 +224,9 @@ export const CustomVariables: FC<{
       );
       // Put custom credentials in the URL fragment, which is not sent to the
       // server, reverse proxy, or Referer header as part of the page request.
+      const fragmentState = encodeURIComponent(url);
       gotoUrl(
-        `/integrations/social/${identifier}?state=${encodeURIComponent(url)}${onboarding ? '&onboarding=true' : ''}#credentials=${encodedCredentials}`
+        `/integrations/social/${identifier}${onboarding ? '?onboarding=true' : ''}#state=${fragmentState}&credentials=${encodedCredentials}`
       );
     },
     [variables, onboarding]
