@@ -157,7 +157,7 @@ export class NostrProvider extends SocialAbstract implements SocialProvider {
         username: user.name || 'nousername',
       };
     } catch (e) {
-      console.log(e);
+      // Do not log authentication errors that may contain user key material.
       return 'Invalid credentials';
     }
   }
