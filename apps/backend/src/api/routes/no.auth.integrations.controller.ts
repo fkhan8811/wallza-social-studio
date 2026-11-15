@@ -328,7 +328,9 @@ export class NoAuthIntegrationsController {
       await ioRedis.del(`redirect:${body.state}`);
     }
 
-    // Bridge OAuth callback to WallzaOS internal sync if initiated from WallzaOS
+    // Bridge OAuth callback to WallzaOS internal sync if initiated from WallzaOS.
+    // Failure to dispatch or enqueue must not turn a successfully saved provider
+    // connection into a failed OAuth callback response.
     const wallzaOrgState = await ioRedis.get(`wallza:oauth_org:${body.state}`);
     if (wallzaOrgState) {
       const wallzaApiUrl = (
@@ -336,6 +338,10 @@ export class NoAuthIntegrationsController {
         process.env.WALLZA_BACKEND_URL ||
         'http://127.0.0.1:5001'
       ).replace(/\/$/, '');
+      const suppliedExpiry = Number(expiresIn);
+      const tokenExpiresAt = Number.isFinite(suppliedExpiry) && suppliedExpiry > 0
+        ? new Date(Date.now() + suppliedExpiry * 1000).toISOString()
+        : null;
       const syncPayload = {
         organizationId: wallzaOrgState,
         platform: integration,
@@ -344,8 +350,32 @@ export class NoAuthIntegrationsController {
         avatarUrl: picture || null,
         socialStudioIntegrationId: createUpdate.id,
         grantedScopes: integrationProvider.scopes || [],
-        tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
+        tokenExpiresAt,
         category: 'major',
+      };
+      const retryEvent = {
+        state: body.state,
+        organizationId: org.id,
+        wallzaOrgId: wallzaOrgState,
+        platform: integration,
+        accountName: validName.trim(),
+        accountId: String(id),
+        avatarUrl: picture || null,
+        socialStudioIntegrationId: createUpdate.id,
+        grantedScopes: integrationProvider.scopes || [],
+        tokenExpiresAt,
+        category: 'major',
+      };
+      const enqueueRetry = async (error: string) => {
+        try {
+          await this._oAuthCallbackRetryRepository.enqueueOrUpdate({
+            ...retryEvent,
+            error,
+          });
+        } catch {
+          // Keep OAuth successful; alert operators without exposing payload data.
+          console.warn('[WallzaBridge] Retry event could not be persisted.');
+        }
       };
 
       try {
@@ -370,39 +400,13 @@ export class NoAuthIntegrationsController {
           await ioRedis.del(`wallza:oauth_org:${body.state}`);
           await this._oAuthCallbackRetryRepository.markCompletedByState(body.state);
         } else {
-          // Never log or persist remote response bodies: providers may echo secrets.
+          // Never log or persist remote response bodies; providers may echo secrets.
           console.warn(`[WallzaBridge] WallzaOS account sync returned HTTP ${syncRes.status}; enqueuing durable retry event.`);
-          await this._oAuthCallbackRetryRepository.enqueueOrUpdate({
-            state: body.state,
-            organizationId: org.id,
-            wallzaOrgId: wallzaOrgState,
-            platform: integration,
-            accountName: validName.trim(),
-            accountId: String(id),
-            avatarUrl: picture || null,
-            socialStudioIntegrationId: createUpdate.id,
-            grantedScopes: integrationProvider.scopes || [],
-            tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
-            category: 'major',
-            error: `HTTP ${syncRes.status}`,
-          });
+          await enqueueRetry(`HTTP ${syncRes.status}`);
         }
-      } catch (bridgeErr: any) {
-        console.warn('[WallzaBridge] Network/runtime error during WallzaOS bridge dispatch; enqueueing sanitized retry event.');
-        await this._oAuthCallbackRetryRepository.enqueueOrUpdate({
-          state: body.state,
-          organizationId: org.id,
-          wallzaOrgId: wallzaOrgState,
-          platform: integration,
-          accountName: validName.trim(),
-          accountId: String(id),
-          avatarUrl: picture || null,
-          socialStudioIntegrationId: createUpdate.id,
-          grantedScopes: integrationProvider.scopes || [],
-          tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
-          category: 'major',
-          error: 'Network/runtime error',
-        });
+      } catch {
+        console.warn('[WallzaBridge] Network/runtime error during dispatch; enqueuing durable retry event.');
+        await enqueueRetry('Network/runtime error');
       }
     }
 
