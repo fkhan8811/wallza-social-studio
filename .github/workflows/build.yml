@@ -50,5 +50,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - name: Validate Prisma schema
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postiz?schema=public
+        run: pnpm exec prisma validate --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
+
+      - name: Test Wallza/Postiz release policies
+        run: pnpm run test:wallza-postiz
+
       - name: Build
         run: pnpm run build
