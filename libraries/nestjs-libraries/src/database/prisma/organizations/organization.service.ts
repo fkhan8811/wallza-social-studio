@@ -221,6 +221,10 @@ export class OrganizationService {
     );
   }
 
+  async linkUserToOrg(userId: string, orgId: string, role: 'USER' | 'ADMIN') {
+    return this._organizationRepository.linkUserToOrg(userId, orgId, role);
+  }
+
   async resolveWallzaOrganization(wallzaOrgId: string, name?: string) {
     if (!wallzaOrgId || typeof wallzaOrgId !== 'string') {
       throw new Error('Invalid Wallza organization ID');
@@ -233,10 +237,16 @@ export class OrganizationService {
       if (org) return org;
     }
 
-    // Check database by tagged description
+    // Atomic DB lookup or creation
     let org = await this._organizationRepository.findByWallzaOrgId(wallzaOrgId);
     if (!org) {
-      org = await this._organizationRepository.createForWallzaOrg(wallzaOrgId, name);
+      try {
+        org = await this._organizationRepository.createForWallzaOrg(wallzaOrgId, name);
+      } catch (err: any) {
+        // If concurrent request created it in parallel, read existing
+        org = await this._organizationRepository.findByWallzaOrgId(wallzaOrgId);
+        if (!org) throw err;
+      }
     }
 
     // Cache mapping in Redis for 24 hours

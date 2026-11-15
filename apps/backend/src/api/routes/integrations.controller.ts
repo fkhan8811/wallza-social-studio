@@ -272,6 +272,20 @@ export class IntegrationsController {
 
       await ioRedis.set(`organization:${state}`, org.id, 'EX', 3600);
       await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+
+      // If this organization is mapped to a WallzaOS organization, record mapping for OAuth callback bridge
+      if (org.description && org.description.startsWith('wallza_org:')) {
+        const wallzaOrgId = org.description.replace('wallza_org:', '').trim();
+        if (wallzaOrgId) {
+          await ioRedis.set(`wallza:oauth_org:${state}`, wallzaOrgId, 'EX', 3600);
+        }
+      } else {
+        const cachedWallzaOrgId = await ioRedis.get(`wallza:org_reverse_map:${org.id}`);
+        if (cachedWallzaOrgId) {
+          await ioRedis.set(`wallza:oauth_org:${state}`, cachedWallzaOrgId, 'EX', 3600);
+        }
+      }
+
       await ioRedis.set(
         `external:${state}`,
         JSON.stringify(getExternalUrl),

@@ -25,6 +25,7 @@ import {
 } from '@gitroom/backend/services/auth/permissions/permission.exception.class';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
+import { SocialSyncGenerationRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/social.sync.generation.repository';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import { verifyWallzaInternalRequest, signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
 import { Request, Response } from 'express';
@@ -36,7 +37,8 @@ export class NoAuthIntegrationsController {
     private _integrationManager: IntegrationManager,
     private _integrationService: IntegrationService,
     private _refreshIntegrationService: RefreshIntegrationService,
-    private _organizationService: OrganizationService
+    private _organizationService: OrganizationService,
+    private _socialSyncGenerationRepository: SocialSyncGenerationRepository
   ) {}
 
   @Get('/')
@@ -349,7 +351,7 @@ export class NoAuthIntegrationsController {
           body: syncPayload,
         });
 
-        await fetch(`${wallzaApiUrl}/api/social/accounts/sync-internal`, {
+        const syncRes = await fetch(`${wallzaApiUrl}/api/social/accounts/sync-internal`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -357,10 +359,15 @@ export class NoAuthIntegrationsController {
           },
           body: JSON.stringify(syncPayload),
         });
+
+        if (syncRes.ok) {
+          await ioRedis.del(`wallza:oauth_org:${body.state}`);
+        } else {
+          const errBody = await syncRes.text().catch(() => '');
+          console.warn(`[WallzaBridge] Failed to sync to WallzaOS (status ${syncRes.status}): ${errBody}. Retaining bridge state for reconciliation.`);
+        }
       } catch (bridgeErr: any) {
-        console.warn('Failed to bridge OAuth completion to WallzaOS:', bridgeErr.message);
-      } finally {
-        await ioRedis.del(`wallza:oauth_org:${body.state}`);
+        console.warn('[WallzaBridge] Network/runtime error during WallzaOS bridge dispatch:', bridgeErr.message);
       }
     }
 
@@ -544,16 +551,37 @@ export class NoAuthIntegrationsController {
       const internalId = String(conn.internalId || '');
       const genKey = `wallza:generation:${targetOrg.id}:${provider}:${internalId}`;
 
-      // Fencing check against Redis persistent generation tracker
-      const currentGenStr = await ioRedis.get(genKey);
-      const currentGen = currentGenStr ? Number(currentGenStr) : 0;
+      // Fencing check against durable Postgres SocialSyncGeneration model
+      let genCheck: { allowed: boolean; currentGeneration: number; reason?: string } = {
+        allowed: true,
+        currentGeneration: 0,
+      };
 
-      if (incomingGen < currentGen) {
+      try {
+        genCheck = await this._socialSyncGenerationRepository.checkAndAdvanceGeneration(
+          targetOrg.id,
+          provider,
+          internalId,
+          incomingGen,
+          action
+        );
+      } catch (genDbErr: any) {
+        // Fallback to Redis if DB generation table error occurs
+        const currentGenStr = await ioRedis.get(genKey);
+        const currentGen = currentGenStr ? Number(currentGenStr) : 0;
+        if (incomingGen < currentGen) {
+          genCheck = { allowed: false, currentGeneration: currentGen, reason: 'superseded' };
+        } else {
+          genCheck = { allowed: true, currentGeneration: incomingGen };
+        }
+      }
+
+      if (!genCheck.allowed) {
         results.push({
           provider,
           internalId,
           status: 'superseded',
-          currentGeneration: currentGen,
+          currentGeneration: genCheck.currentGeneration,
           incomingGeneration: incomingGen,
         });
         continue;

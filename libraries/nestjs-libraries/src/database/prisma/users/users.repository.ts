@@ -314,4 +314,31 @@ export class UsersRepository {
       },
     });
   }
+
+  async findOrCreateUserByEmail(data: {
+    email: string;
+    name?: string;
+    provider?: Provider;
+  }) {
+    const existing = await this._user.model.user.findFirst({
+      where: {
+        email: data.email.toLowerCase().trim(),
+      },
+    });
+
+    if (existing) {
+      return existing;
+    }
+
+    return this._user.model.user.create({
+      data: {
+        email: data.email.toLowerCase().trim(),
+        name: data.name || data.email.split('@')[0],
+        providerName: data.provider || Provider.LOCAL,
+        password: AuthService.hashPassword(makeId(32)),
+        activated: true,
+        timezone: 0,
+      },
+    });
+  }
 }

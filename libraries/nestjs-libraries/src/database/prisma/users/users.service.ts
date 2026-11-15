@@ -23,6 +23,14 @@ export class UsersService {
     return this._usersRepository.getUserByEmail(email);
   }
 
+  findOrCreateUserByEmail(params: {
+    email: string;
+    name?: string;
+    provider?: Provider;
+  }) {
+    return this._usersRepository.findOrCreateUserByEmail(params);
+  }
+
   getUserById(id: string) {
     return this._usersRepository.getUserById(id);
   }

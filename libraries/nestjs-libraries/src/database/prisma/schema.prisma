@@ -48,6 +48,7 @@ model Organization {
   oauthAuthorizations OAuthAuthorization[]
   contentIdeaStages  ContentIdeaStage[]
   contentIdeas       ContentIdea[]
+  socialSyncGenerations SocialSyncGeneration[]
   contentCampaigns   ContentCampaign[]
   contentReviews     ContentReview[]
 
@@ -2009,4 +2010,19 @@ model Announcement {
   description String
   color       AnnouncementColor @default(INFO)
   createdAt   DateTime          @default(now())
+}
+
+model SocialSyncGeneration {
+  id             String       @id @default(uuid())
+  organizationId String
+  provider       String
+  internalId     String
+  generation     Int          @default(1)
+  lastAction     String       @default("upsert")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, provider, internalId])
+  @@index([organizationId, provider, internalId])
 }
