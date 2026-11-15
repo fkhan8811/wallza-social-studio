@@ -226,31 +226,68 @@ export class OrganizationService {
   }
 
   async resolveWallzaOrganization(wallzaOrgId: string, name?: string) {
-    if (!wallzaOrgId || typeof wallzaOrgId !== 'string') {
+    const normalizedId = typeof wallzaOrgId === 'string' ? wallzaOrgId.trim() : '';
+    if (!normalizedId || normalizedId.length > 200) {
       throw new Error('Invalid Wallza organization ID');
     }
 
-    // Check Redis mapping cache first
-    const cachedOrgId = await ioRedis.get(`wallza:org_map:${wallzaOrgId}`);
+    const legacyDescription = `wallza_org:${normalizedId}`;
+
+    // Redis is only a hint. Validate the database row against the requested
+    // tenant before trusting a cached organization ID.
+    const cachedOrgId = await ioRedis.get(`wallza:org_map:${normalizedId}`);
     if (cachedOrgId) {
-      const org = await this._organizationRepository.getOrgById(cachedOrgId);
-      if (org) return org;
+      const cachedOrg = await this._organizationRepository.getOrgById(cachedOrgId);
+      if (
+        cachedOrg &&
+        !cachedOrg.deletedAt &&
+        (cachedOrg.wallzaOrgId === normalizedId || cachedOrg.description === legacyDescription)
+      ) {
+        if (!cachedOrg.wallzaOrgId) {
+          try {
+            await this._organizationRepository.setWallzaOrgId(cachedOrg.id, normalizedId);
+            cachedOrg.wallzaOrgId = normalizedId;
+          } catch {
+            // A concurrent resolver may have claimed the unique mapping.
+            const mapped = await this._organizationRepository.findByWallzaOrgId(normalizedId);
+            if (!mapped) throw new Error('Could not safely claim the Wallza organization mapping');
+            await ioRedis.set(`wallza:org_map:${normalizedId}`, mapped.id, 'EX', 86400);
+            return mapped;
+          }
+        }
+        return cachedOrg;
+      }
+      // Stale or cross-tenant cache entries are discarded before DB resolution.
+      await ioRedis.del(`wallza:org_map:${normalizedId}`);
     }
 
-    // Atomic DB lookup or creation
-    let org = await this._organizationRepository.findByWallzaOrgId(wallzaOrgId);
+    let org = await this._organizationRepository.findByWallzaOrgId(normalizedId);
     if (!org) {
       try {
-        org = await this._organizationRepository.createForWallzaOrg(wallzaOrgId, name);
-      } catch (err: any) {
-        // If concurrent request created it in parallel, read existing
-        org = await this._organizationRepository.findByWallzaOrgId(wallzaOrgId);
-        if (!org) throw err;
+        org = await this._organizationRepository.createForWallzaOrg(normalizedId, name);
+      } catch (error: any) {
+        // Unique constraint collision means another request may have created
+        // the mapping. Re-read by the dedicated unique tenant key.
+        org = await this._organizationRepository.findByWallzaOrgId(normalizedId);
+        if (!org) throw error;
       }
     }
 
-    // Cache mapping in Redis for 24 hours
-    await ioRedis.set(`wallza:org_map:${wallzaOrgId}`, org.id, 'EX', 86400);
+    // Backfill old rows that used the description marker only. The dedicated
+    // nullable unique column avoids imposing uniqueness on ordinary Postiz orgs.
+    if (!org.wallzaOrgId) {
+      try {
+        await this._organizationRepository.setWallzaOrgId(org.id, normalizedId);
+        org.wallzaOrgId = normalizedId;
+      } catch (error: any) {
+        const mapped = await this._organizationRepository.findByWallzaOrgId(normalizedId);
+        if (!mapped) throw error;
+        org = mapped;
+      }
+    } else if (org.wallzaOrgId !== normalizedId) {
+      throw new Error('Wallza organization mapping conflict');
+    }
+
+    await ioRedis.set(`wallza:org_map:${normalizedId}`, org.id, 'EX', 86400);
     return org;
-  }
-}
+  }}
