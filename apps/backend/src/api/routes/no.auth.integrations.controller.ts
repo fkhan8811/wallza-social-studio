@@ -330,7 +330,11 @@ export class NoAuthIntegrationsController {
     // Bridge OAuth callback to WallzaOS internal sync if initiated from WallzaOS
     const wallzaOrgState = await ioRedis.get(`wallza:oauth_org:${body.state}`);
     if (wallzaOrgState) {
-      const wallzaApiUrl = process.env.WALLZAOS_INTERNAL_API_URL || process.env.WALLZA_BACKEND_URL || 'http://127.0.0.1:5001';
+      const wallzaApiUrl = (
+        process.env.WALLZAOS_INTERNAL_API_URL ||
+        process.env.WALLZA_BACKEND_URL ||
+        'http://127.0.0.1:5001'
+      ).replace(/\/$/, '');
       const syncPayload = {
         organizationId: wallzaOrgState,
         platform: integration,
@@ -358,6 +362,7 @@ export class NoAuthIntegrationsController {
             ...signed,
           },
           body: JSON.stringify(syncPayload),
+          signal: AbortSignal.timeout(10000),
         });
 
         if (syncRes.ok) {
