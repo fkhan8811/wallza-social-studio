@@ -219,10 +219,13 @@ export const CustomVariables: FC<{
       }
       const { url } = await response.json();
       modals.closeAll();
+      const encodedCredentials = encodeURIComponent(
+        Buffer.from(JSON.stringify(data)).toString('base64')
+      );
+      // Put custom credentials in the URL fragment, which is not sent to the
+      // server, reverse proxy, or Referer header as part of the page request.
       gotoUrl(
-        `/integrations/social/${identifier}?state=${url}&code=${Buffer.from(
-          JSON.stringify(data)
-        ).toString('base64')}${onboarding ? '&onboarding=true' : ''}`
+        `/integrations/social/${identifier}?state=${encodeURIComponent(url)}${onboarding ? '&onboarding=true' : ''}#credentials=${encodedCredentials}`
       );
     },
     [variables, onboarding]
