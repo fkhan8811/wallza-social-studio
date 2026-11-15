@@ -15,6 +15,8 @@ Configure these variables on the **Postiz backend**:
 | `WALLZA_BACKEND_URL` | Optional fallback | OAuth callback retry fallback when `WALLZAOS_INTERNAL_API_URL` is not set. |
 | `WALLZAOS_DEFAULT_SUBSCRIPTION_TIER` | Optional | Tier assigned to newly provisioned Postiz tenants: `STANDARD`, `PRO`, `TEAM`, or `ULTIMATE`. Defaults to `PRO`. |
 | `WALLZAOS_DEFAULT_CHANNELS` | Optional | Default channel allowance for newly provisioned tenants. Defaults to `50`. |
+ 
+On the **WallzaOS backend**, also configure `SOCIAL_STUDIO_FRONTEND_URL` (or `POSTIZ_FRONTEND_URL`) to the exact public Postiz frontend base URL. This is used by `POST /api/social-studio/sso/start` to build the fixed `/auth/sso` callback. WallzaOS provides `POST /api/social-studio/sso/verify` (HMAC audience `wallzaos-api`) and `POST /api/social/accounts/sync-internal` (HMAC audience `wallzaos`). See `Whatsapp/docs/POSTIZ_SOCIAL_STUDIO_SSO_SYNC.md` for the WallzaOS deployment and migration steps.
 
 The HMAC secret must be identical on both backend services. Do not use the development fallback or expose the value to browser/frontend variables. Redis and PostgreSQL must be available to the Postiz backend; Redis is used for HMAC nonce replay protection, OAuth state and the short-lived tenant lookup cache.
 
