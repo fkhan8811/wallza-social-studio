@@ -519,7 +519,7 @@ export class IntegrationRepository {
           )?.rootInternalId || internalId;
 
         await db.integration.updateMany({
-          where: { id: { not: upsert.id }, rootInternalId: rootId },
+          where: { organizationId: org, id: { not: upsert.id }, rootInternalId: rootId },
           data: {
             token,
             refreshToken,
