@@ -121,6 +121,27 @@ export const ContinueIntegration: FC<{
         'state',
         'device_id',
       ].forEach((key) => cleanedUrl.searchParams.delete(key));
+
+      // A few providers (notably MeWe) return the verifier in the URL hash.
+      // Strip those values too, after modifiedParams has captured them.
+      if (cleanedUrl.hash) {
+        const hashParams = new URLSearchParams(cleanedUrl.hash.slice(1));
+        [
+          'code',
+          'auth_code',
+          'oauth_verifier',
+          'loginRequestToken',
+          'oauth_token',
+          'access_token',
+          'refresh_token',
+          'refresh',
+          'state',
+          'device_id',
+        ].forEach((key) => hashParams.delete(key));
+        const remainingHash = hashParams.toString();
+        cleanedUrl.hash = remainingHash ? `#${remainingHash}` : '';
+      }
+
       window.history.replaceState(
         window.history.state,
         '',
