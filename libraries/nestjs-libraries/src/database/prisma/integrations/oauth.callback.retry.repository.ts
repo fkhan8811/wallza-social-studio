@@ -1,6 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaRepository, PrismaTransaction } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 import { signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
+import {
+  getOAuthCallbackRetryDelayMs,
+  MAX_OAUTH_CALLBACK_ATTEMPTS,
+  sanitizeOAuthCallbackError,
+} from './oauth.callback.retry.policy';
 
 export interface EnqueueCallbackRetryParams {
   state: string;
@@ -17,7 +22,6 @@ export interface EnqueueCallbackRetryParams {
   error?: string;
 }
 
-const MAX_ATTEMPTS = 5;
 const LEASE_MS = 3 * 60 * 1000;
 const MAX_BATCH_SIZE = 50;
 
@@ -31,13 +35,7 @@ export class OAuthCallbackRetryRepository {
   ) {}
 
   private sanitizeError(value: unknown): string | null {
-    if (!value) return null;
-    return String(value)
-      .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
-      .replace(/(access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|password|authorization)\s*[:=]\s*["']?[^\s,"']+/gi, '$1=[REDACTED]')
-      .replace(/https?:\/\/[^\s"'<>]+/gi, '[remote-url]')
-      .replace(/[\r\n\t]+/g, ' ')
-      .slice(0, 500);
+    return sanitizeOAuthCallbackError(value);
   }
 
   /**
@@ -98,7 +96,7 @@ export class OAuthCallbackRetryRepository {
       // Recover attempts whose worker died after consuming the final attempt.
       await tx.oAuthCallbackRetry.updateMany({
         where: {
-          attempts: { gte: MAX_ATTEMPTS },
+          attempts: { gte: MAX_OAUTH_CALLBACK_ATTEMPTS },
           status: { in: ['pending', 'processing'] },
           OR: [
             { status: 'pending' },
@@ -112,7 +110,7 @@ export class OAuthCallbackRetryRepository {
       const candidates = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT "id"
         FROM "OAuthCallbackRetry"
-        WHERE "attempts" < ${MAX_ATTEMPTS}
+        WHERE "attempts" < ${MAX_OAUTH_CALLBACK_ATTEMPTS}
           AND (
             ("status" = 'pending' AND "nextAttemptAt" <= ${now})
             OR
@@ -212,9 +210,8 @@ export class OAuthCallbackRetryRepository {
     reason: unknown
   ) {
     if (!claimedAt) return;
-    const terminal = attempts >= MAX_ATTEMPTS;
-    const exponentialDelay = Math.min(30 * 60 * 1000, 5000 * (2 ** Math.max(0, attempts - 1)));
-    const jitter = Math.floor(Math.random() * Math.max(1, exponentialDelay * 0.2));
+    const terminal = attempts >= MAX_OAUTH_CALLBACK_ATTEMPTS;
+    const retryDelay = getOAuthCallbackRetryDelayMs(attempts);
 
     // The claim timestamp is a lease token. A stale worker cannot overwrite
     // a later worker's result after its lease has expired and been reclaimed.
@@ -223,7 +220,7 @@ export class OAuthCallbackRetryRepository {
       data: {
         status: terminal ? 'dead' : 'pending',
         lockedAt: null,
-        nextAttemptAt: new Date(Date.now() + exponentialDelay + jitter),
+        nextAttemptAt: new Date(Date.now() + retryDelay),
         lastError: this.sanitizeError(reason),
       },
     });
