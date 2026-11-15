@@ -8,8 +8,9 @@ const require = createRequire(import.meta.url);
 let sharp;
 try {
   sharp = require('sharp');
-} catch {
-  sharp = require('D:/Whatsapp-main/node_modules/sharp');
+} catch (err) {
+  // Sharp not available in current environment module resolution
+  sharp = null;
 }
 
 describe('Wallza Social Studio — Master Integration & Verification Test Suite', () => {
@@ -29,6 +30,11 @@ describe('Wallza Social Studio — Master Integration & Verification Test Suite'
     });
 
     it('generates real image bytes and persists file to local storage directory', async () => {
+      assert.ok(
+        sharp,
+        'sharp package must be installed and resolvable in the local environment to run image render tests'
+      );
+
       // 1. Generate real image buffer with Sharp
       const width = 800;
       const height = 800;
