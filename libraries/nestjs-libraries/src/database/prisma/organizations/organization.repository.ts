@@ -783,13 +783,15 @@ export class OrganizationRepository {
     });
 
     if (existing) {
-      if (existing.role !== role) {
-        await this._userOrg.model.userOrganization.update({
-          where: { id: existing.id },
-          data: { role },
-        });
+      // SSO must not demote a Postiz SUPERADMIN account. For ordinary
+      // memberships, reconcile the role to the signed WallzaOS identity.
+      if (existing.role === 'SUPERADMIN' || existing.role === role) {
+        return existing;
       }
-      return existing;
+      return this._userOrg.model.userOrganization.update({
+        where: { id: existing.id },
+        data: { role },
+      });
     }
 
     return this._userOrg.model.userOrganization.create({
