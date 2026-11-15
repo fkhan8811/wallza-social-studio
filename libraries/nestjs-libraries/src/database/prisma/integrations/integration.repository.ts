@@ -7,6 +7,7 @@ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { PlugDto } from '@gitroom/nestjs-libraries/dtos/plugs/plug.dto';
+import { decideSocialSyncGeneration } from './social.sync.generation.policy';
 
 @Injectable()
 export class IntegrationRepository {
@@ -348,23 +349,16 @@ export class IntegrationRepository {
           };
           const current = await tx.socialSyncGeneration.findUnique({ where: key });
 
-          if (current && generation < current.generation) {
+          const decision = decideSocialSyncGeneration(current, generation, action);
+          if (!decision.allowed) {
             return {
               allowed: false,
-              currentGeneration: current.generation,
-              reason: 'superseded' as const,
+              currentGeneration: decision.currentGeneration,
+              reason: decision.reason,
             };
           }
 
-          if (current && generation === current.generation && current.lastAction !== action) {
-            return {
-              allowed: false,
-              currentGeneration: current.generation,
-              reason: 'conflict' as const,
-            };
-          }
-
-          if (!current) {
+          if (decision.shouldInsert) {
             await tx.socialSyncGeneration.create({
               data: {
                 organizationId,
@@ -374,7 +368,7 @@ export class IntegrationRepository {
                 lastAction: action,
               },
             });
-          } else if (generation > current.generation) {
+          } else if (decision.shouldAdvance && current) {
             await tx.socialSyncGeneration.update({
               where: { id: current.id },
               data: { generation, lastAction: action },
@@ -387,9 +381,7 @@ export class IntegrationRepository {
           return {
             allowed: true,
             currentGeneration: generation,
-            ...(current && generation === current.generation
-              ? { reason: 'replayed' as const }
-              : {}),
+            ...(decision.replayed ? { reason: 'replayed' as const } : {}),
             result,
           };
         }, { isolationLevel: 'Serializable' });
