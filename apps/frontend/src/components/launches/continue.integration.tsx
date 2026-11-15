@@ -103,6 +103,31 @@ export const ContinueIntegration: FC<{
   }, []);
 
   useEffect(() => {
+    // OAuth codes, provider verifiers and base64-encoded custom credentials
+    // arrive as query parameters in this legacy continuation route. The
+    // request payload has already been captured in modifiedParams above; scrub
+    // them from browser history before the network request starts.
+    if (typeof window !== 'undefined') {
+      const cleanedUrl = new URL(window.location.href);
+      [
+        'code',
+        'auth_code',
+        'oauth_verifier',
+        'loginRequestToken',
+        'oauth_token',
+        'access_token',
+        'refresh_token',
+        'refresh',
+        'state',
+        'device_id',
+      ].forEach((key) => cleanedUrl.searchParams.delete(key));
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+    }
+
     (async () => {
       const timezone = String(newDayjs().utcOffset());
 
