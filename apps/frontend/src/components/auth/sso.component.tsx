@@ -21,6 +21,19 @@ export function SsoComponent() {
   useEffect(() => {
     let isSubscribed = true;
 
+    // The SSO ticket is a short-lived bearer credential. Preserve it in
+    // component state for the exchange, but remove it from browser history.
+    if (typeof window !== 'undefined') {
+      const cleanedUrl = new URL(window.location.href);
+      cleanedUrl.searchParams.delete('code');
+      cleanedUrl.searchParams.delete('state');
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+    }
+
     async function exchange() {
       if (!code || !state) {
         if (isSubscribed) {
