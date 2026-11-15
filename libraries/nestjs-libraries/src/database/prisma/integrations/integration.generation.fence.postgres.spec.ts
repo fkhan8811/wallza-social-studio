@@ -2,10 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { IntegrationRepository } from './integration.repository';
+import { OrganizationRepository } from '../organizations/organization.repository';
 
 const databaseConfigured = Boolean(process.env.DATABASE_URL);
 const prisma = databaseConfigured ? new PrismaClient() : null;
 const organizationId = randomUUID();
+const otherOrganizationId = randomUUID();
+const wallzaOrganizationId = randomUUID();
 
 describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration mutations', () => {
   const repository: any = Object.create(IntegrationRepository.prototype);
@@ -13,6 +16,7 @@ describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration m
   beforeAll(async () => {
     if (!prisma) throw new Error('DATABASE_URL is required for the PostgreSQL fence tests');
     repository._transaction = { model: prisma };
+    repository._integration = { model: prisma };
     await prisma.organization.create({
       data: {
         id: organizationId,
@@ -20,13 +24,26 @@ describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration m
         description: 'automated test fixture',
       },
     });
+    await prisma.organization.create({
+      data: {
+        id: otherOrganizationId,
+        name: 'Wallza Social Sync Other Tenant Test',
+        description: 'automated other-tenant fixture',
+      },
+    });
   });
 
   afterAll(async () => {
     if (!prisma) return;
-    await prisma.integration.deleteMany({ where: { organizationId } });
-    await prisma.socialSyncGeneration.deleteMany({ where: { organizationId } });
-    await prisma.organization.deleteMany({ where: { id: organizationId } });
+    await prisma.integration.deleteMany({
+      where: { organizationId: { in: [organizationId, otherOrganizationId] } },
+    });
+    await prisma.socialSyncGeneration.deleteMany({
+      where: { organizationId: { in: [organizationId, otherOrganizationId] } },
+    });
+    await prisma.organization.deleteMany({
+      where: { id: { in: [organizationId, otherOrganizationId] } },
+    });
     await prisma.$disconnect();
   });
 
@@ -148,5 +165,105 @@ describe.skipIf(!databaseConfigured)('PostgreSQL generation-fenced integration m
 
     expect(replay).toMatchObject({ allowed: true, reason: 'replayed' });
     expect(conflict).toMatchObject({ allowed: false, reason: 'conflict' });
+  });
+
+  it('does not propagate one-time provider tokens across organizations', async () => {
+    if (!prisma) return;
+    const rootInternalId = randomUUID();
+    await prisma.integration.create({
+      data: {
+        organizationId,
+        internalId: 'same-tenant-child',
+        rootInternalId,
+        name: 'Same tenant child',
+        providerIdentifier: 'tiktok',
+        type: 'social',
+        token: 'old-same-tenant-token',
+        refreshToken: 'old-same-tenant-refresh',
+      },
+    });
+    await prisma.integration.create({
+      data: {
+        organizationId: otherOrganizationId,
+        internalId: 'other-tenant-child',
+        rootInternalId,
+        name: 'Other tenant child',
+        providerIdentifier: 'tiktok',
+        type: 'social',
+        token: 'other-tenant-token',
+        refreshToken: 'other-tenant-refresh',
+      },
+    });
+
+    await repository.createOrUpdateIntegration(
+      undefined,
+      true,
+      organizationId,
+      'One-time Token Source',
+      undefined,
+      'social',
+      rootInternalId,
+      'tiktok',
+      'new-same-tenant-token',
+      'new-same-tenant-refresh',
+      3600,
+      'publisher',
+      false,
+      undefined,
+      0,
+      undefined
+    );
+
+    const sameTenantChild = await prisma.integration.findUnique({
+      where: {
+        organizationId_internalId: {
+          organizationId,
+          internalId: 'same-tenant-child',
+        },
+      },
+    });
+    const otherTenantChild = await prisma.integration.findUnique({
+      where: {
+        organizationId_internalId: {
+          organizationId: otherOrganizationId,
+          internalId: 'other-tenant-child',
+        },
+      },
+    });
+
+    expect(sameTenantChild?.token).toBe('new-same-tenant-token');
+    expect(otherTenantChild?.token).toBe('other-tenant-token');
+    expect(otherTenantChild?.refreshToken).toBe('other-tenant-refresh');
+  });
+
+  it('resolves a canonical Wallza tenant ID ahead of a colliding legacy description', async () => {
+    if (!prisma) return;
+    const canonical = await prisma.organization.create({
+      data: {
+        name: 'Canonical Wallza Tenant',
+        description: `wallza_org:${wallzaOrganizationId}`,
+        wallzaOrgId: wallzaOrganizationId,
+      },
+    });
+    await prisma.organization.create({
+      data: {
+        name: 'Legacy description collision',
+        description: `wallza_org:${wallzaOrganizationId}`,
+      },
+    });
+
+    const organizationRepository: any = Object.create(OrganizationRepository.prototype);
+    organizationRepository._organization = { model: prisma };
+
+    const resolved = await organizationRepository.findByWallzaOrgId(wallzaOrganizationId);
+    expect(resolved?.id).toBe(canonical.id);
+
+    await prisma.organization.update({
+      where: { id: canonical.id },
+      data: { deletedAt: new Date() },
+    });
+    await expect(
+      organizationRepository.findByWallzaOrgId(wallzaOrganizationId)
+    ).resolves.toBeNull();
   });
 });
