@@ -668,12 +668,17 @@ export class NoAuthIntegrationsController {
         continue;
       }
 
-      let accessToken = conn.token || '';
+      let accessToken = typeof conn.token === 'string' ? conn.token : '';
       let refreshToken = '';
-      let expiresIn = conn.expiresIn || 0;
-      let name = conn.name || `${provider} Account`;
-      let picture = conn.picture || '';
-      let username = '';
+      const suppliedExpiry = Number(conn.expiresIn);
+      let expiresIn = Number.isFinite(suppliedExpiry) && suppliedExpiry > 0
+        ? suppliedExpiry
+        : 0;
+      let name = typeof conn.name === 'string' && conn.name.trim()
+        ? conn.name.trim().slice(0, 200)
+        : `${provider} Account`;
+      let picture = typeof conn.picture === 'string' ? conn.picture : '';
+      let username = typeof conn.username === 'string' ? conn.username.slice(0, 200) : '';
       let customDetails: string | undefined = undefined;
 
       // Real provider authentication / adaptation
@@ -728,6 +733,14 @@ export class NoAuthIntegrationsController {
           });
           continue;
         }
+      } else if (integrationProvider.isChromeExtension || integrationProvider.extensionCookies) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'This provider requires the Postiz browser extension and cannot be linked with a bearer token',
+        });
+        continue;
       } else if (provider === 'telegram') {
         // Telegram in Postiz uses server-configured TELEGRAM_TOKEN bot.
         // Direct bot-token credentials from user are not supported without dedicated bot instance.
@@ -738,12 +751,20 @@ export class NoAuthIntegrationsController {
           error: 'Telegram requires platform bot setup and is unsupported for user direct tokens',
         });
         continue;
-      } else if (provider === 'discord' && !conn.token) {
+      } else if (provider === 'discord' && !accessToken) {
         results.push({
           provider,
           internalId,
           status: 'error',
           error: 'Discord requires OAuth authorization. Webhook URLs are not supported as OAuth tokens.',
+        });
+        continue;
+      } else if (!integrationProvider.customFields && !accessToken) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'A provider access token is required',
         });
         continue;
       }
