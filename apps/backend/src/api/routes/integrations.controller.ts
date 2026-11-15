@@ -272,6 +272,24 @@ export class IntegrationsController {
 
       await ioRedis.set(`organization:${state}`, org.id, 'EX', 3600);
       await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+
+      // Bind OAuth state to the Wallza tenant only when this Postiz org has
+      // been resolved through the dedicated tenant mapping. The Redis reverse
+      // mapping remains a compatibility fallback for older mapped accounts.
+      if (org.wallzaOrgId) {
+        await ioRedis.set(`wallza:oauth_org:${state}`, org.wallzaOrgId, 'EX', 3600);
+      } else if (org.description?.startsWith('wallza_org:')) {
+        const legacyWallzaOrgId = org.description.slice('wallza_org:'.length).trim();
+        if (legacyWallzaOrgId) {
+          await ioRedis.set(`wallza:oauth_org:${state}`, legacyWallzaOrgId, 'EX', 3600);
+        }
+      } else {
+        const reverseMapping = await ioRedis.get(`wallza:org_reverse_map:${org.id}`);
+        if (reverseMapping) {
+          await ioRedis.set(`wallza:oauth_org:${state}`, reverseMapping, 'EX', 3600);
+        }
+      }
+
       await ioRedis.set(
         `external:${state}`,
         JSON.stringify(getExternalUrl),
