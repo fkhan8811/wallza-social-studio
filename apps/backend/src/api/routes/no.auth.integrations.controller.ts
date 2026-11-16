@@ -9,6 +9,7 @@ import {
   Res,
   UseFilters,
 } from '@nestjs/common';
+import crypto from 'crypto';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import { ConnectIntegrationDto } from '@gitroom/nestjs-libraries/dtos/integrations/connect.integration.dto';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
@@ -899,15 +900,19 @@ export class NoAuthIntegrationsController {
       return res.status(400).json({ success: false, error: 'Invalid pageData: missing page identifier' });
     }
 
-    // Step 2: Atomic Lua script to validate state bindings and reserve in-progress execution
+    // Step 2: Atomic Lua script to validate state bindings and reserve in-progress execution with ownership token
     // KEYS[1]: organization:${state}
     // KEYS[2]: wallza:oauth_org:${state}
     // KEYS[3]: wallza:oauth_page_state:${state}
     // KEYS[4]: wallza:oauth_page_result:${state}
+    // KEYS[5]: wallza:oauth_page_token:${state}
     // ARGV[1]: expected organizationId (Wallza)
     // ARGV[2]: expected targetOrg.id (Postiz)
     // ARGV[3]: integrationId
     // ARGV[4]: targetPageKey
+    // ARGV[5]: reservationToken (cryptographic owner fencing token)
+    const reservationToken = crypto.randomBytes(16).toString('hex');
+
     const luaValidateAndReservePageSelect = `
       local orgId = redis.call('GET', KEYS[1])
       local wallzaOrgId = redis.call('GET', KEYS[2])
@@ -934,8 +939,9 @@ export class NoAuthIntegrationsController {
         return {-2, 'Target organization mismatch on page selection'}
       end
 
-      -- Reserve state as 'in_progress' with a 60s lease
+      -- Reserve state as 'in_progress' with a 60s lease and record owner fencing token
       redis.call('SET', KEYS[3], 'in_progress', 'EX', 60)
+      redis.call('SET', KEYS[5], ARGV[5], 'EX', 60)
       return {1, orgId, wallzaOrgId}
     `;
 
@@ -943,15 +949,17 @@ export class NoAuthIntegrationsController {
     try {
       stateCheck = await ioRedis.eval(
         luaValidateAndReservePageSelect,
-        4,
+        5,
         `organization:${state}`,
         `wallza:oauth_org:${state}`,
         `wallza:oauth_page_state:${state}`,
         `wallza:oauth_page_result:${state}`,
+        `wallza:oauth_page_token:${state}`,
         organizationId,
         targetOrg.id,
         integrationId,
-        targetPageKey
+        targetPageKey,
+        reservationToken
       );
     } catch (redisErr: any) {
       return res.status(500).json({ success: false, error: 'Redis state verification failed' });
@@ -1029,26 +1037,50 @@ export class NoAuthIntegrationsController {
         pageKey: targetPageKey,
       };
 
-      // Atomically transition state to 'completed', cache result, and release one-time org keys
+      // Atomically transition state to 'completed', cache result, and release one-time keys IF AND ONLY IF the reservation token matches
+      // KEYS[1]: wallza:oauth_page_state:${state}
+      // KEYS[2]: wallza:oauth_page_result:${state}
+      // KEYS[3]: wallza:oauth_page_token:${state}
+      // KEYS[4]: organization:${state}
+      // KEYS[5]: wallza:oauth_org:${state}
+      // KEYS[6]: wallza:oauth_in_between:${state}
+      // ARGV[1]: JSON serialized completionResult
+      // ARGV[2]: reservationToken
       const luaCompletePageSelection = `
+        local currentToken = redis.call('GET', KEYS[3])
+        if currentToken ~= ARGV[2] then
+          return {0, 'Stale reservation token: lease expired or acquired by another request'}
+        end
+
         redis.call('SET', KEYS[1], 'completed', 'EX', 1800)
         redis.call('SET', KEYS[2], ARGV[1], 'EX', 1800)
         redis.call('DEL', KEYS[3])
         redis.call('DEL', KEYS[4])
         redis.call('DEL', KEYS[5])
-        return 1
+        redis.call('DEL', KEYS[6])
+        return {1, 'OK'}
       `;
 
-      await ioRedis.eval(
+      const completionCheck: any = await ioRedis.eval(
         luaCompletePageSelection,
-        5,
+        6,
         `wallza:oauth_page_state:${state}`,
         `wallza:oauth_page_result:${state}`,
+        `wallza:oauth_page_token:${state}`,
         `organization:${state}`,
         `wallza:oauth_org:${state}`,
         `wallza:oauth_in_between:${state}`,
-        JSON.stringify(completionResult)
+        JSON.stringify(completionResult),
+        reservationToken
       );
+
+      const [completeStatus, completeMsg] = completionCheck || [];
+      if (completeStatus !== 1) {
+        return res.status(409).json({
+          success: false,
+          error: completeMsg || 'Reservation lease expired before completion was committed',
+        });
+      }
 
       return res.status(200).json({
         success: true,
@@ -1059,8 +1091,26 @@ export class NoAuthIntegrationsController {
         profile: updated.profile || '',
       });
     } catch (err: any) {
-      // Release in-progress lock on failure so legitimate retry can proceed immediately
-      await ioRedis.del(`wallza:oauth_page_state:${state}`).catch(() => {});
+      // Release in-progress lock on failure IF AND ONLY IF the token matches the current owner
+      // This prevents a delayed failure from deleting a subsequent request's valid reservation
+      const luaReleasePageReservation = `
+        local currentToken = redis.call('GET', KEYS[2])
+        if currentToken == ARGV[1] then
+          redis.call('DEL', KEYS[1])
+          redis.call('DEL', KEYS[2])
+          return 1
+        end
+        return 0
+      `;
+
+      await ioRedis.eval(
+        luaReleasePageReservation,
+        2,
+        `wallza:oauth_page_state:${state}`,
+        `wallza:oauth_page_token:${state}`,
+        reservationToken
+      ).catch(() => {});
+
       return res.status(500).json({ success: false, error: err.message || 'Failed to save provider page selection' });
     }
   }
