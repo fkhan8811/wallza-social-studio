@@ -657,29 +657,89 @@ export class NoAuthIntegrationsController {
       return res.status(400).json({ success: false, error: 'Provider not found' });
     }
 
-    // Verify state and tenant binding in Redis (Single-Use, Atomic Verification)
-    const storedOrgId = await ioRedis.get(`organization:${state}`);
-    const storedWallzaOrgId = await ioRedis.get(`wallza:oauth_org:${state}`);
-    const storedCodeVerifier = (await ioRedis.get(`login:${state}`)) || '';
-    const storedRefresh = (await ioRedis.get(`refresh:${state}`)) || '';
+    // Atomic Lua script to validate and consume OAuth state keys together
+    // Keys:
+    // 1: organization:${state}
+    // 2: wallza:oauth_org:${state}
+    // 3: login:${state}
+    // 4: refresh:${state}
+    // 5: wallza:oauth_in_between:${state}
+    // 6: wallza:oauth_payload:${state}
+    //
+    // Logic:
+    // 1. Check if both organization:${state} and wallza:oauth_org:${state} exist.
+    // 2. Check if wallza:oauth_org matches expected ARGV[1] (Wallza organizationId).
+    // 3. If valid, read codeVerifier, refresh, and atomically delete state keys (or retain org binding if inBetweenSteps is required for page selection).
+    const luaValidateAndConsume = `
+      local orgId = redis.call('GET', KEYS[1])
+      local wallzaOrgId = redis.call('GET', KEYS[2])
+      if not orgId or not wallzaOrgId then
+        return {0, 'OAuth state expired, invalid or already consumed'}
+      end
+      if wallzaOrgId ~= ARGV[1] then
+        return {-1, 'Tenant mismatch: OAuth session does not belong to the requesting organization'}
+      end
+      local codeVerifier = redis.call('GET', KEYS[3]) or ''
+      local refresh = redis.call('GET', KEYS[4]) or ''
+      local isBetween = ARGV[2]
 
-    if (!storedOrgId) {
-      return res.status(400).json({
-        success: false,
-        error: 'OAuth state expired, invalid or already consumed',
-      });
+      -- Consume single-use login state keys immediately
+      redis.call('DEL', KEYS[3])
+      redis.call('DEL', KEYS[4])
+
+      if isBetween == '1' then
+        -- Retain organization and wallza:oauth_org bindings for page selection stage, but mark exchange as completed
+        -- Set marker to prevent concurrent/repeated callback exchanges
+        local consumed = redis.call('GET', KEYS[5])
+        if consumed then
+          return {0, 'OAuth state already exchanged'}
+        end
+        redis.call('SET', KEYS[5], '1', 'EX', 1800)
+      else
+        -- Completely consume all state keys immediately
+        redis.call('DEL', KEYS[1])
+        redis.call('DEL', KEYS[2])
+      end
+
+      return {1, orgId, wallzaOrgId, codeVerifier, refresh}
+    `;
+
+    const isBetweenFlag = integrationProvider.isBetweenSteps ? '1' : '0';
+    let evalResult: any;
+    try {
+      evalResult = await ioRedis.eval(
+        luaValidateAndConsume,
+        5,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `login:${state}`,
+        `refresh:${state}`,
+        `wallza:oauth_in_between:${state}`,
+        organizationId,
+        isBetweenFlag
+      );
+    } catch (redisErr: any) {
+      return res.status(500).json({ success: false, error: 'Redis state evaluation failed' });
     }
 
-    // Strict Tenant Isolation: Ensure the callback caller matches the organization that initiated it
-    if (storedWallzaOrgId && storedWallzaOrgId !== organizationId) {
+    const [statusCode, val1, val2, val3, val4] = evalResult || [];
+    if (statusCode === -1) {
       return res.status(403).json({
         success: false,
-        error: 'Tenant mismatch: OAuth session does not belong to the requesting organization',
+        error: val1 || 'Tenant mismatch: OAuth session does not belong to the requesting organization',
+      });
+    }
+    if (statusCode !== 1) {
+      return res.status(400).json({
+        success: false,
+        error: val1 || 'OAuth state expired, invalid or already consumed',
       });
     }
 
-    // Consume single-use state immediately to prevent replay
-    await ioRedis.del(`login:${state}`);
+    const storedOrgId = val1;
+    const storedWallzaOrgId = val2;
+    const storedCodeVerifier = val3 || '';
+    const storedRefresh = val4 || '';
 
     let authOutcome: any;
     try {
@@ -805,6 +865,9 @@ export class NoAuthIntegrationsController {
     if (!pageData || typeof pageData !== 'object') {
       return res.status(400).json({ success: false, error: 'Missing or invalid pageData' });
     }
+    if (!state || typeof state !== 'string' || state.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Missing or invalid state parameter' });
+    }
 
     let targetOrg: any;
     try {
@@ -813,20 +876,98 @@ export class NoAuthIntegrationsController {
       return res.status(500).json({ success: false, error: 'Unable to resolve Wallza organization context' });
     }
 
-    // If state is passed, ensure it hasn't expired and matches the tenant
-    if (state) {
-      const storedWallzaOrgId = await ioRedis.get(`wallza:oauth_org:${state}`);
-      if (storedWallzaOrgId && storedWallzaOrgId !== organizationId) {
-        return res.status(403).json({ success: false, error: 'Tenant mismatch on page selection' });
-      }
-      // Consume state after page selection is finalized
-      await ioRedis.del(`organization:${state}`);
-      await ioRedis.del(`wallza:oauth_org:${state}`);
+    // Atomic Lua script to validate state bindings and consume them upon finalization
+    // KEYS[1]: organization:${state}
+    // KEYS[2]: wallza:oauth_org:${state}
+    // KEYS[3]: wallza:oauth_page_selected:${state}
+    // ARGV[1]: expected organizationId
+    // ARGV[2]: expected targetOrg.id
+    const luaValidatePageSelectState = `
+      local orgId = redis.call('GET', KEYS[1])
+      local wallzaOrgId = redis.call('GET', KEYS[2])
+      local alreadyFinalized = redis.call('GET', KEYS[3])
+
+      if alreadyFinalized then
+        return {2, 'State already finalized'}
+      end
+
+      if not orgId or not wallzaOrgId then
+        return {0, 'OAuth state expired, invalid, missing or already consumed'}
+      end
+
+      if wallzaOrgId ~= ARGV[1] then
+        return {-1, 'Tenant mismatch on page selection'}
+      end
+
+      if orgId ~= ARGV[2] then
+        return {-2, 'Target organization mismatch on page selection'}
+      end
+
+      -- Mark state as finalized in-flight to prevent race conditions
+      redis.call('SET', KEYS[3], '1', 'EX', 300)
+      return {1, orgId, wallzaOrgId}
+    `;
+
+    let stateCheck: any;
+    try {
+      stateCheck = await ioRedis.eval(
+        luaValidatePageSelectState,
+        3,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `wallza:oauth_page_selected:${state}`,
+        organizationId,
+        targetOrg.id
+      );
+    } catch (redisErr: any) {
+      return res.status(500).json({ success: false, error: 'Redis state verification failed' });
+    }
+
+    const [statusFlag, msg] = stateCheck || [];
+    if (statusFlag === -1 || statusFlag === -2) {
+      return res.status(403).json({ success: false, error: msg || 'Tenant mismatch on page selection' });
+    }
+    if (statusFlag === 0) {
+      return res.status(400).json({ success: false, error: msg || 'OAuth state expired, invalid or already consumed' });
+    }
+
+    // Verify integration exists and strictly belongs to targetOrg.id
+    let existingIntegration: any;
+    try {
+      existingIntegration = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
+    } catch (err: any) {
+      return res.status(404).json({ success: false, error: 'Integration not found for this organization' });
+    }
+
+    if (!existingIntegration || existingIntegration.organizationId !== targetOrg.id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Integration does not belong to the requesting organization',
+      });
+    }
+
+    // If already finalized (idempotent submission), return existing updated integration
+    if (statusFlag === 2) {
+      return res.status(200).json({
+        success: true,
+        integrationId: existingIntegration.id,
+        name: existingIntegration.name,
+        internalId: existingIntegration.internalId,
+        picture: existingIntegration.picture || '',
+        profile: existingIntegration.profile || '',
+        idempotent: true,
+      });
     }
 
     try {
       await this._integrationService.saveProviderPage(targetOrg.id, integrationId, pageData);
       const updated = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
+
+      // Successfully saved provider page: consume state keys permanently
+      await ioRedis.del(`organization:${state}`);
+      await ioRedis.del(`wallza:oauth_org:${state}`);
+      await ioRedis.del(`wallza:oauth_in_between:${state}`);
+
       return res.status(200).json({
         success: true,
         integrationId: updated.id,
@@ -836,6 +977,8 @@ export class NoAuthIntegrationsController {
         profile: updated.profile || '',
       });
     } catch (err: any) {
+      // Revert in-flight marker on error so retry is possible if failure was transient
+      await ioRedis.del(`wallza:oauth_page_selected:${state}`).catch(() => {});
       return res.status(500).json({ success: false, error: err.message || 'Failed to save provider page selection' });
     }
   }
