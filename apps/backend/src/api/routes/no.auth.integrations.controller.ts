@@ -988,8 +988,22 @@ export class NoAuthIntegrationsController {
 
     // Completed state encounter: return cached completed result if matching integration and page
     if (statusFlag === 2) {
+      if (!payload || typeof payload !== 'string') {
+        return res.status(409).json({
+          success: false,
+          error: 'OAuth state was marked completed but cached result is missing',
+        });
+      }
+
       try {
         const completedData = JSON.parse(payload);
+        if (!completedData || typeof completedData !== 'object') {
+          return res.status(409).json({
+            success: false,
+            error: 'OAuth state was marked completed but cached result is malformed',
+          });
+        }
+
         if (
           completedData.integrationId === integrationId &&
           (completedData.pageKey === targetPageKey || completedData.internalId === targetPageKey)
@@ -1010,14 +1024,9 @@ export class NoAuthIntegrationsController {
           });
         }
       } catch {
-        return res.status(200).json({
-          success: true,
-          integrationId: existingIntegration.id,
-          name: existingIntegration.name,
-          internalId: existingIntegration.internalId,
-          picture: existingIntegration.picture || '',
-          profile: existingIntegration.profile || '',
-          idempotent: true,
+        return res.status(409).json({
+          success: false,
+          error: 'OAuth state cached result could not be parsed; cannot verify requested page and integration',
         });
       }
     }
