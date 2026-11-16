@@ -562,6 +562,284 @@ export class NoAuthIntegrationsController {
     });
   }
 
+  @Post('/wallza-oauth-url')
+  async wallzaOAuthUrl(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, provider, refresh, redirectUrl } = req.body || {};
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid organizationId' });
+    }
+    if (!provider || typeof provider !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid provider' });
+    }
+
+    const normProvider = provider.toLowerCase().trim();
+    if (!this._integrationManager.getAllowedSocialsIntegrations().includes(normProvider)) {
+      return res.status(400).json({ success: false, error: `Provider ${normProvider} is not allowed` });
+    }
+
+    let targetOrg: any;
+    try {
+      targetOrg = await this._organizationService.resolveWallzaOrganization(organizationId);
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: 'Unable to resolve Wallza organization context' });
+    }
+
+    try {
+      const integrationProvider = this._integrationManager.getSocialIntegration(normProvider);
+      const { codeVerifier, state, url } = await integrationProvider.generateAuthUrl();
+
+      // Store one-time state, code verifier, organization bindings in Redis with 1h TTL
+      await ioRedis.set(`organization:${state}`, targetOrg.id, 'EX', 3600);
+      await ioRedis.set(`wallza:oauth_org:${state}`, organizationId, 'EX', 3600);
+      if (codeVerifier) {
+        await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+      }
+      if (refresh) {
+        await ioRedis.set(`refresh:${state}`, String(refresh), 'EX', 3600);
+      }
+      if (redirectUrl) {
+        await ioRedis.set(`redirect:${state}`, String(redirectUrl), 'EX', 3600);
+      }
+
+      return res.status(200).json({
+        success: true,
+        url,
+        state,
+        provider: normProvider,
+        isBetweenSteps: !!integrationProvider.isBetweenSteps,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || 'Failed to generate OAuth URL' });
+    }
+  }
+
+  @Post('/wallza-callback-exchange')
+  async wallzaCallbackExchange(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, provider, code, state, timezone } = req.body || {};
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid organizationId' });
+    }
+    if (!provider || typeof provider !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid provider' });
+    }
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid authorization code' });
+    }
+    if (!state || typeof state !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid state' });
+    }
+
+    const normProvider = provider.toLowerCase().trim();
+    const integrationProvider = this._integrationManager.getSocialIntegration(normProvider);
+    if (!integrationProvider) {
+      return res.status(400).json({ success: false, error: 'Provider not found' });
+    }
+
+    // Verify state and tenant binding in Redis (Single-Use, Atomic Verification)
+    const storedOrgId = await ioRedis.get(`organization:${state}`);
+    const storedWallzaOrgId = await ioRedis.get(`wallza:oauth_org:${state}`);
+    const storedCodeVerifier = (await ioRedis.get(`login:${state}`)) || '';
+    const storedRefresh = (await ioRedis.get(`refresh:${state}`)) || '';
+
+    if (!storedOrgId) {
+      return res.status(400).json({
+        success: false,
+        error: 'OAuth state expired, invalid or already consumed',
+      });
+    }
+
+    // Strict Tenant Isolation: Ensure the callback caller matches the organization that initiated it
+    if (storedWallzaOrgId && storedWallzaOrgId !== organizationId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Tenant mismatch: OAuth session does not belong to the requesting organization',
+      });
+    }
+
+    // Consume single-use state immediately to prevent replay
+    await ioRedis.del(`login:${state}`);
+
+    let authOutcome: any;
+    try {
+      authOutcome = await integrationProvider.authenticate({
+        code,
+        codeVerifier: storedCodeVerifier,
+        refresh: storedRefresh,
+      });
+
+      if (typeof authOutcome === 'string') {
+        return res.status(400).json({ success: false, error: authOutcome });
+      }
+    } catch (err: any) {
+      return res.status(400).json({
+        success: false,
+        error: err.message || 'Third-party OAuth exchange failed',
+      });
+    }
+
+    const {
+      accessToken,
+      refreshToken = '',
+      expiresIn = 0,
+      id,
+      name,
+      picture,
+      username,
+    } = authOutcome;
+
+    const validName = typeof name === 'string' && name.trim().length > 0 ? name.trim() : normProvider;
+
+    // Persist into Postiz integration repository
+    let createUpdate: any;
+    try {
+      createUpdate = await this._integrationService.createOrUpdateIntegration(
+        undefined,
+        !!integrationProvider.oneTimeToken,
+        storedOrgId,
+        validName,
+        picture,
+        'social',
+        String(id),
+        normProvider,
+        accessToken,
+        refreshToken,
+        expiresIn,
+        username,
+        storedRefresh ? false : !!integrationProvider.isBetweenSteps,
+        storedRefresh,
+        Number(timezone) || 0
+      );
+
+      this._refreshIntegrationService
+        .startRefreshWorkflow(storedOrgId, createUpdate.id, integrationProvider)
+        .catch(() => {});
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Failed to save integration in Postiz repository',
+      });
+    }
+
+    // Fetch pages if two-step provider (Facebook/Instagram/LinkedIn)
+    let pages: any[] = [];
+    if (integrationProvider.isBetweenSteps && !storedRefresh) {
+      try {
+        const fetchMethod =
+          'pages' in integrationProvider
+            ? 'pages'
+            : 'companies' in integrationProvider
+            ? 'companies'
+            : null;
+        if (fetchMethod && typeof (integrationProvider as any)[fetchMethod] === 'function') {
+          pages = await (integrationProvider as any)[fetchMethod](accessToken);
+        }
+      } catch (pageErr: any) {
+        console.warn('[WallzaCallbackExchange] Failed to fetch pages:', pageErr.message);
+      }
+    }
+
+    // Format safe response: NEVER leak raw access token or secrets
+    const safeResult = {
+      success: true,
+      integrationId: createUpdate.id,
+      internalId: String(id),
+      name: validName,
+      username: username || '',
+      picture: picture || '',
+      provider: normProvider,
+      isBetweenSteps: !!integrationProvider.isBetweenSteps && !storedRefresh,
+      pages: pages.map((p: any) => ({
+        id: String(p.id),
+        name: p.name,
+        pageId: p.pageId ? String(p.pageId) : undefined,
+        picture: p.picture?.data?.url || p.picture || '',
+        username: p.username || '',
+      })),
+    };
+
+    return res.status(200).json(safeResult);
+  }
+
+  @Post('/wallza-save-page')
+  async wallzaSavePage(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, integrationId, pageData, state } = req.body || {};
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid organizationId' });
+    }
+    if (!integrationId || typeof integrationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid integrationId' });
+    }
+    if (!pageData || typeof pageData !== 'object') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid pageData' });
+    }
+
+    let targetOrg: any;
+    try {
+      targetOrg = await this._organizationService.resolveWallzaOrganization(organizationId);
+    } catch {
+      return res.status(500).json({ success: false, error: 'Unable to resolve Wallza organization context' });
+    }
+
+    // If state is passed, ensure it hasn't expired and matches the tenant
+    if (state) {
+      const storedWallzaOrgId = await ioRedis.get(`wallza:oauth_org:${state}`);
+      if (storedWallzaOrgId && storedWallzaOrgId !== organizationId) {
+        return res.status(403).json({ success: false, error: 'Tenant mismatch on page selection' });
+      }
+      // Consume state after page selection is finalized
+      await ioRedis.del(`organization:${state}`);
+      await ioRedis.del(`wallza:oauth_org:${state}`);
+    }
+
+    try {
+      await this._integrationService.saveProviderPage(targetOrg.id, integrationId, pageData);
+      const updated = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
+      return res.status(200).json({
+        success: true,
+        integrationId: updated.id,
+        name: updated.name,
+        internalId: updated.internalId,
+        picture: updated.picture || '',
+        profile: updated.profile || '',
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || 'Failed to save provider page selection' });
+    }
+  }
+
   @Post('/sync-from-wallza')
   async syncFromWallza(@Req() req: Request, @Res() res: Response) {
     const authResult = await verifyWallzaInternalRequest(req as any, {
