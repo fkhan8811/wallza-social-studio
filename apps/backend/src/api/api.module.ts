@@ -18,6 +18,9 @@ import { PostsController } from '@gitroom/backend/api/routes/posts.controller';
 import { IdeasController } from '@gitroom/backend/api/routes/ideas.controller';
 import { CampaignsController } from '@gitroom/backend/api/routes/campaigns.controller';
 import { ReviewsController, PublicReviewsController } from '@gitroom/backend/api/routes/reviews.controller';
+import { CreativeStudioController } from '@gitroom/backend/api/routes/creative-studio.controller';
+import { PublishingAutomationController } from '@gitroom/backend/api/routes/publishing-automation.controller';
+import { ContentEfficiencyController } from '@gitroom/backend/api/routes/content-efficiency.controller';
 import { MediaController } from '@gitroom/backend/api/routes/media.controller';
 import { ClippingController } from '@gitroom/backend/api/routes/clipping.controller';
 import { MediaWidgetController } from '@gitroom/backend/api/routes/media.widget.controller';
@@ -27,6 +30,7 @@ import { ClippingWidgetAuthMiddleware } from '@gitroom/backend/services/auth/cli
 import { UploadModule } from '@gitroom/nestjs-libraries/upload/upload.module';
 import { BillingController } from '@gitroom/backend/api/routes/billing.controller';
 import { NotificationsController } from '@gitroom/backend/api/routes/notifications.controller';
+import { ActivityInboxController } from '@gitroom/backend/api/routes/activity-inbox.controller';
 import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
 import { ExtractContentService } from '@gitroom/nestjs-libraries/openai/extract.content.service';
 import { CodesService } from '@gitroom/nestjs-libraries/services/codes.service';
@@ -69,10 +73,14 @@ const authenticatedController = [
   IdeasController,
   CampaignsController,
   ReviewsController,
+  CreativeStudioController,
+  PublishingAutomationController,
+  ContentEfficiencyController,
   MediaController,
   ClippingController,
   BillingController,
   NotificationsController,
+  ActivityInboxController,
   CopilotController,
   WebhookController,
   SignatureController,

@@ -3,8 +3,11 @@
 import {
   AddProviderButton,
   CustomVariables,
+  UrlModal,
+  ExtensionNotFound,
+  ChromeExtensionWarning,
 } from '@gitroom/frontend/components/launches/add.provider.component';
-import { FC, useCallback, useEffect, useMemo, useState } from 'react';
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import SafeImage from '@gitroom/react/helpers/safe.image';
 import { capitalize, groupBy, orderBy } from 'lodash';
 import { CalendarWeekProvider } from '@gitroom/frontend/components/launches/calendar.context';
@@ -460,7 +463,7 @@ export const MenuComponent: FC<
 export const LaunchesComponent = () => {
   const fetch = useFetch();
   const user = useUser();
-  const { billingEnabled } = useVariables();
+  const { billingEnabled, extensionId } = useVariables();
   const router = useRouter();
   const search = useSearchParams();
   const toast = useToaster();
@@ -588,10 +591,215 @@ export const LaunchesComponent = () => {
       },
     []
   );
+  const connectHandledRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
+
+    const connectProvider = search.get('connect')?.toLowerCase()?.trim();
+    if (connectProvider && connectHandledRef.current !== connectProvider) {
+      connectHandledRef.current = connectProvider;
+
+      // Consume the one-shot connect request before async provider discovery.
+      const cleanedUrl = new URL(window.location.href);
+      cleanedUrl.searchParams.delete('connect');
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+
+      void (async () => {
+        try {
+          const availableResponse = await fetch('/integrations');
+          if (!availableResponse.ok) {
+            toast.show('Could not load available social providers.', 'warning');
+            return;
+          }
+
+          const available = await availableResponse.json();
+          const providers: Array<any> = available?.social || [];
+          const matched = providers.find(
+            (item) => String(item.identifier || '').toLowerCase() === connectProvider
+          );
+
+          if (!matched) {
+            toast.show(
+              t('unsupported_provider', `Provider '${connectProvider}' is not supported or enabled.`),
+              'warning'
+            );
+            return;
+          }
+
+          if (matched.customFields && matched.customFields.length > 0) {
+            modal.openModal({
+              title: t('custom_url', 'Custom URL / Credentials'),
+              withCloseButton: true,
+              classNames: { modal: 'md' },
+              children: (
+                <CustomVariables
+                  identifier={matched.identifier}
+                  gotoUrl={(url: string) => router.push(url)}
+                  variables={matched.customFields}
+                />
+              ),
+            });
+            return;
+          }
+
+          const startOAuth = async (externalUrl?: string) => {
+            const query = externalUrl
+              ? `?externalUrl=${encodeURIComponent(externalUrl)}`
+              : '';
+            const response = await fetch(`/integrations/social/${matched.identifier}${query}`);
+            if (!response.ok) {
+              toast.show(
+                t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+                'warning'
+              );
+              return;
+            }
+            const auth = await response.json();
+            if (auth?.err || !auth?.url) {
+              toast.show(
+                t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+                'warning'
+              );
+              return;
+            }
+            window.location.href = auth.url;
+          };
+
+          if (matched.isChromeExtension) {
+            const confirmed = await new Promise<boolean>((resolve) => {
+              modal.openModal({
+                title: t('chrome_extension_notice', 'Browser Extension Notice'),
+                withCloseButton: true,
+                onClose: () => resolve(false),
+                children: (
+                  <ChromeExtensionWarning
+                    onConfirm={() => resolve(true)}
+                    onCancel={() => resolve(false)}
+                  />
+                ),
+              });
+            });
+            if (!confirmed) return;
+
+            if (
+              !extensionId ||
+              typeof chrome === 'undefined' ||
+              !chrome?.runtime?.sendMessage
+            ) {
+              modal.openModal({
+                title: t('extension_not_available_title', 'Extension Not Found'),
+                withCloseButton: true,
+                children: <ExtensionNotFound />,
+              });
+              return;
+            }
+
+            try {
+              await new Promise<void>((resolve, reject) => {
+                chrome.runtime.sendMessage(extensionId, { type: 'PING' }, (response: any) => {
+                  if (chrome.runtime.lastError || !response?.status) {
+                    reject(new Error('Extension not reachable'));
+                  } else {
+                    resolve();
+                  }
+                });
+              });
+
+              const cookieResponse = await new Promise<any>((resolve, reject) => {
+                chrome.runtime.sendMessage(
+                  extensionId,
+                  { type: 'GET_COOKIES', provider: matched.identifier },
+                  (response: any) => {
+                    if (chrome.runtime.lastError) {
+                      reject(new Error('Extension cookie request failed'));
+                    } else {
+                      resolve(response);
+                    }
+                  }
+                );
+              });
+
+              if (!cookieResponse?.success) {
+                toast.show(
+                  cookieResponse?.error ||
+                    t('extension_cookies_missing', 'Could not get cookies. Please log in to the platform first.'),
+                  'warning'
+                );
+                return;
+              }
+
+              const response = await fetch(`/integrations/social/${matched.identifier}`);
+              if (!response.ok) {
+                toast.show(
+                  t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+                  'warning'
+                );
+                return;
+              }
+              const auth = await response.json();
+              if (auth?.err || !auth?.url) {
+                toast.show(
+                  t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+                  'warning'
+                );
+                return;
+              }
+
+              const credentials = encodeURIComponent(
+                Buffer.from(JSON.stringify(cookieResponse.cookies)).toString('base64')
+              );
+              window.location.href =
+                `/integrations/social/${matched.identifier}#state=${encodeURIComponent(auth.url)}&credentials=${credentials}`;
+            } catch {
+              toast.show(
+                t('extension_communication_error', 'Failed to communicate with the browser extension.'),
+                'warning'
+              );
+            }
+            return;
+          }
+
+          if (matched.isExternal) {
+            modal.openModal({
+              title: 'URL',
+              withCloseButton: true,
+              classNames: { modal: 'md' },
+              children: (
+                <UrlModal
+                  gotoUrl={(externalUrl: string) => {
+                    void startOAuth(externalUrl);
+                  }}
+                />
+              ),
+            });
+            return;
+          }
+
+          if (matched.isWeb3) {
+            toast.show(
+              'This wallet provider must be connected from Postiz Add Channel.',
+              'warning'
+            );
+            return;
+          }
+
+          await startOAuth();
+        } catch {
+          toast.show(
+            t('could_not_connect_to_platform', 'Could not initiate connection to platform'),
+            'warning'
+          );
+        }
+      })();
+    }
+
     if (search.get('msg')) {
       toast.show(search.get('msg')!, 'success');
       window?.opener?.postMessage(

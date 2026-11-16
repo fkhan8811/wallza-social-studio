@@ -131,7 +131,7 @@ export class WordpressProvider
       });
     } catch (err) {
       // DNS failure, connection refused, TLS error, site unreachable, etc.
-      console.log(err);
+      // Do not log remote request errors for user-supplied WordPress credentials.
       return 'Could not reach your WordPress site. Check the Domain URL and that the site is publicly accessible.';
     }
 
@@ -151,14 +151,7 @@ export class WordpressProvider
       } catch (err) {
         // Non-JSON error body (e.g. an HTML page from a security plugin).
       }
-      console.log(
-        `WordPress auth failed for ${domain} (HTTP ${response.status})`,
-        JSON.stringify({
-          code: wpCode,
-          message: wpMessage,
-          ...(wpCode ? {} : { body: errorBody.slice(0, 500) }),
-        })
-      );
+      console.warn(`WordPress authentication failed (HTTP ${response.status}; code ${String(wpCode).slice(0, 80) || 'unknown'}).`);
 
       if (response.status === 401 || response.status === 403) {
         return 'WordPress rejected the login. A security plugin or server setting may be blocking the REST API or stripping the Authorization header, or the username / Application Password is incorrect.';
@@ -173,7 +166,7 @@ export class WordpressProvider
     try {
       data = await response.json();
     } catch (err) {
-      console.log(err);
+      // Keep remote error payloads out of logs.
       return 'WordPress did not return a valid response. The REST API may be disabled or blocked by a security plugin.';
     }
 
@@ -306,10 +299,7 @@ export class WordpressProvider
 
     let mediaId = '';
     if (postDetails?.[0]?.settings?.main_image?.path) {
-      console.log(
-        'Uploading image to WordPress',
-        postDetails[0].settings.main_image.path
-      );
+      // Do not log user media URLs; they may contain signed access parameters.
 
       const blob = await this.fetch(
         postDetails[0].settings.main_image.path

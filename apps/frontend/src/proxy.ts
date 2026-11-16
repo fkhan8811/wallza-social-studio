@@ -39,6 +39,13 @@ export async function proxy(request: NextRequest) {
     topResponse.headers.set(cookieName, lng);
   }
 
+  if (nextUrl.searchParams.get('loggedAuth')) {
+    topResponse.cookies.set('auth', nextUrl.searchParams.get('loggedAuth')!, {
+      path: '/',
+      maxAge: 86400 * 7,
+    });
+  }
+
   if (nextUrl.pathname.startsWith('/modal/') && !authCookie) {
     return NextResponse.redirect(new URL(`/auth/login-required`, nextUrl.href));
   }

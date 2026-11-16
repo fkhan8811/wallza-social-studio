@@ -5,16 +5,36 @@ on:
   push:
   merge_group:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postiz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postiz"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postiz?schema=public
 
     strategy:
       matrix:
-        node-version: ['22.12.0']
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+        node-version: ['22.23.4']
 
     steps:
       - uses: actions/checkout@v4
@@ -32,23 +52,17 @@ jobs:
           version: 10
           run_install: false
 
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-#      - name: Setup pnpm cache
-#        uses: actions/cache@v4
-#        with:
-#          path: |
-#            ${{ env.STORE_PATH }}
-#            ${{ github.workspace }}/.next/cache
-#          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
-#          restore-keys: |
-#            ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}-
-
       - name: Install dependencies
         run: pnpm install
+
+      - name: Validate Prisma schema
+        run: pnpm exec prisma validate --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
+
+      - name: Push Prisma schema to disposable CI database
+        run: pnpm run prisma-db-push
+
+      - name: Test Wallza/Postiz release policies and PostgreSQL behavior
+        run: pnpm run test:wallza-postiz
 
       - name: Build
         run: pnpm run build

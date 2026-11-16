@@ -5,8 +5,11 @@ import {
   HttpException,
   Param,
   Post,
+  Req,
+  Res,
   UseFilters,
 } from '@nestjs/common';
+import crypto from 'crypto';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import { ConnectIntegrationDto } from '@gitroom/nestjs-libraries/dtos/integrations/connect.integration.dto';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
@@ -24,6 +27,10 @@ import {
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
+import { Request, Response } from 'express';
+import { mapWallzaProviderCredentials } from '@gitroom/nestjs-libraries/database/prisma/integrations/wallza.provider.credentials';
+import { verifyWallzaInternalRequest, signInternalRequest } from '@gitroom/nestjs-libraries/auth/wallza.hmac';
+import { OAuthCallbackRetryRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/oauth.callback.retry.repository';
 
 @ApiTags('Integrations')
 @Controller('/integrations')
@@ -32,7 +39,8 @@ export class NoAuthIntegrationsController {
     private _integrationManager: IntegrationManager,
     private _integrationService: IntegrationService,
     private _refreshIntegrationService: RefreshIntegrationService,
-    private _organizationService: OrganizationService
+    private _organizationService: OrganizationService,
+    private _oAuthCallbackRetryRepository: OAuthCallbackRetryRepository
   ) {}
 
   @Get('/')
@@ -321,6 +329,88 @@ export class NoAuthIntegrationsController {
       await ioRedis.del(`redirect:${body.state}`);
     }
 
+    // Bridge OAuth callback to WallzaOS internal sync if initiated from WallzaOS.
+    // Failure to dispatch or enqueue must not turn a successfully saved provider
+    // connection into a failed OAuth callback response.
+    const wallzaOrgState = await ioRedis.get(`wallza:oauth_org:${body.state}`);
+    if (wallzaOrgState) {
+      const wallzaApiUrl = (
+        process.env.WALLZAOS_INTERNAL_API_URL ||
+        process.env.WALLZA_BACKEND_URL ||
+        'http://127.0.0.1:5001'
+      ).replace(/\/$/, '');
+      const suppliedExpiry = Number(expiresIn);
+      const tokenExpiresAt = Number.isFinite(suppliedExpiry) && suppliedExpiry > 0
+        ? new Date(Date.now() + suppliedExpiry * 1000).toISOString()
+        : null;
+      const syncPayload = {
+        organizationId: wallzaOrgState,
+        platform: integration,
+        accountName: validName.trim(),
+        accountId: String(id),
+        avatarUrl: picture || null,
+        socialStudioIntegrationId: createUpdate.id,
+        grantedScopes: integrationProvider.scopes || [],
+        tokenExpiresAt,
+        category: 'major',
+      };
+      const retryEvent = {
+        state: body.state,
+        organizationId: org.id,
+        wallzaOrgId: wallzaOrgState,
+        platform: integration,
+        accountName: validName.trim(),
+        accountId: String(id),
+        avatarUrl: picture || null,
+        socialStudioIntegrationId: createUpdate.id,
+        grantedScopes: integrationProvider.scopes || [],
+        tokenExpiresAt,
+        category: 'major',
+      };
+      const enqueueRetry = async (error: string) => {
+        try {
+          await this._oAuthCallbackRetryRepository.enqueueOrUpdate({
+            ...retryEvent,
+            error,
+          });
+        } catch {
+          // Keep OAuth successful; alert operators without exposing payload data.
+          console.warn('[WallzaBridge] Retry event could not be persisted.');
+        }
+      };
+
+      try {
+        const signed = signInternalRequest({
+          method: 'POST',
+          path: '/api/social/accounts/sync-internal',
+          audience: 'wallzaos',
+          body: syncPayload,
+        });
+
+        const syncRes = await fetch(`${wallzaApiUrl}/api/social/accounts/sync-internal`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...signed,
+          },
+          body: JSON.stringify(syncPayload),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        if (syncRes.ok) {
+          await ioRedis.del(`wallza:oauth_org:${body.state}`);
+          await this._oAuthCallbackRetryRepository.markCompletedByState(body.state);
+        } else {
+          // Never log or persist remote response bodies; providers may echo secrets.
+          console.warn(`[WallzaBridge] WallzaOS account sync returned HTTP ${syncRes.status}; enqueuing durable retry event.`);
+          await enqueueRetry(`HTTP ${syncRes.status}`);
+        }
+      } catch {
+        console.warn('[WallzaBridge] Network/runtime error during dispatch; enqueuing durable retry event.');
+        await enqueueRetry('Network/runtime error');
+      }
+    }
+
     const extensionToken = integrationProvider.isChromeExtension
       ? AuthService.signJWT({
           integrationId: createUpdate.id,
@@ -452,4 +542,900 @@ export class NoAuthIntegrationsController {
 
     return { success: true };
   }
+
+  @Get('/wallza-status')
+  async wallzaStatus(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      service: 'wallza-social-engine',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  @Post('/wallza-oauth-url')
+  async wallzaOAuthUrl(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, provider, refresh, redirectUrl } = req.body || {};
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid organizationId' });
+    }
+    if (!provider || typeof provider !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid provider' });
+    }
+
+    const normProvider = provider.toLowerCase().trim();
+    if (!this._integrationManager.getAllowedSocialsIntegrations().includes(normProvider)) {
+      return res.status(400).json({ success: false, error: `Provider ${normProvider} is not allowed` });
+    }
+
+    let targetOrg: any;
+    try {
+      targetOrg = await this._organizationService.resolveWallzaOrganization(organizationId);
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: 'Unable to resolve Wallza organization context' });
+    }
+
+    try {
+      const integrationProvider = this._integrationManager.getSocialIntegration(normProvider);
+      const { codeVerifier, state, url } = await integrationProvider.generateAuthUrl();
+
+      // Store one-time state, code verifier, organization bindings in Redis with 1h TTL
+      await ioRedis.set(`organization:${state}`, targetOrg.id, 'EX', 3600);
+      await ioRedis.set(`wallza:oauth_org:${state}`, organizationId, 'EX', 3600);
+      if (codeVerifier) {
+        await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+      }
+      if (refresh) {
+        await ioRedis.set(`refresh:${state}`, String(refresh), 'EX', 3600);
+      }
+      if (redirectUrl) {
+        await ioRedis.set(`redirect:${state}`, String(redirectUrl), 'EX', 3600);
+      }
+
+      return res.status(200).json({
+        success: true,
+        url,
+        state,
+        provider: normProvider,
+        isBetweenSteps: !!integrationProvider.isBetweenSteps,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || 'Failed to generate OAuth URL' });
+    }
+  }
+
+  @Post('/wallza-callback-exchange')
+  async wallzaCallbackExchange(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, provider, code, state, timezone } = req.body || {};
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid organizationId' });
+    }
+    if (!provider || typeof provider !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid provider' });
+    }
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid authorization code' });
+    }
+    if (!state || typeof state !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid state' });
+    }
+
+    const normProvider = provider.toLowerCase().trim();
+    const integrationProvider = this._integrationManager.getSocialIntegration(normProvider);
+    if (!integrationProvider) {
+      return res.status(400).json({ success: false, error: 'Provider not found' });
+    }
+
+    // Atomic Lua script to validate and consume OAuth state keys together
+    // Keys:
+    // 1: organization:${state}
+    // 2: wallza:oauth_org:${state}
+    // 3: login:${state}
+    // 4: refresh:${state}
+    // 5: wallza:oauth_in_between:${state}
+    // 6: wallza:oauth_payload:${state}
+    //
+    // Logic:
+    // 1. Check if both organization:${state} and wallza:oauth_org:${state} exist.
+    // 2. Check if wallza:oauth_org matches expected ARGV[1] (Wallza organizationId).
+    // 3. If valid, read codeVerifier, refresh, and atomically delete state keys (or retain org binding if inBetweenSteps is required for page selection).
+    const luaValidateAndConsume = `
+      local orgId = redis.call('GET', KEYS[1])
+      local wallzaOrgId = redis.call('GET', KEYS[2])
+      if not orgId or not wallzaOrgId then
+        return {0, 'OAuth state expired, invalid or already consumed'}
+      end
+      if wallzaOrgId ~= ARGV[1] then
+        return {-1, 'Tenant mismatch: OAuth session does not belong to the requesting organization'}
+      end
+      local codeVerifier = redis.call('GET', KEYS[3]) or ''
+      local refresh = redis.call('GET', KEYS[4]) or ''
+      local isBetween = ARGV[2]
+
+      -- Consume single-use login state keys immediately
+      redis.call('DEL', KEYS[3])
+      redis.call('DEL', KEYS[4])
+
+      if isBetween == '1' then
+        -- Retain organization and wallza:oauth_org bindings for page selection stage, but mark exchange as completed
+        -- Set marker to prevent concurrent/repeated callback exchanges
+        local consumed = redis.call('GET', KEYS[5])
+        if consumed then
+          return {0, 'OAuth state already exchanged'}
+        end
+        redis.call('SET', KEYS[5], '1', 'EX', 1800)
+      else
+        -- Completely consume all state keys immediately
+        redis.call('DEL', KEYS[1])
+        redis.call('DEL', KEYS[2])
+      end
+
+      return {1, orgId, wallzaOrgId, codeVerifier, refresh}
+    `;
+
+    const isBetweenFlag = integrationProvider.isBetweenSteps ? '1' : '0';
+    let evalResult: any;
+    try {
+      evalResult = await ioRedis.eval(
+        luaValidateAndConsume,
+        5,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `login:${state}`,
+        `refresh:${state}`,
+        `wallza:oauth_in_between:${state}`,
+        organizationId,
+        isBetweenFlag
+      );
+    } catch (redisErr: any) {
+      return res.status(500).json({ success: false, error: 'Redis state evaluation failed' });
+    }
+
+    const [statusCode, val1, val2, val3, val4] = evalResult || [];
+    if (statusCode === -1) {
+      return res.status(403).json({
+        success: false,
+        error: val1 || 'Tenant mismatch: OAuth session does not belong to the requesting organization',
+      });
+    }
+    if (statusCode !== 1) {
+      return res.status(400).json({
+        success: false,
+        error: val1 || 'OAuth state expired, invalid or already consumed',
+      });
+    }
+
+    const storedOrgId = val1;
+    const storedWallzaOrgId = val2;
+    const storedCodeVerifier = val3 || '';
+    const storedRefresh = val4 || '';
+
+    let authOutcome: any;
+    try {
+      authOutcome = await integrationProvider.authenticate({
+        code,
+        codeVerifier: storedCodeVerifier,
+        refresh: storedRefresh,
+      });
+
+      if (typeof authOutcome === 'string') {
+        return res.status(400).json({ success: false, error: authOutcome });
+      }
+    } catch (err: any) {
+      return res.status(400).json({
+        success: false,
+        error: err.message || 'Third-party OAuth exchange failed',
+      });
+    }
+
+    const {
+      accessToken,
+      refreshToken = '',
+      expiresIn = 0,
+      id,
+      name,
+      picture,
+      username,
+    } = authOutcome;
+
+    const validName = typeof name === 'string' && name.trim().length > 0 ? name.trim() : normProvider;
+
+    // Persist into Postiz integration repository
+    let createUpdate: any;
+    try {
+      createUpdate = await this._integrationService.createOrUpdateIntegration(
+        undefined,
+        !!integrationProvider.oneTimeToken,
+        storedOrgId,
+        validName,
+        picture,
+        'social',
+        String(id),
+        normProvider,
+        accessToken,
+        refreshToken,
+        expiresIn,
+        username,
+        storedRefresh ? false : !!integrationProvider.isBetweenSteps,
+        storedRefresh,
+        Number(timezone) || 0
+      );
+
+      this._refreshIntegrationService
+        .startRefreshWorkflow(storedOrgId, createUpdate.id, integrationProvider)
+        .catch(() => {});
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Failed to save integration in Postiz repository',
+      });
+    }
+
+    // Fetch pages if two-step provider (Facebook/Instagram/LinkedIn)
+    let pages: any[] = [];
+    if (integrationProvider.isBetweenSteps && !storedRefresh) {
+      try {
+        const fetchMethod =
+          'pages' in integrationProvider
+            ? 'pages'
+            : 'companies' in integrationProvider
+            ? 'companies'
+            : null;
+        if (fetchMethod && typeof (integrationProvider as any)[fetchMethod] === 'function') {
+          pages = await (integrationProvider as any)[fetchMethod](accessToken);
+        }
+      } catch (pageErr: any) {
+        console.warn('[WallzaCallbackExchange] Failed to fetch pages:', pageErr.message);
+      }
+    }
+
+    // Format safe response: NEVER leak raw access token or secrets
+    const safeResult = {
+      success: true,
+      integrationId: createUpdate.id,
+      internalId: String(id),
+      name: validName,
+      username: username || '',
+      picture: picture || '',
+      provider: normProvider,
+      isBetweenSteps: !!integrationProvider.isBetweenSteps && !storedRefresh,
+      pages: pages.map((p: any) => ({
+        id: String(p.id),
+        name: p.name,
+        pageId: p.pageId ? String(p.pageId) : undefined,
+        picture: p.picture?.data?.url || p.picture || '',
+        username: p.username || '',
+      })),
+    };
+
+    return res.status(200).json(safeResult);
+  }
+
+  @Post('/wallza-save-page')
+  async wallzaSavePage(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, integrationId, pageData, state } = req.body || {};
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid organizationId' });
+    }
+    if (!integrationId || typeof integrationId !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid integrationId' });
+    }
+    if (!pageData || typeof pageData !== 'object') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid pageData' });
+    }
+    if (!state || typeof state !== 'string' || state.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Missing or invalid state parameter' });
+    }
+
+    let targetOrg: any;
+    try {
+      targetOrg = await this._organizationService.resolveWallzaOrganization(organizationId);
+    } catch {
+      return res.status(500).json({ success: false, error: 'Unable to resolve Wallza organization context' });
+    }
+
+    // Step 1: Pre-validate that integration exists and strictly belongs to targetOrg.id
+    // Doing this BEFORE state reservation guarantees that an invalid or foreign integration ID
+    // never blocks or reserves the valid OAuth state.
+    let existingIntegration: any;
+    try {
+      existingIntegration = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
+    } catch (err: any) {
+      return res.status(404).json({ success: false, error: 'Integration not found for this organization' });
+    }
+
+    if (!existingIntegration || existingIntegration.organizationId !== targetOrg.id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Integration does not belong to the requesting organization',
+      });
+    }
+
+    // Derive deterministic target page key to prevent different page selections from reusing state
+    const targetPageKey = String(pageData.id || pageData.page || pageData.pageId || '');
+    if (!targetPageKey) {
+      return res.status(400).json({ success: false, error: 'Invalid pageData: missing page identifier' });
+    }
+
+    // Step 2: Atomic Lua script to validate state bindings and reserve in-progress execution with ownership token
+    // KEYS[1]: organization:${state}
+    // KEYS[2]: wallza:oauth_org:${state}
+    // KEYS[3]: wallza:oauth_page_state:${state}
+    // KEYS[4]: wallza:oauth_page_result:${state}
+    // KEYS[5]: wallza:oauth_page_token:${state}
+    // ARGV[1]: expected organizationId (Wallza)
+    // ARGV[2]: expected targetOrg.id (Postiz)
+    // ARGV[3]: integrationId
+    // ARGV[4]: targetPageKey
+    // ARGV[5]: reservationToken (cryptographic owner fencing token)
+    const reservationToken = crypto.randomBytes(16).toString('hex');
+
+    const luaValidateAndReservePageSelect = `
+      local orgId = redis.call('GET', KEYS[1])
+      local wallzaOrgId = redis.call('GET', KEYS[2])
+      local pageState = redis.call('GET', KEYS[3])
+
+      if pageState == 'completed' then
+        local savedResult = redis.call('GET', KEYS[4])
+        return {2, savedResult or ''}
+      end
+
+      if pageState == 'in_progress' then
+        return {3, 'Page selection is currently in progress. Please retry shortly.'}
+      end
+
+      if not orgId or not wallzaOrgId then
+        return {0, 'OAuth state expired, invalid, missing or already consumed'}
+      end
+
+      if wallzaOrgId ~= ARGV[1] then
+        return {-1, 'Tenant mismatch on page selection'}
+      end
+
+      if orgId ~= ARGV[2] then
+        return {-2, 'Target organization mismatch on page selection'}
+      end
+
+      -- Reserve state as 'in_progress' with a 60s lease and record owner fencing token
+      redis.call('SET', KEYS[3], 'in_progress', 'EX', 60)
+      redis.call('SET', KEYS[5], ARGV[5], 'EX', 60)
+      return {1, orgId, wallzaOrgId}
+    `;
+
+    let stateCheck: any;
+    try {
+      stateCheck = await ioRedis.eval(
+        luaValidateAndReservePageSelect,
+        5,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `wallza:oauth_page_state:${state}`,
+        `wallza:oauth_page_result:${state}`,
+        `wallza:oauth_page_token:${state}`,
+        organizationId,
+        targetOrg.id,
+        integrationId,
+        targetPageKey,
+        reservationToken
+      );
+    } catch (redisErr: any) {
+      return res.status(500).json({ success: false, error: 'Redis state verification failed' });
+    }
+
+    const [statusFlag, payload] = stateCheck || [];
+
+    // Tenant mismatch
+    if (statusFlag === -1 || statusFlag === -2) {
+      return res.status(403).json({ success: false, error: payload || 'Tenant mismatch on page selection' });
+    }
+
+    // Invalid, missing, or expired state
+    if (statusFlag === 0) {
+      return res.status(400).json({ success: false, error: payload || 'OAuth state expired, invalid or already consumed' });
+    }
+
+    // Concurrent request while save is already in progress: return 409 Conflict with retry recommendation
+    if (statusFlag === 3) {
+      return res.status(409).json({
+        success: false,
+        retryable: true,
+        error: 'Page selection operation is currently in progress. Please retry.',
+      });
+    }
+
+    // Completed state encounter: return cached completed result if matching integration and page
+    if (statusFlag === 2) {
+      if (!payload || typeof payload !== 'string') {
+        return res.status(409).json({
+          success: false,
+          error: 'OAuth state was marked completed but cached result is missing',
+        });
+      }
+
+      try {
+        const completedData = JSON.parse(payload);
+        if (!completedData || typeof completedData !== 'object') {
+          return res.status(409).json({
+            success: false,
+            error: 'OAuth state was marked completed but cached result is malformed',
+          });
+        }
+
+        if (
+          completedData.integrationId === integrationId &&
+          (completedData.pageKey === targetPageKey || completedData.internalId === targetPageKey)
+        ) {
+          return res.status(200).json({
+            success: true,
+            integrationId: completedData.integrationId,
+            name: completedData.name,
+            internalId: completedData.internalId,
+            picture: completedData.picture || '',
+            profile: completedData.profile || '',
+            idempotent: true,
+          });
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: 'OAuth state was already finalized with a different page or integration selection',
+          });
+        }
+      } catch {
+        return res.status(409).json({
+          success: false,
+          error: 'OAuth state cached result could not be parsed; cannot verify requested page and integration',
+        });
+      }
+    }
+
+    // Status 1: Successfully acquired reservation. Execute page selection
+    try {
+      await this._integrationService.saveProviderPage(targetOrg.id, integrationId, pageData);
+      const updated = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
+
+      // Prepare final completed payload
+      const completionResult = {
+        integrationId: updated.id,
+        name: updated.name,
+        internalId: updated.internalId,
+        picture: updated.picture || '',
+        profile: updated.profile || '',
+        pageKey: targetPageKey,
+      };
+
+      // Atomically transition state to 'completed', cache result, and release one-time keys IF AND ONLY IF the reservation token matches
+      // KEYS[1]: wallza:oauth_page_state:${state}
+      // KEYS[2]: wallza:oauth_page_result:${state}
+      // KEYS[3]: wallza:oauth_page_token:${state}
+      // KEYS[4]: organization:${state}
+      // KEYS[5]: wallza:oauth_org:${state}
+      // KEYS[6]: wallza:oauth_in_between:${state}
+      // ARGV[1]: JSON serialized completionResult
+      // ARGV[2]: reservationToken
+      const luaCompletePageSelection = `
+        local currentToken = redis.call('GET', KEYS[3])
+        if currentToken ~= ARGV[2] then
+          return {0, 'Stale reservation token: lease expired or acquired by another request'}
+        end
+
+        redis.call('SET', KEYS[1], 'completed', 'EX', 1800)
+        redis.call('SET', KEYS[2], ARGV[1], 'EX', 1800)
+        redis.call('DEL', KEYS[3])
+        redis.call('DEL', KEYS[4])
+        redis.call('DEL', KEYS[5])
+        redis.call('DEL', KEYS[6])
+        return {1, 'OK'}
+      `;
+
+      const completionCheck: any = await ioRedis.eval(
+        luaCompletePageSelection,
+        6,
+        `wallza:oauth_page_state:${state}`,
+        `wallza:oauth_page_result:${state}`,
+        `wallza:oauth_page_token:${state}`,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `wallza:oauth_in_between:${state}`,
+        JSON.stringify(completionResult),
+        reservationToken
+      );
+
+      const [completeStatus, completeMsg] = completionCheck || [];
+      if (completeStatus !== 1) {
+        return res.status(409).json({
+          success: false,
+          error: completeMsg || 'Reservation lease expired before completion was committed',
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        integrationId: updated.id,
+        name: updated.name,
+        internalId: updated.internalId,
+        picture: updated.picture || '',
+        profile: updated.profile || '',
+      });
+    } catch (err: any) {
+      // Release in-progress lock on failure IF AND ONLY IF the token matches the current owner
+      // This prevents a delayed failure from deleting a subsequent request's valid reservation
+      const luaReleasePageReservation = `
+        local currentToken = redis.call('GET', KEYS[2])
+        if currentToken == ARGV[1] then
+          redis.call('DEL', KEYS[1])
+          redis.call('DEL', KEYS[2])
+          return 1
+        end
+        return 0
+      `;
+
+      await ioRedis.eval(
+        luaReleasePageReservation,
+        2,
+        `wallza:oauth_page_state:${state}`,
+        `wallza:oauth_page_token:${state}`,
+        reservationToken
+      ).catch(() => {});
+
+      return res.status(500).json({ success: false, error: err.message || 'Failed to save provider page selection' });
+    }
+  }
+
+  @Post('/sync-from-wallza')
+  async syncFromWallza(@Req() req: Request, @Res() res: Response) {
+    const authResult = await verifyWallzaInternalRequest(req as any, {
+      expectedAudience: 'social-studio',
+    });
+
+    if (!authResult.valid) {
+      return res.status(401).json({
+        success: false,
+        error: authResult.error || 'HMAC authentication failed',
+      });
+    }
+
+    const { organizationId, action, connections, generation } = req.body || {};
+
+    if (!organizationId || typeof organizationId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing or invalid organizationId',
+      });
+    }
+
+    if (!Array.isArray(connections) || connections.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Connections array must not be empty',
+      });
+    }
+    if (connections.length > 100) {
+      return res.status(413).json({
+        success: false,
+        error: 'A sync batch cannot contain more than 100 accounts',
+      });
+    }
+
+    // Resolve or provision Postiz Organization for WallzaOS tenant
+    let targetOrg: any;
+    try {
+      targetOrg = await this._organizationService.resolveWallzaOrganization(organizationId);
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: 'Unable to resolve Wallza organization',
+      });
+    }
+
+    const results: any[] = [];
+    const incomingGen = Number(generation);
+
+    if (!Number.isSafeInteger(incomingGen) || incomingGen <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid generation: must be a positive safe integer (> 0)',
+        results: connections.map((conn: any) => ({
+          provider: conn.provider,
+          internalId: conn.internalId,
+          status: 'error',
+          error: 'Generation must be a positive safe integer',
+        })),
+      });
+    }
+
+    if (action !== 'upsert' && action !== 'disconnect') {
+      return res.status(400).json({ success: false, error: 'Unsupported sync action' });
+    }
+
+    const seenAccounts = new Set<string>();
+    for (const incoming of connections) {
+      const conn =
+        incoming && typeof incoming === 'object' && !Array.isArray(incoming)
+          ? incoming
+          : {};
+      const provider = typeof conn.provider === 'string'
+        ? conn.provider.toLowerCase().trim().slice(0, 64)
+        : '';
+      const internalId = typeof conn.internalId === 'string'
+        ? conn.internalId.trim().slice(0, 255)
+        : '';
+      const accountKey = `${provider}\u0000${internalId}`;
+
+      if (!/^[a-z0-9_-]+$/.test(provider) || !internalId) {
+        results.push({ provider, internalId, status: 'error', error: 'Provider and internal account ID are required' });
+        continue;
+      }
+      if (seenAccounts.has(accountKey)) {
+        results.push({ provider, internalId, status: 'error', error: 'Duplicate account in sync batch' });
+        continue;
+      }
+      seenAccounts.add(accountKey);
+
+      if (action === 'disconnect') {
+        try {
+          const outcome = await this._integrationService.deleteChannelWithGeneration(
+            targetOrg.id,
+            provider,
+            internalId,
+            incomingGen
+          );
+
+          if (!outcome.allowed) {
+            results.push({
+              provider,
+              internalId,
+              status: outcome.reason === 'superseded' ? 'superseded' : 'error',
+              error: outcome.reason === 'conflict'
+                ? 'Same-generation conflicting action rejected'
+                : outcome.reason === 'invalid_generation'
+                ? 'Generation must be a positive safe integer'
+                : undefined,
+              currentGeneration: outcome.currentGeneration,
+              incomingGeneration: incomingGen,
+            });
+          } else {
+            results.push({
+              provider,
+              internalId,
+              status: 'disconnected',
+              generation: incomingGen,
+              affected: outcome.result?.count || 0,
+            });
+          }
+        } catch (disconnectErr: any) {
+          results.push({
+            provider,
+            internalId,
+            status: 'error',
+            error: 'Transactional disconnect failed',
+          });
+        }
+        continue;
+      }
+
+      // Action === 'upsert'
+      const integrationProvider = this._integrationManager.getSocialIntegration(provider);
+      if (!integrationProvider) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: `Provider ${provider} is not supported by Social Studio`,
+        });
+        continue;
+      }
+
+      let accessToken = typeof conn.token === 'string' ? conn.token : '';
+      let refreshToken = '';
+      const suppliedExpiry = Number(conn.expiresIn);
+      let expiresIn = Number.isFinite(suppliedExpiry) && suppliedExpiry > 0
+        ? suppliedExpiry
+        : 0;
+      let name = typeof conn.name === 'string' && conn.name.trim()
+        ? conn.name.trim().slice(0, 200)
+        : `${provider} Account`;
+      let picture = typeof conn.picture === 'string'
+        ? conn.picture.trim().slice(0, 2048)
+        : '';
+      let username = typeof conn.username === 'string' ? conn.username.slice(0, 200) : '';
+      let customDetails: string | undefined = undefined;
+
+      // Real provider authentication / adaptation
+      if (integrationProvider.customFields) {
+        const authCodePayload = mapWallzaProviderCredentials(
+          provider,
+          conn.credentials || {},
+          internalId,
+          conn.token
+        );
+
+        if (!authCodePayload) {
+          results.push({
+            provider,
+            internalId,
+            status: 'error',
+            error: `Direct credential mapping is not implemented for provider ${provider}`,
+          });
+          continue;
+        }
+
+        const base64Code = Buffer.from(JSON.stringify(authCodePayload)).toString('base64');
+        try {
+          const authResult = await integrationProvider.authenticate({
+            code: base64Code,
+            codeVerifier: '',
+          });
+
+          if (typeof authResult === 'string') {
+            results.push({
+              provider,
+              internalId,
+              status: 'error',
+              error: 'Provider authentication failed',
+            });
+            continue;
+          }
+
+          accessToken = authResult.accessToken;
+          refreshToken = authResult.refreshToken || '';
+          expiresIn = authResult.expiresIn || expiresIn;
+          name = authResult.name || name;
+          picture = authResult.picture || picture;
+          username = authResult.username || '';
+          customDetails = AuthService.fixedEncryption(JSON.stringify(authCodePayload));
+        } catch (authErr: any) {
+          results.push({
+            provider,
+            internalId,
+            status: 'error',
+            error: 'Provider authentication request failed',
+          });
+          continue;
+        }
+      } else if (
+        integrationProvider.isChromeExtension ||
+        integrationProvider.extensionCookies ||
+        integrationProvider.isWeb3 ||
+        integrationProvider.externalUrl
+      ) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'This provider requires an interactive extension, wallet, or instance-specific OAuth flow and cannot be linked with a bearer token',
+        });
+        continue;
+      } else if (provider === 'telegram') {
+        // Telegram in Postiz uses server-configured TELEGRAM_TOKEN bot.
+        // Direct bot-token credentials from user are not supported without dedicated bot instance.
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'Telegram requires platform bot setup and is unsupported for user direct tokens',
+        });
+        continue;
+      } else if (provider === 'discord' && !accessToken) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'Discord requires OAuth authorization. Webhook URLs are not supported as OAuth tokens.',
+        });
+        continue;
+      } else if (!integrationProvider.customFields && !accessToken) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'A provider access token is required',
+        });
+        continue;
+      }
+
+      // Upsert into Postiz Prisma Integrations
+      try {
+        const saved = await this._integrationService.createOrUpdateIntegration(
+          undefined,
+          !!integrationProvider.oneTimeToken,
+          targetOrg.id,
+          name,
+          picture,
+          'social',
+          internalId,
+          provider,
+          accessToken,
+          refreshToken,
+          expiresIn,
+          username,
+          false,
+          undefined,
+          0,
+          customDetails,
+          incomingGen
+        );
+
+        if (!saved.allowed) {
+          results.push({
+            provider,
+            internalId,
+            status: saved.reason === 'superseded' ? 'superseded' : 'error',
+            error: saved.reason === 'conflict'
+              ? 'Same-generation conflicting action rejected'
+              : saved.reason === 'invalid_generation'
+              ? 'Generation must be a positive safe integer'
+              : undefined,
+            currentGeneration: saved.currentGeneration,
+            incomingGeneration: incomingGen,
+          });
+          continue;
+        }
+
+        results.push({
+          provider,
+          internalId,
+          status: 'synced',
+          integrationId: saved.result?.id,
+          generation: incomingGen,
+        });
+      } catch (upsertErr: any) {
+        results.push({
+          provider,
+          internalId,
+          status: 'error',
+          error: 'Integration persistence failed',
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      synchronized: results.filter((r) => r.status === 'synced' || r.status === 'disconnected').length,
+      results,
+    });
+  }
+
 }

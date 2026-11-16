@@ -15,8 +15,12 @@ export class UploadFactory {
     const storageProvider = process.env.STORAGE_PROVIDER || 'local';
 
     switch (storageProvider) {
-      case 'local':
-        return new LocalStorage(process.env.UPLOAD_DIRECTORY!);
+      case 'local': {
+        const uploadDir =
+          process.env.UPLOAD_DIRECTORY ||
+          require('path').resolve(process.cwd(), 'uploads');
+        return new LocalStorage(uploadDir);
+      }
       case 'cloudflare':
         return new CloudflareStorage(
           process.env.CLOUDFLARE_ACCOUNT_ID!,

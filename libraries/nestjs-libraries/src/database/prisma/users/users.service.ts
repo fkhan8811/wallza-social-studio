@@ -23,6 +23,35 @@ export class UsersService {
     return this._usersRepository.getUserByEmail(email);
   }
 
+  async findOrCreateUserByEmail(input: {
+    email: string;
+    name?: string;
+    provider: Provider;
+  }) {
+    const email = String(input.email || '').trim().toLowerCase();
+    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new Error('Invalid SSO user email');
+    }
+
+    const existing = await this._usersRepository.getUserByEmail(email);
+    if (existing) return existing;
+
+    try {
+      return await this._usersRepository.createUserForSso({
+        email,
+        name: input.name,
+        provider: input.provider,
+      });
+    } catch (error: any) {
+      // Concurrent SSO handoffs can race on the (email, providerName) key.
+      if (error?.code === 'P2002') {
+        const racedUser = await this._usersRepository.getUserByEmail(email);
+        if (racedUser) return racedUser;
+      }
+      throw error;
+    }
+  }
+
   getUserById(id: string) {
     return this._usersRepository.getUserById(id);
   }
