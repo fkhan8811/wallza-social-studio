@@ -876,62 +876,9 @@ export class NoAuthIntegrationsController {
       return res.status(500).json({ success: false, error: 'Unable to resolve Wallza organization context' });
     }
 
-    // Atomic Lua script to validate state bindings and consume them upon finalization
-    // KEYS[1]: organization:${state}
-    // KEYS[2]: wallza:oauth_org:${state}
-    // KEYS[3]: wallza:oauth_page_selected:${state}
-    // ARGV[1]: expected organizationId
-    // ARGV[2]: expected targetOrg.id
-    const luaValidatePageSelectState = `
-      local orgId = redis.call('GET', KEYS[1])
-      local wallzaOrgId = redis.call('GET', KEYS[2])
-      local alreadyFinalized = redis.call('GET', KEYS[3])
-
-      if alreadyFinalized then
-        return {2, 'State already finalized'}
-      end
-
-      if not orgId or not wallzaOrgId then
-        return {0, 'OAuth state expired, invalid, missing or already consumed'}
-      end
-
-      if wallzaOrgId ~= ARGV[1] then
-        return {-1, 'Tenant mismatch on page selection'}
-      end
-
-      if orgId ~= ARGV[2] then
-        return {-2, 'Target organization mismatch on page selection'}
-      end
-
-      -- Mark state as finalized in-flight to prevent race conditions
-      redis.call('SET', KEYS[3], '1', 'EX', 300)
-      return {1, orgId, wallzaOrgId}
-    `;
-
-    let stateCheck: any;
-    try {
-      stateCheck = await ioRedis.eval(
-        luaValidatePageSelectState,
-        3,
-        `organization:${state}`,
-        `wallza:oauth_org:${state}`,
-        `wallza:oauth_page_selected:${state}`,
-        organizationId,
-        targetOrg.id
-      );
-    } catch (redisErr: any) {
-      return res.status(500).json({ success: false, error: 'Redis state verification failed' });
-    }
-
-    const [statusFlag, msg] = stateCheck || [];
-    if (statusFlag === -1 || statusFlag === -2) {
-      return res.status(403).json({ success: false, error: msg || 'Tenant mismatch on page selection' });
-    }
-    if (statusFlag === 0) {
-      return res.status(400).json({ success: false, error: msg || 'OAuth state expired, invalid or already consumed' });
-    }
-
-    // Verify integration exists and strictly belongs to targetOrg.id
+    // Step 1: Pre-validate that integration exists and strictly belongs to targetOrg.id
+    // Doing this BEFORE state reservation guarantees that an invalid or foreign integration ID
+    // never blocks or reserves the valid OAuth state.
     let existingIntegration: any;
     try {
       existingIntegration = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
@@ -946,27 +893,162 @@ export class NoAuthIntegrationsController {
       });
     }
 
-    // If already finalized (idempotent submission), return existing updated integration
-    if (statusFlag === 2) {
-      return res.status(200).json({
-        success: true,
-        integrationId: existingIntegration.id,
-        name: existingIntegration.name,
-        internalId: existingIntegration.internalId,
-        picture: existingIntegration.picture || '',
-        profile: existingIntegration.profile || '',
-        idempotent: true,
+    // Derive deterministic target page key to prevent different page selections from reusing state
+    const targetPageKey = String(pageData.id || pageData.page || pageData.pageId || '');
+    if (!targetPageKey) {
+      return res.status(400).json({ success: false, error: 'Invalid pageData: missing page identifier' });
+    }
+
+    // Step 2: Atomic Lua script to validate state bindings and reserve in-progress execution
+    // KEYS[1]: organization:${state}
+    // KEYS[2]: wallza:oauth_org:${state}
+    // KEYS[3]: wallza:oauth_page_state:${state}
+    // KEYS[4]: wallza:oauth_page_result:${state}
+    // ARGV[1]: expected organizationId (Wallza)
+    // ARGV[2]: expected targetOrg.id (Postiz)
+    // ARGV[3]: integrationId
+    // ARGV[4]: targetPageKey
+    const luaValidateAndReservePageSelect = `
+      local orgId = redis.call('GET', KEYS[1])
+      local wallzaOrgId = redis.call('GET', KEYS[2])
+      local pageState = redis.call('GET', KEYS[3])
+
+      if pageState == 'completed' then
+        local savedResult = redis.call('GET', KEYS[4])
+        return {2, savedResult or ''}
+      end
+
+      if pageState == 'in_progress' then
+        return {3, 'Page selection is currently in progress. Please retry shortly.'}
+      end
+
+      if not orgId or not wallzaOrgId then
+        return {0, 'OAuth state expired, invalid, missing or already consumed'}
+      end
+
+      if wallzaOrgId ~= ARGV[1] then
+        return {-1, 'Tenant mismatch on page selection'}
+      end
+
+      if orgId ~= ARGV[2] then
+        return {-2, 'Target organization mismatch on page selection'}
+      end
+
+      -- Reserve state as 'in_progress' with a 60s lease
+      redis.call('SET', KEYS[3], 'in_progress', 'EX', 60)
+      return {1, orgId, wallzaOrgId}
+    `;
+
+    let stateCheck: any;
+    try {
+      stateCheck = await ioRedis.eval(
+        luaValidateAndReservePageSelect,
+        4,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `wallza:oauth_page_state:${state}`,
+        `wallza:oauth_page_result:${state}`,
+        organizationId,
+        targetOrg.id,
+        integrationId,
+        targetPageKey
+      );
+    } catch (redisErr: any) {
+      return res.status(500).json({ success: false, error: 'Redis state verification failed' });
+    }
+
+    const [statusFlag, payload] = stateCheck || [];
+
+    // Tenant mismatch
+    if (statusFlag === -1 || statusFlag === -2) {
+      return res.status(403).json({ success: false, error: payload || 'Tenant mismatch on page selection' });
+    }
+
+    // Invalid, missing, or expired state
+    if (statusFlag === 0) {
+      return res.status(400).json({ success: false, error: payload || 'OAuth state expired, invalid or already consumed' });
+    }
+
+    // Concurrent request while save is already in progress: return 409 Conflict with retry recommendation
+    if (statusFlag === 3) {
+      return res.status(409).json({
+        success: false,
+        retryable: true,
+        error: 'Page selection operation is currently in progress. Please retry.',
       });
     }
 
+    // Completed state encounter: return cached completed result if matching integration and page
+    if (statusFlag === 2) {
+      try {
+        const completedData = JSON.parse(payload);
+        if (
+          completedData.integrationId === integrationId &&
+          (completedData.pageKey === targetPageKey || completedData.internalId === targetPageKey)
+        ) {
+          return res.status(200).json({
+            success: true,
+            integrationId: completedData.integrationId,
+            name: completedData.name,
+            internalId: completedData.internalId,
+            picture: completedData.picture || '',
+            profile: completedData.profile || '',
+            idempotent: true,
+          });
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: 'OAuth state was already finalized with a different page or integration selection',
+          });
+        }
+      } catch {
+        return res.status(200).json({
+          success: true,
+          integrationId: existingIntegration.id,
+          name: existingIntegration.name,
+          internalId: existingIntegration.internalId,
+          picture: existingIntegration.picture || '',
+          profile: existingIntegration.profile || '',
+          idempotent: true,
+        });
+      }
+    }
+
+    // Status 1: Successfully acquired reservation. Execute page selection
     try {
       await this._integrationService.saveProviderPage(targetOrg.id, integrationId, pageData);
       const updated = await this._integrationService.getIntegrationById(targetOrg.id, integrationId);
 
-      // Successfully saved provider page: consume state keys permanently
-      await ioRedis.del(`organization:${state}`);
-      await ioRedis.del(`wallza:oauth_org:${state}`);
-      await ioRedis.del(`wallza:oauth_in_between:${state}`);
+      // Prepare final completed payload
+      const completionResult = {
+        integrationId: updated.id,
+        name: updated.name,
+        internalId: updated.internalId,
+        picture: updated.picture || '',
+        profile: updated.profile || '',
+        pageKey: targetPageKey,
+      };
+
+      // Atomically transition state to 'completed', cache result, and release one-time org keys
+      const luaCompletePageSelection = `
+        redis.call('SET', KEYS[1], 'completed', 'EX', 1800)
+        redis.call('SET', KEYS[2], ARGV[1], 'EX', 1800)
+        redis.call('DEL', KEYS[3])
+        redis.call('DEL', KEYS[4])
+        redis.call('DEL', KEYS[5])
+        return 1
+      `;
+
+      await ioRedis.eval(
+        luaCompletePageSelection,
+        5,
+        `wallza:oauth_page_state:${state}`,
+        `wallza:oauth_page_result:${state}`,
+        `organization:${state}`,
+        `wallza:oauth_org:${state}`,
+        `wallza:oauth_in_between:${state}`,
+        JSON.stringify(completionResult)
+      );
 
       return res.status(200).json({
         success: true,
@@ -977,8 +1059,8 @@ export class NoAuthIntegrationsController {
         profile: updated.profile || '',
       });
     } catch (err: any) {
-      // Revert in-flight marker on error so retry is possible if failure was transient
-      await ioRedis.del(`wallza:oauth_page_selected:${state}`).catch(() => {});
+      // Release in-progress lock on failure so legitimate retry can proceed immediately
+      await ioRedis.del(`wallza:oauth_page_state:${state}`).catch(() => {});
       return res.status(500).json({ success: false, error: err.message || 'Failed to save provider page selection' });
     }
   }
